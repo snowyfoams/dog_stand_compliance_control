@@ -1,0 +1,869 @@
+{
+  "meta": {
+    "robot_name": "dog5",
+    "fusion_doc": "\u65e0\u6807\u9898",
+    "exported": "2026-07-13",
+    "units": {
+      "length": "cm",
+      "mass": "kg",
+      "inertia": "kg*cm^2",
+      "mesh": "mm"
+    },
+    "frame": "z-up remap of Fusion Y-up world (x fwd, y left, z up); origin = trunk motor-plane centre; flat calibration pose = all joints 0; axes: abd +x, pitch/knee +z(at flat); PLA density 1.0 g/cm3",
+    "root_link": "trunk",
+    "base": "floating"
+  },
+  "links": [
+    {
+      "name": "trunk",
+      "mass_kg": 2.618901035,
+      "com_cm": [
+        0.071848018,
+        0.000646126,
+        0.838375402
+      ],
+      "inertia_kgcm2_about_com": [
+        126.887689781,
+        742.359680617,
+        843.524841289,
+        0.013251254,
+        -0.005554084,
+        0.874723246
+      ],
+      "meshes": [
+        {
+          "name": "trunk",
+          "file": "trunk.stl",
+          "R": [
+            [
+              1,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              -1
+            ],
+            [
+              0,
+              1,
+              0
+            ]
+          ],
+          "t_cm": [
+            0.0,
+            -10.0,
+            -4.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hip_FL",
+      "mass_kg": 0.391529157,
+      "com_cm": [
+        26.428628405,
+        5.999834439,
+        -5.507724657
+      ],
+      "inertia_kgcm2_about_com": [
+        2.369945129,
+        2.917801682,
+        2.58395737,
+        0.000144228,
+        -9.2269e-05,
+        0.746241315
+      ],
+      "meshes": [
+        {
+          "name": "hip_FL",
+          "file": "hip_FL.stl",
+          "R": [
+            [
+              -0.7071067811865476,
+              0,
+              -0.7071067811865476
+            ],
+            [
+              0.0,
+              -1,
+              0.0
+            ],
+            [
+              -0.7071067811865476,
+              0,
+              0.7071067811865476
+            ]
+          ],
+          "t_cm": [
+            24.98912,
+            4.31271,
+            -4.58987
+          ]
+        }
+      ]
+    },
+    {
+      "name": "thigh_FL",
+      "mass_kg": 0.369325186,
+      "com_cm": [
+        38.245831169,
+        6.014012135,
+        -6.68383186
+      ],
+      "inertia_kgcm2_about_com": [
+        1.337164702,
+        3.555742006,
+        3.997874608,
+        0.029987608,
+        0.008975369,
+        -0.389981997
+      ],
+      "meshes": [
+        {
+          "name": "thigh_FL",
+          "file": "thigh_FL.stl",
+          "R": [
+            [
+              1,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              -1
+            ],
+            [
+              0,
+              1,
+              0
+            ]
+          ],
+          "t_cm": [
+            26.89776,
+            5.99999,
+            -8.8009
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shin_FL",
+      "mass_kg": 0.038195498,
+      "com_cm": [
+        46.520767499,
+        5.990774185,
+        -5.288871383
+      ],
+      "inertia_kgcm2_about_com": [
+        0.062186833,
+        0.903345164,
+        0.931001493,
+        0.001590872,
+        -1.1645e-05,
+        0.000512529
+      ],
+      "meshes": [
+        {
+          "name": "shin_FL",
+          "file": "shin_FL.stl",
+          "R": [
+            [
+              0,
+              -1,
+              0
+            ],
+            [
+              -1,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              -1
+            ]
+          ],
+          "t_cm": [
+            53.73124,
+            6.99635,
+            14.5441
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hip_FR",
+      "mass_kg": 0.391529157,
+      "com_cm": [
+        26.428628405,
+        -6.000165561,
+        -5.507724657
+      ],
+      "inertia_kgcm2_about_com": [
+        2.369945129,
+        2.917801682,
+        2.58395737,
+        0.000144228,
+        -9.2269e-05,
+        0.746241315
+      ],
+      "meshes": [
+        {
+          "name": "hip_FR",
+          "file": "hip_FR.stl",
+          "R": [
+            [
+              -0.7071067811865476,
+              0,
+              -0.7071067811865476
+            ],
+            [
+              0.0,
+              -1,
+              0.0
+            ],
+            [
+              -0.7071067811865476,
+              0,
+              0.7071067811865476
+            ]
+          ],
+          "t_cm": [
+            24.98912,
+            -7.68729,
+            -4.58987
+          ]
+        }
+      ]
+    },
+    {
+      "name": "thigh_FR",
+      "mass_kg": 0.369325186,
+      "com_cm": [
+        38.245831169,
+        -5.985987865,
+        -6.68383186
+      ],
+      "inertia_kgcm2_about_com": [
+        1.337164702,
+        3.555742006,
+        3.997874608,
+        0.029987608,
+        0.008975369,
+        -0.389981997
+      ],
+      "meshes": [
+        {
+          "name": "thigh_FR",
+          "file": "thigh_FR.stl",
+          "R": [
+            [
+              1,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              -1
+            ],
+            [
+              0,
+              1,
+              0
+            ]
+          ],
+          "t_cm": [
+            26.89776,
+            -6.00001,
+            -8.8009
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shin_FR",
+      "mass_kg": 0.038195498,
+      "com_cm": [
+        46.520767499,
+        -6.009225815,
+        -5.288871383
+      ],
+      "inertia_kgcm2_about_com": [
+        0.062186833,
+        0.903345164,
+        0.931001493,
+        0.001590872,
+        -1.1645e-05,
+        0.000512529
+      ],
+      "meshes": [
+        {
+          "name": "shin_FR",
+          "file": "shin_FR.stl",
+          "R": [
+            [
+              0,
+              -1,
+              0
+            ],
+            [
+              -1,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              -1
+            ]
+          ],
+          "t_cm": [
+            53.73124,
+            -5.00365,
+            14.5441
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hip_RL",
+      "mass_kg": 0.391529157,
+      "com_cm": [
+        -26.428728405,
+        6.000065561,
+        -5.507724657
+      ],
+      "inertia_kgcm2_about_com": [
+        2.369945129,
+        2.917801682,
+        2.58395737,
+        0.000144228,
+        9.2269e-05,
+        -0.746241315
+      ],
+      "meshes": [
+        {
+          "name": "hip_RL",
+          "file": "hip_RL.stl",
+          "R": [
+            [
+              0.7071067811865476,
+              0,
+              0.7071067811865476
+            ],
+            [
+              0.0,
+              1,
+              0.0
+            ],
+            [
+              -0.7071067811865476,
+              0,
+              0.7071067811865476
+            ]
+          ],
+          "t_cm": [
+            -24.98922,
+            7.68719,
+            -4.58987
+          ]
+        }
+      ]
+    },
+    {
+      "name": "thigh_RL",
+      "mass_kg": 0.369325186,
+      "com_cm": [
+        -38.245931169,
+        5.985887865,
+        -6.68383186
+      ],
+      "inertia_kgcm2_about_com": [
+        1.337164702,
+        3.555742006,
+        3.997874608,
+        0.029987608,
+        -0.008975369,
+        0.389981997
+      ],
+      "meshes": [
+        {
+          "name": "thigh_RL",
+          "file": "thigh_RL.stl",
+          "R": [
+            [
+              -1,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ],
+            [
+              0,
+              1,
+              0
+            ]
+          ],
+          "t_cm": [
+            -26.89786,
+            5.99991,
+            -8.8009
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shin_RL",
+      "mass_kg": 0.038195498,
+      "com_cm": [
+        -46.520867499,
+        6.009125815,
+        -5.288871383
+      ],
+      "inertia_kgcm2_about_com": [
+        0.062186833,
+        0.903345164,
+        0.931001493,
+        0.001590872,
+        1.1645e-05,
+        -0.000512529
+      ],
+      "meshes": [
+        {
+          "name": "shin_RL",
+          "file": "shin_RL.stl",
+          "R": [
+            [
+              0,
+              1,
+              0
+            ],
+            [
+              1,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              -1
+            ]
+          ],
+          "t_cm": [
+            -53.73134,
+            5.00355,
+            14.5441
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hip_RR",
+      "mass_kg": 0.391529157,
+      "com_cm": [
+        -26.428728405,
+        -5.999934439,
+        -5.507724657
+      ],
+      "inertia_kgcm2_about_com": [
+        2.369945129,
+        2.917801682,
+        2.58395737,
+        0.000144228,
+        9.2269e-05,
+        -0.746241315
+      ],
+      "meshes": [
+        {
+          "name": "hip_RR",
+          "file": "hip_RR.stl",
+          "R": [
+            [
+              0.7071067811865476,
+              0,
+              0.7071067811865476
+            ],
+            [
+              0.0,
+              1,
+              0.0
+            ],
+            [
+              -0.7071067811865476,
+              0,
+              0.7071067811865476
+            ]
+          ],
+          "t_cm": [
+            -24.98922,
+            -4.31281,
+            -4.58987
+          ]
+        }
+      ]
+    },
+    {
+      "name": "thigh_RR",
+      "mass_kg": 0.369325186,
+      "com_cm": [
+        -38.245931169,
+        -6.014112135,
+        -6.68383186
+      ],
+      "inertia_kgcm2_about_com": [
+        1.337164702,
+        3.555742006,
+        3.997874608,
+        0.029987608,
+        -0.008975369,
+        0.389981997
+      ],
+      "meshes": [
+        {
+          "name": "thigh_RR",
+          "file": "thigh_RR.stl",
+          "R": [
+            [
+              -1,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ],
+            [
+              0,
+              1,
+              0
+            ]
+          ],
+          "t_cm": [
+            -26.89786,
+            -6.00009,
+            -8.8009
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shin_RR",
+      "mass_kg": 0.038195498,
+      "com_cm": [
+        -46.520867499,
+        -5.990874185,
+        -5.288871383
+      ],
+      "inertia_kgcm2_about_com": [
+        0.062186833,
+        0.903345164,
+        0.931001493,
+        0.001590872,
+        1.1645e-05,
+        -0.000512529
+      ],
+      "meshes": [
+        {
+          "name": "shin_RR",
+          "file": "shin_RR.stl",
+          "R": [
+            [
+              0,
+              1,
+              0
+            ],
+            [
+              1,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              -1
+            ]
+          ],
+          "t_cm": [
+            -53.73134,
+            -6.99645,
+            14.5441
+          ]
+        }
+      ]
+    }
+  ],
+  "joints": [
+    {
+      "name": "hip_abd_FL",
+      "type": "continuous",
+      "parent": "trunk",
+      "child": "hip_FL",
+      "origin_cm": [
+        22.05,
+        6.0,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "hip_pitch_FL",
+      "type": "continuous",
+      "parent": "hip_FL",
+      "child": "thigh_FL",
+      "origin_cm": [
+        26.89776,
+        6.0,
+        -5.2859
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "knee_FL",
+      "type": "continuous",
+      "parent": "thigh_FL",
+      "child": "shin_FL",
+      "origin_cm": [
+        38.89776,
+        6.0,
+        -5.2859
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "hip_abd_FR",
+      "type": "continuous",
+      "parent": "trunk",
+      "child": "hip_FR",
+      "origin_cm": [
+        22.05,
+        -6.0,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "hip_pitch_FR",
+      "type": "continuous",
+      "parent": "hip_FR",
+      "child": "thigh_FR",
+      "origin_cm": [
+        26.89776,
+        -6.0,
+        -5.2859
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "knee_FR",
+      "type": "continuous",
+      "parent": "thigh_FR",
+      "child": "shin_FR",
+      "origin_cm": [
+        38.89776,
+        -6.0,
+        -5.2859
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "hip_abd_RL",
+      "type": "continuous",
+      "parent": "trunk",
+      "child": "hip_RL",
+      "origin_cm": [
+        -22.05,
+        5.9999,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "hip_pitch_RL",
+      "type": "continuous",
+      "parent": "hip_RL",
+      "child": "thigh_RL",
+      "origin_cm": [
+        -26.89786,
+        5.9999,
+        -5.2859
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "knee_RL",
+      "type": "continuous",
+      "parent": "thigh_RL",
+      "child": "shin_RL",
+      "origin_cm": [
+        -38.89786,
+        5.9999,
+        -5.2859
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "hip_abd_RR",
+      "type": "continuous",
+      "parent": "trunk",
+      "child": "hip_RR",
+      "origin_cm": [
+        -22.05,
+        -6.0001,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "hip_pitch_RR",
+      "type": "continuous",
+      "parent": "hip_RR",
+      "child": "thigh_RR",
+      "origin_cm": [
+        -26.89786,
+        -6.0001,
+        -5.2859
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    },
+    {
+      "name": "knee_RR",
+      "type": "continuous",
+      "parent": "thigh_RR",
+      "child": "shin_RR",
+      "origin_cm": [
+        -38.89786,
+        -6.0001,
+        -5.2859
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "limits": {
+        "lower": null,
+        "upper": null,
+        "effort": null,
+        "velocity": null
+      }
+    }
+  ]
+}
