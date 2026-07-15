@@ -46,23 +46,67 @@ and clamp each commanded torque to `TAU_MAX`.
 - prints every joint's world-frame anchor and axis;
 - uses the passive viewer so visualization options can be set before display.
 
-### NumPy geometric Jacobian check
+### Independent NumPy FK and Jacobian check
 
-`stand_dog5.py` now contains `leg_jacobian_numpy()`. For each hinge joint it
-forms one translational Jacobian column:
+`dog5_kinematics.py` now implements independent trunk-frame forward kinematics
+and the translational foot Jacobian. It contains no MuJoCo import and uses only
+the fixed body/site translations copied from `dog5.xml`. For each hinge joint
+it forms one Jacobian column:
 
 ```text
 J_i = axis_i x (foot_position - joint_anchor_i)
 ```
 
-The `--compare-jacobians` mode advances the simulation to a bent-leg pose and
-compares this matrix with `mujoco.mj_jacSite`. The largest observed difference
-was `5.551e-17`, which is floating-point roundoff.
+`check_dog5_kinematics.py` compares the independent NumPy result with
+`mujoco.mj_jacSite` and with central finite differences. The 2026-07-15 check
+used the zero pose, crouch pose, four other fixed/boundary poses, and 1,000
+random poses per leg (4,024 total poses). The observed worst-case errors were:
 
-Important limitation: this check still uses `data.xaxis`, `data.xanchor`, and
-`data.site_xpos`. MuJoCo therefore performs the FK, while NumPy only performs
-the final cross products. This is a useful Jacobian-formula check, but it is
-not yet an independent hardware kinematics implementation.
+| Check | Maximum absolute error |
+|---|---:|
+| NumPy FK vs MuJoCo foot position | `1.665e-16 m` |
+| NumPy Jacobian vs `mj_jacSite` | `1.665e-16 m/rad` |
+| NumPy Jacobian vs finite differences | `6.499e-10 m/rad` |
+
+This completes the independent offline FK/Jacobian check. Re-run it with:
+
+```bash
+../../.venv/bin/python check_dog5_kinematics.py --samples 1000
+```
+
+from the `dog5_description` directory.
+
+## Confirmed Motor-to-Joint Angle Mapping
+
+The motor-driver zero calibration has been completed, so the calibrated motor
+output angle already has the MJCF zero pose as zero. There is no additional
+software offset and no gearbox division in this conversion:
+
+```text
+joint_angle_deg = direction * motoroutput_deg
+joint_angle_rad = radians(direction * motoroutput_deg)
+```
+
+The finalized directions are `-1` for CAN motors 1, 3, 4, 6, 9, and 12, and
+`+1` for all other motors. With the current motor-to-joint assignment:
+
+| CAN ID | Model joint | Direction | Joint-angle relationship |
+|---:|---|---:|---|
+| 1 | `hip_abd_RR` | -1 | `q = -motoroutput` |
+| 2 | `hip_pitch_RR` | +1 | `q = +motoroutput` |
+| 3 | `knee_RR` | -1 | `q = -motoroutput` |
+| 4 | `hip_abd_RL` | -1 | `q = -motoroutput` |
+| 5 | `hip_pitch_RL` | +1 | `q = +motoroutput` |
+| 6 | `knee_RL` | -1 | `q = -motoroutput` |
+| 7 | `hip_abd_FL` | +1 | `q = +motoroutput` |
+| 8 | `hip_pitch_FL` | +1 | `q = +motoroutput` |
+| 9 | `knee_FL` | -1 | `q = -motoroutput` |
+| 10 | `hip_abd_FR` | +1 | `q = +motoroutput` |
+| 11 | `hip_pitch_FR` | +1 | `q = +motoroutput` |
+| 12 | `knee_FR` | -1 | `q = -motoroutput` |
+
+Encoder wrap must still be handled when an angle crosses the `0/360` boundary;
+wrap handling does not introduce a calibration offset.
 
 ## Meaning of `h`
 
@@ -119,19 +163,19 @@ orientations, joint positions, and joint axes in the MJCF.
 
 ## Encoder Calibration Contract
 
-For every motor, record:
+The calibrated angle conversion is:
 
 ```text
-q_model = direction * (encoder_count - zero_count) * radians_per_count
+q_model = radians(direction * motoroutput_deg)
 ```
 
-The calibration table must include:
+The hardware calibration/configuration table must include:
 
 | Field | Meaning |
 |---|---|
-| `zero_count` | Encoder reading at the defined MJCF zero pose |
+| `hardware_zero` | Confirm the driver was zeroed at the defined MJCF zero pose |
 | `direction` | `+1` or `-1`, mapping hardware motion to model-positive rotation |
-| `radians_per_count` | Encoder scale including gearbox ratio |
+| `degrees_per_count` | `360/65535` for the reported motor output angle |
 | `q_min`, `q_max` | Safe software joint limits |
 | `tau_limit` | Safe motor-specific torque/current limit |
 
@@ -165,6 +209,18 @@ J[:, i] ~= (FK(q + epsilon e_i) - FK(q - epsilon e_i)) / (2 epsilon)
 ### 3. Hardware kinematics validation without Cartesian torque
 
 - Suspend or securely support the robot.
+- Run one guided mapping check first:
+
+```bash
+python calibrate12.py --cross-verify --motors 1
+```
+
+- Move only the selected physical joint by hand. The program continuously
+  commands zero torque, calculates `q = direction * motoroutput`, writes `q`
+  directly into the corresponding MuJoCo joint, and updates the viewer without
+  stepping physics. Confirm that the simulated link mirrors the real link.
+- Repeat with all motors using `python calibrate12.py --cross-verify` and move
+  one physical joint at a time in both directions.
 - Read encoders and display `q`, `p_foot_trunk`, and `h_encoder` at low rate.
 - Manually move one joint at a time and confirm the predicted foot direction.
 - Measure several joint-to-foot distances physically and compare with FK.
@@ -172,6 +228,15 @@ J[:, i] ~= (FK(q + epsilon e_i) - FK(q - epsilon e_i)) / (2 epsilon)
 
 ### 4. Joint-space stages on hardware
 
+- `stand_dog5_hw.py` first runs REST: a smooth joint-PD trajectory from the
+  measured stationary pose to all calibrated joint zeros. It then runs ROLL
+  and FOLD as separate operator-gated stages. It holds each completed target
+  and accepts Enter only after pose error and joint speed are within limits.
+  Enter during an active trajectory is ignored.
+- Hardware timing is deliberately slower than simulation: REST takes 2 s,
+  ROLL 4 s, FOLD 5 s, and Cartesian STAND 6 s. The ROLL change reduces its
+  peak desired speed from about 1.96 rad/s to 0.59 rad/s after a real-hardware
+  overshoot reached the hip-abduction safety limit.
 - Run ROLL and FOLD separately at reduced speed, torque/current, and travel.
 - Begin with one leg while the robot is supported.
 - Add joint-limit, encoder-validity, communication-timeout, and emergency-stop
@@ -181,6 +246,11 @@ J[:, i] ~= (FK(q + epsilon e_i) - FK(q - epsilon e_i)) / (2 epsilon)
 
 ### 5. Cartesian control on a supported robot
 
+- The hardware Cartesian stage now uses `dog5_kinematics.foot_position()` and
+  `foot_jacobian()` directly. It begins only after Enter at a settled crouch.
+- The first-test defaults are a `1 N*m` joint cap, `0.25` Cartesian gain scale,
+  `0.25` support-feedforward scale, and a `5 N*m/s` torque slew limit. The
+  staged runner refuses torque caps above `3 N*m`.
 - Start with low Cartesian stiffness and damping.
 - Command millimetre-scale changes in one Cartesian direction.
 - Confirm that `J.T @ F` produces the expected motor directions.
@@ -222,10 +292,9 @@ has reliable orientation estimation and contact handling.
 8. Add an IMU and body-orientation safety logic.
 9. Attempt a tethered stand and tune gradually from logs.
 
-## Immediate Next Deliverable
+## Completed Kinematics Interface
 
-The next code change should be `dog5_kinematics.py` plus tests. It should expose
-an interface independent of MuJoCo, such as:
+`dog5_kinematics.py` now exposes the hardware-independent interface:
 
 ```python
 p_foot = foot_position(leg, q)
@@ -233,6 +302,18 @@ J = foot_jacobian(leg, q)
 h = -p_foot[2]
 ```
 
-Only after these functions match MuJoCo and finite differences for all legs
-should the controller replace `mj_jacSite` and `data.site_xpos` with the NumPy
-hardware path.
+These functions now match MuJoCo and finite differences for all four legs.
+`stand_dog5_hw.py` uses the confirmed direction table and direct calibrated
+motor-output angles, then feeds `foot_position()` and `foot_jacobian()` without
+calling MuJoCo. Its sequence is:
+
+```text
+zero-torque check -> Enter -> REST -> Enter -> ROLL -> Enter -> FOLD
+                  -> Enter -> STAND -> HOLD
+```
+
+Run the no-CAN validation before every hardware revision:
+
+```bash
+../.venv/bin/python dog5_description/stand_dog5_hw.py --self-test
+```
