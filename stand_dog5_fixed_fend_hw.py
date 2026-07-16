@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
-"""Stand DOG5 from the operator-recorded crouch on real CAN hardware.
+"""Stand DOG5 with each foot's crouch x/y position held fixed.
 
-This runner uses the polished, model-positive crouch shared with
-``stand_dog5_hw.py``::
-
-    FL = (+88.33, +48.04, -142.11) deg
-    FR = (-88.33, -48.04, +142.11) deg
-    RL = (+88.33, -48.04, +142.11) deg
-    RR = (-88.33, +48.04, -142.11) deg
+This runner starts from a mirrored crouch derived from the direction-corrected
+hardware recording in ``dog5_description/stand_dog5_hw.py``.
 
 The operator-gated sequence is deliberately short:
 
     ZERO TORQUE  read and display the current pose; Enter starts CROUCH
     CROUCH       native 0xA4 position control moves to the recorded pose
     WAIT CROUCH  hold the recorded pose; Enter starts Cartesian STAND
-    STAND        Cartesian compliance ramps from the exact recorded foot positions
-                 to the configured under-body stance and standing height
+    STAND        Cartesian compliance keeps each crouch foot x/y fixed while
+                 ramping only z to the configured standing height
     WAIT STAND   keep the final target until position error and speed settle
     HOLD         hold the full Cartesian target; partial tests report HOLD_PARTIAL
     PARK         press P in HOLD to reverse the Cartesian path back to crouch
@@ -27,18 +22,25 @@ the feedback and torque conversions.
 
 The robot must remain mechanically supported.  This encoder-only controller
 does not know trunk attitude or foot contact and is not a balance controller.
+The fixed foot targets are in the trunk frame, not the world frame.
 Start with a small fraction of the validated path and a 1 N*m torque cap::
 
-    python stand_dog5_recorded_hw.py --self-test
-    python stand_dog5_recorded_hw.py --tau-max 1.0 --travel-scale 0.25
+    ../.venv/bin/python stand_dog5_fixed_fend_hw.py --self-test
+    ../.venv/bin/python stand_dog5_fixed_fend_hw.py \
+        --tau-max 1.0 --travel-scale 0.25
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
 import numpy as np
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_DESCRIPTION = os.path.join(_HERE, "dog5_description")
+sys.path.insert(0, _DESCRIPTION)
 
 import dog5_kinematics
 import stand_dog5
@@ -51,11 +53,24 @@ MOTOR_DIRECTIONS = base.MOTOR_DIRECTIONS
 JOINT_LABELS = base.JOINT_LABELS
 N_JOINTS = base.N_JOINTS
 
-# Keep the native-position runner on the same polished crouch as the staged
-# hardware controller.
-RECORDED_CROUCH_DEG = {
+# Preserve the original measured pose for the raw-versus-polished diagnostics.
+RAW_RECORDED_CROUCH_DEG = {
+    "FL": (89.62, 47.57, -140.92),
+    "FR": (-84.59, -53.61, 148.50),
+    "RL": (86.16, -44.44, 142.34),
+    "RR": (-92.95, 46.54, -136.68),
+}
+
+# Use the base controller's polished pose.  Each magnitude is the mean of the
+# four measured magnitudes; the signs follow DOG5's mirrored joint axes.  This
+# removes the measured left/right bias without inventing a new crouch depth or
+# weakening a joint limit.
+POLISHED_CROUCH_DEG = {
     leg: tuple(base.CROUCH_JOINT_TARGET_DEG[leg]) for leg in LEGS
 }
+
+# Retain the established names used by the shared sequence and safety code.
+RECORDED_CROUCH_DEG = POLISHED_CROUCH_DEG
 Q_RECORDED_CROUCH = np.deg2rad(base._stack_pose(RECORDED_CROUCH_DEG))
 POSITION_TARGET_DEG = np.rad2deg(Q_RECORDED_CROUCH)
 
@@ -130,8 +145,15 @@ class RecordedCrouchController(base.HardwareStandController):
             self.crouch_foot[leg] = dog5_kinematics.foot_position(
                 leg, Q_RECORDED_CROUCH[section]
             )
+            # Preserve the exact crouch foot x/y coordinates.  Standing is a
+            # vertical trunk-frame foot motion only; no horizontal sweep to
+            # the nominal under-body stance is commanded.
             self.full_stand_foot[leg] = np.array(
-                [*self.foot_xy[leg], -self.stand_height]
+                [
+                    self.crouch_foot[leg][0],
+                    self.crouch_foot[leg][1],
+                    -self.stand_height,
+                ]
             )
             self.final_foot[leg] = (
                 self.crouch_foot[leg]
@@ -149,6 +171,7 @@ class RecordedCrouchController(base.HardwareStandController):
                 )
             )
         self.last_cart_error = 0.0
+        self.last_xy_error = 0.0
         self.last_min_singular = np.inf
         self.last_max_force = 0.0
 
@@ -178,6 +201,7 @@ class RecordedCrouchController(base.HardwareStandController):
         qd = np.asarray(qd, dtype=float)
         tau = np.zeros(N_JOINTS)
         max_error = 0.0
+        max_xy_error = 0.0
         min_singular = np.inf
         max_force = 0.0
 
@@ -198,6 +222,10 @@ class RecordedCrouchController(base.HardwareStandController):
             error = desired - foot
             error_norm = float(np.linalg.norm(error))
             max_error = max(max_error, error_norm)
+            max_xy_error = max(
+                max_xy_error,
+                float(np.linalg.norm(error[:2])),
+            )
             if error_norm > MAX_CART_ERROR_M:
                 raise RuntimeError(
                     f"{leg} Cartesian error {error_norm:.3f} m exceeds "
@@ -224,6 +252,7 @@ class RecordedCrouchController(base.HardwareStandController):
             )
 
         self.last_cart_error = max_error
+        self.last_xy_error = max_xy_error
         self.last_min_singular = min_singular
         self.last_max_force = max_force
         if not np.all(np.isfinite(tau)):
@@ -398,6 +427,18 @@ class RecordedStandSequence:
 
 def validate_recorded_configuration(controller):
     base.validate_hardware_config()
+    polished_deg = base._stack_pose(POLISHED_CROUCH_DEG).reshape(4, 3)
+    expected_polished_deg = np.array(
+        [
+            [88.33, 48.04, -142.11],
+            [-88.33, -48.04, 142.11],
+            [88.33, -48.04, 142.11],
+            [-88.33, 48.04, -142.11],
+        ]
+    )
+    if not np.allclose(polished_deg, expected_polished_deg):
+        raise ValueError("polished crouch is not the expected mirrored pose")
+
     low, high = base.soft_limits()
     outside = (Q_RECORDED_CROUCH < low) | (Q_RECORDED_CROUCH > high)
     if np.any(outside):
@@ -429,6 +470,26 @@ def validate_recorded_configuration(controller):
                 f"{actual_motoroutput[index]:+.2f} != "
                 f"{expected_motoroutput[mid]:+.2f} deg"
             )
+
+    crouch_feet = np.stack(
+        [controller.crouch_foot[leg] for leg in LEGS], axis=0
+    )
+    left_mean_z = float(np.mean(crouch_feet[[0, 2], 2]))
+    right_mean_z = float(np.mean(crouch_feet[[1, 3], 2]))
+    if abs(left_mean_z - right_mean_z) > 5.0e-4:
+        raise ValueError(
+            "polished crouch retains excessive left/right FK height bias: "
+            f"{1000.0 * (left_mean_z - right_mean_z):+.3f} mm"
+        )
+    pair_height_error = max(
+        abs(float(crouch_feet[0, 2] - crouch_feet[1, 2])),
+        abs(float(crouch_feet[2, 2] - crouch_feet[3, 2])),
+    )
+    if pair_height_error > 5.0e-4:
+        raise ValueError(
+            "polished crouch mirrored-pair FK heights differ by "
+            f"{1000.0 * pair_height_error:.3f} mm"
+        )
 
     for leg_index, leg in enumerate(LEGS):
         section = slice(3 * leg_index, 3 * leg_index + 3)
@@ -661,7 +722,7 @@ def run_hardware(
         "WAIT_CROUCH"
     )
     print(
-        "[recorded] crouch joint targets deg: "
+        "[fixed-fend] polished symmetric crouch joint targets deg: "
         + ", ".join(
             f"{leg}={RECORDED_CROUCH_DEG[leg]}" for leg in LEGS
         )
@@ -677,6 +738,10 @@ def run_hardware(
         f"height={stand_height:.3f}m, tau cap={tau_max:.2f}N*m, "
         f"travel={travel_scale:.2f}, cart scale={cart_gain_scale:.2f}, "
         f"support scale={support_scale:.2f}"
+    )
+    print(
+        "[fixed-fend] Each foot keeps its polished crouch x/y target; "
+        "only trunk-frame z changes during STAND/PARK."
     )
     print(
         "[recorded] NOTE: native 0xA4 position control has a speed cap but "
@@ -929,6 +994,7 @@ def run_hardware(
                                 f"[recorded] stage={sequence.stage:11s} "
                                 f"crouch_err={pose_error:.2f}rad "
                                 f"cart_err={controller.last_cart_error:.3f}m "
+                                f"xy_err={controller.last_xy_error:.3f}m "
                                 f"sigma_min={controller.last_min_singular:.4f} "
                                 f"force_max={controller.last_max_force:.1f}N "
                                 f"h_actual={min(actual_heights):.3f}.."
@@ -1072,6 +1138,7 @@ def offline_self_test(stand_height=DEFAULT_STAND_HEIGHT, travel_scale=1.0):
         Q_RECORDED_CROUCH, zero, 0.0
     )
     assert np.allclose(cart_start, 0.0, atol=1.0e-10)
+    assert np.isclose(controller.last_xy_error, 0.0)
     for leg in LEGS:
         target0, velocity0, progress0 = controller.cartesian_target(leg, 0.0)
         target1, velocity1, progress1 = controller.cartesian_target(
@@ -1079,9 +1146,25 @@ def offline_self_test(stand_height=DEFAULT_STAND_HEIGHT, travel_scale=1.0):
         )
         assert np.allclose(target0, controller.crouch_foot[leg])
         assert np.allclose(target1, controller.final_foot[leg])
+        assert np.allclose(
+            controller.full_stand_foot[leg][:2],
+            controller.crouch_foot[leg][:2],
+        )
+        assert np.allclose(
+            controller.final_foot[leg][:2],
+            controller.crouch_foot[leg][:2],
+        )
+        assert np.allclose(
+            controller.clearance_foot[leg][:2],
+            controller.crouch_foot[leg][:2],
+        )
         assert np.allclose(velocity0, 0.0)
         assert np.allclose(velocity1, 0.0)
         assert progress0 == 0.0 and progress1 == 1.0
+
+        for elapsed in np.linspace(0.0, T_STAND, 21):
+            target, _, _ = controller.cartesian_target(leg, elapsed)
+            assert np.allclose(target[:2], controller.crouch_foot[leg][:2])
 
         park0, park_velocity0, park_progress0 = controller.parking_target(
             leg, 0.0
@@ -1178,8 +1261,34 @@ def offline_self_test(stand_height=DEFAULT_STAND_HEIGHT, travel_scale=1.0):
     )
     assert sequence.stage == "WAIT_CROUCH"
 
-    print("stand_dog5_recorded_hw offline self-test PASS")
-    print("  recorded joint targets deg:", RECORDED_CROUCH_DEG)
+    print("stand_dog5_fixed_fend_hw offline self-test PASS")
+    print("  raw recorded joint targets deg:", RAW_RECORDED_CROUCH_DEG)
+    print("  polished symmetric targets deg:", POLISHED_CROUCH_DEG)
+    raw_q = np.deg2rad(base._stack_pose(RAW_RECORDED_CROUCH_DEG))
+    raw_feet = np.stack(
+        [
+            dog5_kinematics.foot_position(
+                leg, raw_q[3 * leg_index:3 * leg_index + 3]
+            )
+            for leg_index, leg in enumerate(LEGS)
+        ],
+        axis=0,
+    )
+    polished_feet = np.stack(
+        [controller.crouch_foot[leg] for leg in LEGS], axis=0
+    )
+    raw_roll_bias = float(
+        np.mean(raw_feet[[0, 2], 2]) - np.mean(raw_feet[[1, 3], 2])
+    )
+    polished_roll_bias = float(
+        np.mean(polished_feet[[0, 2], 2])
+        - np.mean(polished_feet[[1, 3], 2])
+    )
+    print(
+        "  modelled left/right crouch height bias: "
+        f"raw={1000.0 * raw_roll_bias:+.3f}mm -> "
+        f"polished={1000.0 * polished_roll_bias:+.3f}mm"
+    )
     print(
         "  expected motoroutput deg:",
         {
@@ -1207,6 +1316,7 @@ def offline_self_test(stand_height=DEFAULT_STAND_HEIGHT, travel_scale=1.0):
             f"sigma_min={singular:.4f}"
         )
     print("  STAND transition torque at t=0: zero")
+    print("  STAND/PARK foot x/y targets: fixed at polished crouch values")
     print("  PARK begins at the HOLD target and ends at zero crouch torque")
     print(
         "  flow: CURRENT -> CROUCH -> ENTER -> STAND -> WAIT_STAND -> "

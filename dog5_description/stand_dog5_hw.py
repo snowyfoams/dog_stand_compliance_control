@@ -71,8 +71,10 @@ T_REST = 2.0
 T_ROLL_HW = 4.0
 T_FOLD_HW = 5.0
 T_STAND_HW = 6.0
-KP_JOINT_HW = 300.0
-KD_JOINT_HW = 30.0
+STAND_CLEARANCE_DROP_M = 0.04
+STAND_CLEARANCE_PHASE = 0.25
+KP_JOINT_HW = 600.0
+KD_JOINT_HW = 90.0
 
 ABD_LIM, PITCH_LIM, KNEE_LIM = 1.75, 2.6, 2.6
 LIMIT_ESTOP_MARGIN = 0.05
@@ -81,7 +83,7 @@ STAGE_POSE_TOL = 0.20
 STAGE_QD_TOL = 0.50
 WAIT_DWELL_S = 0.50
 # Overspeed is checked once per round-robin (~21 Hz). QD_ESTOP_HARD applies
-# immediately to the driver's reported speed field because no legitimate stage
+# immediately to the driver's reported sp
 # reaches it. The lower sustained trip must also agree with velocity calculated
 # independently from encoder position changes. The sustained threshold is kept
 # above the observed 5.9 rad/s nuisance reading; the hard runaway tier remains.
@@ -101,7 +103,7 @@ FAULT_STATUS_HZ = 5.0
 RECOVER_PERIOD_S = 0.1
 
 # Total XML body mass, used only for the optional per-foot support feedforward.
-DOG5_MASS_KG = 5.81510043
+DOG5_MASS_KG = 5.3
 
 
 def _stack_pose(pose):
@@ -117,11 +119,21 @@ ROLL_JOINT_TARGET_DEG = {
     "RR": (-90.0, 0.0, 0.0),
 }
 
+# Polished hardware crouch in model joint-angle coordinates, in degrees.
+# The magnitudes are averaged from the direction-corrected recorded pose and
+# mirrored across all four legs to remove its left/right bias.  These are
+# joint-angle targets, not raw motor-output angles.
+CROUCH_JOINT_TARGET_DEG = {
+    "FL": (88.33, 48.04, -142.11),
+    "FR": (-88.33, -48.04, 142.11),
+    "RL": (88.33, -48.04, 142.11),
+    "RR": (-88.33, 48.04, -142.11),
+}
+
 Q_ZERO_ALL = np.zeros(N_JOINTS)
-# Controllers use radians internally. FOLD remains unchanged for the next
-# hardware-validation step.
+# Controllers use radians internally.
 Q_ROLL_ALL = np.deg2rad(_stack_pose(ROLL_JOINT_TARGET_DEG))
-Q_CROUCH_ALL = _stack_pose(stand_dog5.Q_CROUCH)
+Q_CROUCH_ALL = np.deg2rad(_stack_pose(CROUCH_JOINT_TARGET_DEG))
 
 
 def motoroutput_deg_to_joint_rad(motoroutput_deg):
@@ -168,11 +180,22 @@ def validate_hardware_config() -> None:
     )
     if not np.allclose(np.rad2deg(Q_ROLL_ALL), expected_roll_deg):
         raise ValueError("hardware ROLL joint-angle target is incorrect")
+    expected_crouch_deg = np.asarray(
+        [88.33, 48.04, -142.11, -88.33, -48.04, 142.11,
+         88.33, -48.04, 142.11, -88.33, 48.04, -142.11]
+    )
+    if not np.allclose(np.rad2deg(Q_CROUCH_ALL), expected_crouch_deg):
+        raise ValueError("hardware CROUCH joint-angle target is incorrect")
     roll_motoroutput = joint_rad_to_motoroutput_deg(Q_ROLL_ALL)
     if not np.allclose(
         motoroutput_deg_to_joint_rad(roll_motoroutput), Q_ROLL_ALL
     ):
         raise ValueError("ROLL joint/motoroutput direction conversion failed")
+    crouch_motoroutput = joint_rad_to_motoroutput_deg(Q_CROUCH_ALL)
+    if not np.allclose(
+        motoroutput_deg_to_joint_rad(crouch_motoroutput), Q_CROUCH_ALL
+    ):
+        raise ValueError("CROUCH joint/motoroutput direction conversion failed")
 
 
 class CalibratedEncoderUnwrap:
@@ -213,16 +236,46 @@ class HardwareStandController:
         self.kd_cart = cart_gain_scale * np.asarray(stand_dog5.KD_CART)
         self.support_per_foot = support_scale * DOG5_MASS_KG * 9.81 / 4.0
         self.foot_xy = {}
+        self.crouch_foot = {}
+        self.clearance_foot = {}
+        self.stand_foot = {}
         for leg in LEGS:
             hip = np.asarray(dog5_kinematics.LEG_GEOMETRY[leg].hip)
             self.foot_xy[leg] = np.array(
                 [hip[0], hip[1] + np.sign(hip[1]) * stand_dog5.STANCE_OUT]
+            )
+        for leg_index, leg in enumerate(LEGS):
+            section = slice(3 * leg_index, 3 * leg_index + 3)
+            self.crouch_foot[leg] = dog5_kinematics.foot_position(
+                leg, Q_CROUCH_ALL[section]
+            )
+            self.clearance_foot[leg] = (
+                self.crouch_foot[leg]
+                + np.array([0.0, 0.0, -STAND_CLEARANCE_DROP_M])
+            )
+            self.stand_foot[leg] = np.array(
+                [*self.foot_xy[leg], -stand_dog5.H_STAND]
             )
 
     @staticmethod
     def _cubic(t, duration):
         u = np.clip(t / duration, 0.0, 1.0)
         return 3.0 * u**2 - 2.0 * u**3, (6.0 * u - 6.0 * u**2) / duration
+
+    def _two_stage_target(
+        self, start, waypoint, final, elapsed, duration, waypoint_phase
+    ):
+        """Cubic start-to-waypoint-to-final target with zero join velocity."""
+        split_time = waypoint_phase * duration
+        if elapsed <= split_time:
+            s, ds = self._cubic(elapsed, split_time)
+            delta = waypoint - start
+            return start + s * delta, ds * delta, waypoint_phase * s
+
+        s, ds = self._cubic(elapsed - split_time, duration - split_time)
+        delta = final - waypoint
+        progress = waypoint_phase + (1.0 - waypoint_phase) * s
+        return waypoint + s * delta, ds * delta, progress
 
     def _joint_move(self, q, qd, q0, q1, elapsed, duration):
         q = np.asarray(q, dtype=float)
@@ -261,19 +314,20 @@ class HardwareStandController:
         q = np.asarray(q, dtype=float)
         qd = np.asarray(qd, dtype=float)
         tau = np.zeros(N_JOINTS)
-        s, ds = self._cubic(elapsed, T_STAND_HW)
-        height = stand_dog5.H_CROUCH + s * (
-            stand_dog5.H_STAND - stand_dog5.H_CROUCH
-        )
-        vertical_speed = -ds * (stand_dog5.H_STAND - stand_dog5.H_CROUCH)
 
         for leg_index, leg in enumerate(LEGS):
             section = slice(3 * leg_index, 3 * leg_index + 3)
             q_leg, qd_leg = q[section], qd[section]
             foot = dog5_kinematics.foot_position(leg, q_leg)
             jacobian = dog5_kinematics.foot_jacobian(leg, q_leg)
-            desired = np.array([*self.foot_xy[leg], -height])
-            desired_velocity = np.array([0.0, 0.0, vertical_speed])
+            desired, desired_velocity, _ = self._two_stage_target(
+                self.crouch_foot[leg],
+                self.clearance_foot[leg],
+                self.stand_foot[leg],
+                elapsed,
+                T_STAND_HW,
+                STAND_CLEARANCE_PHASE,
+            )
             foot_velocity = jacobian @ qd_leg
             force = (self.kp_cart @ (desired - foot)
                      + self.kd_cart @ (desired_velocity - foot_velocity))
@@ -746,6 +800,20 @@ def run_hardware(tau_max, cart_gain_scale, support_scale,
         )
     )
     print(
+        "[hardware] CROUCH desired joint angles [abd,pitch,knee] deg: "
+        + ", ".join(
+            f"{leg}={tuple(CROUCH_JOINT_TARGET_DEG[leg])}" for leg in LEGS
+        )
+    )
+    crouch_motoroutput = joint_rad_to_motoroutput_deg(Q_CROUCH_ALL)
+    print(
+        "[hardware] CROUCH expected motoroutput deg: "
+        + ", ".join(
+            f"CAN {joint.can_id}={crouch_motoroutput[index]:+.2f}"
+            for index, joint in enumerate(HARDWARE_JOINTS)
+        )
+    )
+    print(
         f"[hardware] tau cap={tau_max:.2f} N*m, cart scale={cart_gain_scale:.2f}, "
         f"support scale={support_scale:.2f}"
     )
@@ -968,6 +1036,16 @@ def offline_self_test():
         controller.compute_stand(Q_CROUCH_ALL, zero_qd, T_STAND_HW),
     ):
         assert tau.shape == (N_JOINTS,) and np.all(np.isfinite(tau))
+    stand_start_tau = controller.compute_stand(Q_CROUCH_ALL, zero_qd, 0.0)
+    expected_support_tau = np.zeros(N_JOINTS)
+    support_force = np.array([0.0, 0.0, -controller.support_per_foot])
+    for leg_index, leg in enumerate(LEGS):
+        section = slice(3 * leg_index, 3 * leg_index + 3)
+        expected_support_tau[section] = (
+            dog5_kinematics.foot_jacobian(leg, Q_CROUCH_ALL[section]).T
+            @ support_force
+        )
+    assert np.allclose(stand_start_tau, expected_support_tau), stand_start_tau
 
     # The slower hardware profile reduces peak ROLL desired speed from the
     # simulation's ~1.96 rad/s to below 0.60 rad/s.
@@ -1124,6 +1202,20 @@ def offline_self_test():
             for joint, value in zip(
                 HARDWARE_JOINTS,
                 joint_rad_to_motoroutput_deg(Q_ROLL_ALL),
+            )
+        },
+    )
+    print(
+        "  CROUCH joint targets deg:",
+        {leg: tuple(CROUCH_JOINT_TARGET_DEG[leg]) for leg in LEGS},
+    )
+    print(
+        "  CROUCH expected motoroutput deg:",
+        {
+            joint.can_id: float(value)
+            for joint, value in zip(
+                HARDWARE_JOINTS,
+                joint_rad_to_motoroutput_deg(Q_CROUCH_ALL),
             )
         },
     )

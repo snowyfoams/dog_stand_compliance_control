@@ -43,8 +43,8 @@ STANCE_OUT = 0.04     # m, feet this much outboard of the hips (wider = better r
 KP_JOINT = 12.0       # Nm/rad   roll/fold-phase PD
 KD_JOINT = 0.5        # Nms/rad
 
-KP_CART = np.diag([600.0, 600.0, 600.0])   # N/m    Cartesian stiffness
-KD_CART = np.diag([30.0, 30.0, 30.0])      # Ns/m   Cartesian damping
+KP_CART = np.diag([800.0, 800.0, 800.0])   # N/m    Cartesian stiffness
+KD_CART = np.diag([1.0, 1.0, 1.0])      # Ns/m   Cartesian damping
 KD_JOINT_STAND = 0.15                      # Nms/rad extra joint damping in stand
 TAU_MAX = 8.0                              # Nm torque clamp
 
