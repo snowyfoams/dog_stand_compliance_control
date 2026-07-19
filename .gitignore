@@ -1,3 +1,12 @@
 .claude/
 __pycache__/
 *.pyc
+
+# Raw hardware capture (large; converted derivatives are committed instead:
+# dog5_stand_hw.gif, dog5_hardware.jpg)
+dog5_description/*.MOV
+dog5_description/*.HEIC
+
+# Informal personal working notes, superseded by README.md
+dog5_description/*work_overview.txt
+dog5_description/week*_review.txt
