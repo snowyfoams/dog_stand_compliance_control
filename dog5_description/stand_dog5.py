@@ -19,6 +19,7 @@ trunk resting on the ground) and stands up in four phases:
 Run with the project venv:
     D:\mujoco\.venv\Scripts\python.exe stand_dog5.py            # interactive viewer
     D:\mujoco\.venv\Scripts\python.exe stand_dog5.py --headless # 7 s test, prints metrics
+    D:\mujoco\.venv\Scripts\python.exe stand_dog5.py --compare-jacobians
 """
 import sys
 import time
@@ -71,11 +72,30 @@ WAYPOINTS = [
 ]
 
 
+def leg_jacobian_numpy(data, foot_site_id, joint_ids):
+    """Return a leg's 3x3 translational Jacobian using NumPy only.
+
+    For a hinge joint, the linear velocity of a point is
+
+        v = axis x (point - joint_anchor) * joint_rate.
+
+    MuJoCo has already performed forward kinematics, so ``xaxis``, ``xanchor``
+    and ``site_xpos`` are expressed in the world frame.  Each resulting cross
+    product is one Jacobian column.
+    """
+    foot = data.site_xpos[foot_site_id]
+    return np.column_stack([
+        np.cross(data.xaxis[jid], foot - data.xanchor[jid])
+        for jid in joint_ids
+    ])
+
+
 class Dog5Stand:
     def __init__(self, model):
         self.m = model
         self.trunk = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "trunk")
         self.site = {}
+        self.jids = {}
         self.qadr = {}
         self.dadr = {}
         self.actadr = {}
@@ -83,6 +103,7 @@ class Dog5Stand:
             self.site[leg] = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"foot_{leg}")
             joints = [f"hip_abd_{leg}", f"hip_pitch_{leg}", f"knee_{leg}"]
             jids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j in joints]
+            self.jids[leg] = np.array(jids)
             self.qadr[leg] = np.array([model.jnt_qposadr[j] for j in jids])
             self.dadr[leg] = np.array([model.jnt_dofadr[j] for j in jids])
             self.actadr[leg] = np.array(
@@ -96,6 +117,24 @@ class Dog5Stand:
         total_mass = model.body_mass.sum()
         self.f_support = total_mass * 9.81 / 4.0   # static share per foot
         self._jacp = np.zeros((3, model.nv))
+
+    def compare_jacobians(self, data):
+        """Print NumPy and MuJoCo leg Jacobians and return the largest error."""
+        largest_error = 0.0
+        for leg in LEGS:
+            J_numpy = leg_jacobian_numpy(data, self.site[leg], self.jids[leg])
+
+            self._jacp.fill(0.0)
+            mujoco.mj_jacSite(self.m, data, self._jacp, None, self.site[leg])
+            J_mujoco = self._jacp[:, self.dadr[leg]]
+
+            error = J_numpy - J_mujoco
+            max_error = np.max(np.abs(error))
+            largest_error = max(largest_error, max_error)
+            print(f"\n{leg} NumPy Jacobian [m/rad]:\n{J_numpy}")
+            print(f"{leg} MuJoCo Jacobian [m/rad]:\n{J_mujoco}")
+            print(f"{leg} difference (NumPy - MuJoCo), max |error|={max_error:.3e}:\n{error}")
+        return largest_error
 
     @staticmethod
     def _cubic(t, T):
@@ -147,6 +186,17 @@ def main():
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, 0)
     ctrl = Dog5Stand(model)
+
+    if "--compare-jacobians" in sys.argv:
+        # Move away from the initial straight-leg singularity so the comparison
+        # contains general, nonzero Jacobian entries.
+        while data.time < 3.5:
+            ctrl.control(data)
+            mujoco.mj_step(model, data)
+        mujoco.mj_forward(model, data)
+        error = ctrl.compare_jacobians(data)
+        print(f"\nLargest error across all legs: {error:.3e}")
+        return
 
     if "--headless" in sys.argv:
         import PIL.Image
