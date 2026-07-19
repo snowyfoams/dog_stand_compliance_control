@@ -48,6 +48,10 @@ controller runs four phases:
 Result: trunk settles at 0.221 m with zero steady-state droop, level
 attitude, survives an 8 N × 0.3 s lateral shove.
 
+(Naming note: phase 1's "ROLL" is a joint move — rolling each `hip_abd` to
+±90° — unrelated to *body roll*. The hardware's no-IMU body-roll correction
+is a different mechanism, covered in [Stage 4](#stage-4--hardware-cartesian-compliance-stand).)
+
 ```bash
 python dog5_description/stand_dog5.py               # interactive viewer
 python dog5_description/stand_dog5.py --headless     # metrics-only test
@@ -95,6 +99,21 @@ feedback at ~20.8 Hz from a 12-motor CAN round-robin). That controller
 [`dog5-live-mirror`](../../tree/dog5-live-mirror) — it is real-hardware code
 and doesn't belong in the sim tree.
 
+**The CAN bus.** All 12 joints are LK Motor brushless servos on a single CAN
+bus, with a confirmed id → joint map and per-joint direction sign
+(`dog5_hardware_map.py`: RR = 1–3, RL = 4–6, FL = 7–9, FR = 10–12). Two native
+commands are used: `0xA4` absolute multi-turn position (with a motor-side
+speed cap, used for CROUCH/STAND moves) and a torque command (used once
+Cartesian compliance takes over); telemetry back is encoder position, speed,
+and measured torque, nothing else — no IMU, no foot-force sensor. The control
+loop runs at 250 Hz but services one motor per tick, so a full 12-motor state
+sweep lands at ~20.8 Hz — the real rate the robot "knows" its own state, and
+the single most important fidelity constraint the sim mirrors in Stage 4.
+The low-level protocol driver (frame encoding, the position/torque/telemetry
+calls, single-motor bring-up) is its own project:
+[can_motor_control](https://github.com/snowyfoams/can_motor_control); this
+repo's hardware branches build a thin per-joint wrapper on top of it.
+
 ## Stage 4 — Hardware: Cartesian-compliance stand
 
 ![DOG5 hardware stand-up (real robot)](dog5_description/dog5_stand_hw.gif)
@@ -126,6 +145,28 @@ clearance 42 mm, trunk tilt ≤ 0.43°, CoM margin ≥ 47 mm; robustness sweep
 It also predicted a real hardware issue ahead of time: the loaded front hip
 pitch peaks at 4.27 N·m, so the default 2.0 N·m torque trip **will** fire —
 use ≈ 6 N·m.
+
+### Correcting roll without an IMU
+
+DOG5 has no attitude sensor, so the hardware controllers (on
+[`dog5-live-mirror`](../../tree/dog5-live-mirror)) correct roll two ways,
+both from encoder FK alone — this is what the "Roll Problem" whiteboard
+derivation in Stage 2 was working out:
+
+- **Symmetrize the pose, offline.** The recorded crouch pose had unequal
+  joint magnitudes between the left legs (FL, RL) and right legs (FR, RR),
+  which meant unequal leg length and a built-in lean. The fix compares each
+  side's mean foot height (`dog5_kinematics.foot_position`, i.e. leg length)
+  left vs right, averages the four legs' joint magnitudes, and mirrors the
+  signs into a symmetric pose — validation refuses to start unless the
+  residual left/right height bias is under 0.5 mm.
+- **Trim it at runtime.** While standing, each leg's *sag* (how far its foot
+  sits above its commanded trunk-frame target — a corner carrying more load
+  sags more) is measured from encoder FK every control cycle. A slow
+  integrator (gain 150 N per m·s, clamped to ±6 N, deliberately much slower
+  than the Cartesian stiffness) adds extra downward support force on
+  whichever corner is sagging, so all four foot heights — and the trunk —
+  level out with no attitude measurement at all.
 
 ```bash
 python dog5_description/stand3_dog5.py --self-test   # offline IK/margin/torque checks
@@ -197,28 +238,68 @@ visualization, then take the sim-validated crawl fix back to the real robot.
 - **`main`** (this branch) — MJCF model, hardware-independent kinematics, and
   every sim stage above.
 - [`dog5-live-mirror`](../../tree/dog5-live-mirror) — the real hardware
-  controllers: `stand_by_position_command.py`, `stand_dog5_hw.py`,
-  `crawl_dog5_hw.py`, the CAN joint map, and the direction/calibration
-  verifier. This is the code that actually runs on DOG5.
-- [`dog5-crawl-sim`](../../tree/dog5-crawl-sim) — `crawl_dog5_sim.py`, a
-  more complete hardware-mirrored crawl (diagonal `REPOSE`, in-place swing
-  test, tucked-stance walking) than `walk_dog5.py` on `main`.
+  controllers. This is the code that actually runs on DOG5.
+- [`dog5-crawl-sim`](../../tree/dog5-crawl-sim) — a more complete,
+  hardware-mirrored crawl sim than `walk_dog5.py` on `main`.
 
-## Files
+File-by-file breakdown of all three (plus the external CAN driver repo) is in
+[Code map](#code-map) below.
 
-- `dog5_description/dog5.xml` — MJCF model (mesh visuals, sphere feet +
-  thigh-pad collision, motor armature)
-- `dog5_description/stand_dog5.py` — Stage 1 sim-only stand-up controller
-- `dog5_description/view_dog5.py` — Stage 2 joint-frame inspector
-- `dog5_description/dog5_kinematics.py` — Stage 2 hardware NumPy FK/Jacobian
-- `dog5_description/check_dog5_kinematics.py` — validates the above against MuJoCo
-- `dog5_description/SIM_TO_HARDWARE_PLAN.md` — the Stage 2 kinematics plan
-- `dog5_description/stand3_dog5.py` — Stage 4 hardware-faithful 3-leg stand
-- `dog5_description/SIM_APPROACH_HW.md` — how the sim is kept hardware-faithful, plus measured transfer notes
-- `dog5_description/hw_gap_experiments.py` — Stage 6 diagnosis of the crawl drag
-- `dog5_description/walk_dog5.py` — Stage 6 fixed kinematic crawl
-- `dog5_description/make_gif.py`, `make_gif3.py`, `make_gif_walk.py` — regenerate the sim GIFs
-- `dog5_description/dog5_stand_hw.gif`, `dog5_hardware.jpg` — hardware media (converted from on-device video/photo)
+## Code map
+
+The code for this project is spread across three branches plus one external
+repo, because sim code and hardware code have different constraints (see
+[Branches](#branches)). `dog5_kinematics.py`, `check_dog5_kinematics.py`, and
+`make_gif.py` are byte-identical across all three branches — everything else
+either only exists on one branch or has diverged slightly between them.
+
+**`main` (this branch) — model, sim controllers, hardware-independent kinematics**
+
+| File | What it does |
+|---|---|
+| `dog5_description/dog5.xml` | MJCF model — mesh visuals, sphere feet + thigh-pad collision, motor armature |
+| `dog5_description/stand_dog5.py` | Stage 1 sim-only Cartesian-compliance stand-up |
+| `dog5_description/view_dog5.py` | Stage 2 joint-frame inspector |
+| `dog5_description/dog5_kinematics.py` | Stage 2 hardware NumPy FK/Jacobian — the module the real robot runs |
+| `dog5_description/check_dog5_kinematics.py` | validates the above against MuJoCo + finite differences |
+| `dog5_description/SIM_TO_HARDWARE_PLAN.md` | the Stage 2 kinematics/encoder-calibration plan |
+| `dog5_description/stand3_dog5.py` | Stage 4 hardware-faithful 3-leg stand rehearsal |
+| `dog5_description/SIM_APPROACH_HW.md` | how the sim is kept hardware-faithful, plus measured transfer notes |
+| `dog5_description/hw_gap_experiments.py` | Stage 6 diagnosis of the crawl leg-drag |
+| `dog5_description/walk_dog5.py` | Stage 6 fixed kinematic crawl |
+| `dog5_description/make_gif.py`, `make_gif3.py`, `make_gif_walk.py` | regenerate the sim GIFs above |
+
+**[`dog5-live-mirror`](../../tree/dog5-live-mirror) — real hardware controllers (the code that actually runs on DOG5)**
+
+| File | What it does |
+|---|---|
+| `stand_dog5_fixed_fend_hw.py` (root) | fixed-foothold stand from the polished crouch; runs the L/R leg-length roll check |
+| `dog5_description/stand_dog5_hw.py` | base operator-gated Cartesian-compliance stand on CAN hardware; CAN round-robin loop, `MOTOR_IDS`/directions |
+| `dog5_description/stand_dog5_recorded_hw.py` | reaches the recorded crouch via `0xA4`, then Cartesian STAND from it |
+| `dog5_description/stand_dog5_inplace_hw.py` | stand-in-place (no foot drag); runs the runtime roll-trim integrator |
+| `dog5_description/crawl_dog5_hw.py` | the real crawl gait — shift/unload/lift/swing/lower/load, encoder-FK support-triangle gates |
+| `dog5_description/stand_by_position_command.py` | stand from pure `0xA4` position commands only, no torque law |
+| `dog5_description/dog5_pose_monitor.py` | zero-torque pose display/capture/hold utility |
+| `dog5_description/dog5_hardware_map.py` | confirmed CAN id → joint map + direction signs |
+| `dog5_description/hw_jointmap.py` | naming/order bridge between MJCF, CAN ids, and gear/encoder scale |
+| `dog5_description/direction_check.py` | 12-motor zero-torque direction verifier / hardware set-zero |
+
+**[`dog5-crawl-sim`](../../tree/dog5-crawl-sim) — advanced, hardware-mirrored crawl sim**
+
+| File | What it does |
+|---|---|
+| `dog5_description/crawl_dog5_sim.py` | fuller crawl sim mirroring `crawl_dog5_hw.py` line-for-line — diagonal `REPOSE`, in-place swing test, tucked-stance walking |
+| `dog5_description/make_gif_crawl.py` | renders it to `dog5_crawl.gif` |
+
+**[can_motor_control](https://github.com/snowyfoams/can_motor_control) — external, public: the low-level CAN driver**
+
+| File | What it does |
+|---|---|
+| `motor_library.py` | `LKMotor` class — the CAN frame protocol (status, position/speed/torque commands, encoder) |
+| `config.py` | unit conversions and bus parameters |
+| `main.py`, `demo_motors.py` | single-motor and multi-motor bring-up/demo scripts |
+| `can_smoke.py`, `read_state.py`, `encoder_compare.py` | bus health checks and telemetry inspection |
+| `torque_impedance.py`, `trajectory_follow.py` | standalone single-motor control demos |
 
 ## Run
 
