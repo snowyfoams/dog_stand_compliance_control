@@ -93,6 +93,25 @@ TRIM_DEADBAND_M = 0.002
 MAX_STAND_HEIGHT = 0.21
 MIN_STAND_HEIGHT = recorded.MIN_STAND_HEIGHT
 
+# Phase 2 IMU leveling (--imu-level): slow per-leg foot-target z trim from
+# body roll/pitch, dog FLU frame (+roll = right side down, +pitch = nose
+# down).  Geometric error dz = -x*pitch + y*roll; integrating a fraction per
+# second gives a ~1/POSTURE_KI_PER_S s time constant -- same order as the
+# support trim, far too slow to fight the Cartesian PD.  Phase 1 measured
+# the need: stands settle ~1 deg left-side-down, below the 2 mm deadband the
+# height-based trim can see (0.66 deg ~ 1.3 mm at half-track 0.1125 m).
+POSTURE_KI_PER_S = 0.25         # fraction of geometric tilt error per second
+# The integrator stops at the deadband edge, so this IS the guaranteed
+# residual.  Plan said 0.5 deg, but measured tilt noise is ~0.03 deg; 0.2
+# stays 7x above the noise floor while beating the 0.66 deg the blind
+# height trim leaves behind.
+POSTURE_DEADBAND_DEG = 0.2
+POSTURE_CLAMP_M = 0.012         # per-foot target shift ceiling
+POSTURE_LPF_FC_HZ = 10.0        # tilt low-pass (noise measured ~0.03 deg)
+POSTURE_STALE_S = 0.05          # older IMU data freezes the trim
+TIPOVER_ABORT_DEG = 25.0        # |roll| or |pitch| beyond this aborts
+TIPOVER_CONFIRM_SAMPLES = 3     # consecutive fresh samples to confirm
+
 # Hard overspeed tier confirmation (the sustained tier is inherited).
 QD_ESTOP_HARD_STREAK = 2            # consecutive driver-only checks (~96 ms)
 QD_ESTOP_HARD_CONFIRM_RATIO = 0.5   # encoder fraction confirming a driver sample
@@ -100,6 +119,58 @@ QD_ESTOP_HARD_CONFIRM_RATIO = 0.5   # encoder fraction confirming a driver sampl
 # above this is treated as a glitch, not a runaway.  If phantoms persist,
 # requiring two consecutive encoder-alone checks is the next step.
 QD_ENC_GLITCH_RAD_S = 25.0
+
+# Phase 1 IMU observation (display only): roll/pitch in the trunk FLU frame
+# on the status line.  No control action consumes it.
+IMU_STALE_S = 0.05
+
+
+def _open_imu():
+    """Open the trunk DETA10 via the imu_dog adapter; display only.
+
+    Returns an ImuDog or None -- any failure just means the status line
+    runs without the [imu] row, never blocks the stand.
+    """
+    from pathlib import Path
+
+    imu_dir = str(Path(__file__).resolve().parents[2] / "IMU_sensor")
+    if imu_dir not in sys.path:
+        sys.path.insert(0, imu_dir)
+    try:
+        from imu_dog import ImuDog
+
+        imu = ImuDog().start()
+        if not imu.wait_for_data(timeout=2.0):
+            imu.stop()
+            print("[imu] no data within 2 s -- running without IMU display")
+            return None
+        print(
+            f"[imu] streaming (display only), offsets roll="
+            f"{imu.roll_offset_deg:+.2f} pitch={imu.pitch_offset_deg:+.2f} deg"
+        )
+        return imu
+    except Exception as exc:
+        print(f"[imu] unavailable ({exc}) -- running without IMU display")
+        return None
+
+
+def _imu_status(imu):
+    """One status row in the dog FLU frame, or '' if the IMU is absent."""
+    if imu is None:
+        return ""
+    try:
+        d = imu.sample()
+    except Exception as exc:
+        return f"[imu] sample failed: {exc}"
+    if d is None:
+        return "[imu] no packets yet"
+    stale = "  STALE" if d.age_s > IMU_STALE_S else ""
+    return (
+        f"[imu] roll={d.roll_deg:+6.2f}deg pitch={d.pitch_deg:+6.2f}deg "
+        f"(+roll=right down, +pitch=nose down) "
+        f"yaw={d.yaw_deg:+7.1f}deg(mag!) age={1000.0 * d.age_s:.0f}ms"
+        f"{stale}"
+    )
 
 
 class ConfirmedSafetyGate(base.SafetyGate):
@@ -216,6 +287,13 @@ class InPlaceStandController(recorded.RecordedCrouchController):
         self.last_leg_sag_m = {leg: 0.0 for leg in LEGS}
         self.last_leg_force_clipped = {leg: False for leg in LEGS}
         self._trim_last_time = None
+        # IMU leveling trim (Phase 2): per-leg foot-target z shift, metres.
+        self.posture_enabled = False
+        self.posture_dz_m = {leg: 0.0 for leg in LEGS}
+        self.last_posture_roll_deg = 0.0
+        self.last_posture_pitch_deg = 0.0
+        self._posture_lpf = None
+        self._posture_last_time = None
 
     def restore_full_targets(self):
         """Recompute the travel-scaled targets (undoes a HOLD_SAG rebase)."""
@@ -273,6 +351,73 @@ class InPlaceStandController(recorded.RecordedCrouchController):
                 np.clip(trim + increment, -TRIM_CLAMP_N, TRIM_CLAMP_N)
             )
 
+    def update_posture_trim(self, now, mode, roll_deg=None, pitch_deg=None):
+        """IMU leveling: integrate body tilt into per-leg foot-target z.
+
+        Same lifecycle as update_support_trim: "reset" zeroes, "freeze"
+        holds, "integrate" runs the loop.  roll/pitch are dog-FLU degrees
+        (+roll = right side down, +pitch = nose down); pass None when the
+        IMU sample is stale or absent -- the trim freezes for that call.
+
+        Nose down (+pitch) -> front feet pushed down (targets extend),
+        right side down (+roll) -> right feet pushed down.  Increments are
+        zero-mean across legs so leveling never changes average height.
+        """
+        now = float(now)
+        if mode == "reset":
+            for leg in LEGS:
+                self.posture_dz_m[leg] = 0.0
+            self._posture_lpf = None
+            self._posture_last_time = now
+            return
+        if mode == "freeze" or roll_deg is None or pitch_deg is None:
+            self._posture_last_time = now
+            return
+        if mode != "integrate":
+            raise ValueError(f"unknown posture trim mode: {mode}")
+        if self._posture_last_time is None:
+            self._posture_last_time = now
+            return
+        dt = float(np.clip(now - self._posture_last_time, 0.0, 0.1))
+        self._posture_last_time = now
+        # Low-pass the tilt (measured vibration is ~0.03 deg; belt and
+        # braces against a future noisier mount).
+        if self._posture_lpf is None:
+            self._posture_lpf = [float(roll_deg), float(pitch_deg)]
+        else:
+            tau_f = 1.0 / (2.0 * np.pi * POSTURE_LPF_FC_HZ)
+            alpha = dt / (tau_f + dt)
+            self._posture_lpf[0] += alpha * (roll_deg - self._posture_lpf[0])
+            self._posture_lpf[1] += alpha * (pitch_deg - self._posture_lpf[1])
+        roll_f, pitch_f = self._posture_lpf
+        self.last_posture_roll_deg = roll_f
+        self.last_posture_pitch_deg = pitch_f
+        phi = np.deg2rad(roll_f) if abs(roll_f) >= POSTURE_DEADBAND_DEG else 0.0
+        theta = (
+            np.deg2rad(pitch_f)
+            if abs(pitch_f) >= POSTURE_DEADBAND_DEG
+            else 0.0
+        )
+        if phi == 0.0 and theta == 0.0:
+            return
+        # Geometric leveling error per foot in the trunk frame (z up in
+        # FLU, foot targets have z negative): extend = more negative.
+        dz_geom = {
+            leg: -self.final_foot[leg][0] * theta
+            + self.final_foot[leg][1] * phi
+            for leg in LEGS
+        }
+        mean_dz = sum(dz_geom.values()) / len(LEGS)
+        for leg in LEGS:
+            increment = POSTURE_KI_PER_S * (dz_geom[leg] - mean_dz) * dt
+            self.posture_dz_m[leg] = float(
+                np.clip(
+                    self.posture_dz_m[leg] + increment,
+                    -POSTURE_CLAMP_M,
+                    POSTURE_CLAMP_M,
+                )
+            )
+
     def _compute_cartesian(self, q, qd, target):
         q = np.asarray(q, dtype=float)
         qd = np.asarray(qd, dtype=float)
@@ -295,6 +440,12 @@ class InPlaceStandController(recorded.RecordedCrouchController):
                 )
 
             desired, desired_velocity, progress = target(leg)
+            if self.posture_dz_m[leg] != 0.0:
+                # IMU leveling trim rides the same progress ramp as the
+                # weight support: full in HOLD, fades through PARK.
+                desired = desired + np.array(
+                    [0.0, 0.0, progress * self.posture_dz_m[leg]]
+                )
             error = desired - foot
             # Positive sag: the body hangs below its target, so the foot
             # sits above the desired point in the trunk frame.
@@ -557,11 +708,24 @@ def run_hardware(
     crouch_speed_trip,
     qd_estop=base.QD_ESTOP,
     qd_estop_hard=base.QD_ESTOP_HARD,
+    controller_factory=None,
+    sequence_factory=None,
+    configuration_validator=None,
+    use_imu=True,
+    imu_level=False,
 ):
-    controller = InPlaceStandController(
-        cart_gain_scale, support_scale, stand_height, travel_scale
-    )
-    max_static_tau = validate_inplace_configuration(controller)
+    if controller_factory is None:
+        controller = InPlaceStandController(
+            cart_gain_scale, support_scale, stand_height, travel_scale
+        )
+    else:
+        controller = controller_factory(
+            cart_gain_scale, support_scale, stand_height, travel_scale
+        )
+    if configuration_validator is None:
+        max_static_tau = validate_inplace_configuration(controller)
+    else:
+        max_static_tau = configuration_validator(controller)
     gate = ConfirmedSafetyGate(tau_max, qd_estop, qd_estop_hard)
     unwrap = [base.CalibratedEncoderUnwrap() for _ in base.HARDWARE_JOINTS]
 
@@ -634,6 +798,27 @@ def run_hardware(
         "STAND IS VALIDATED. P parks from HOLD; X stops."
     )
 
+    imu = _open_imu() if use_imu else None
+    if imu_level:
+        if imu is None:
+            raise RuntimeError(
+                "--imu-level requested but the IMU is unavailable"
+            )
+        controller.posture_enabled = True
+        print(
+            f"[imu] LEVELING ACTIVE: Ki={POSTURE_KI_PER_S:.2f}/s, deadband "
+            f"{POSTURE_DEADBAND_DEG:.1f} deg, clamp "
+            f"+/-{1000.0 * POSTURE_CLAMP_M:.0f} mm/foot, LPF "
+            f"{POSTURE_LPF_FC_HZ:.0f} Hz, stale freeze "
+            f"{1000.0 * POSTURE_STALE_S:.0f} ms; zero-mean across legs; "
+            f"integrates in WAIT_STAND/HOLD only"
+        )
+    if imu is not None:
+        print(
+            f"[imu] tip-over abort armed: |roll| or |pitch| > "
+            f"{TIPOVER_ABORT_DEG:.0f} deg for {TIPOVER_CONFIRM_SAMPLES} "
+            f"consecutive fresh samples"
+        )
     key = base.KeyPoller()
     try:
         with base.motorbus.MotorBus(
@@ -649,7 +834,14 @@ def run_hardware(
 
                 start_q = recorded.zero_torque_preflight(mb, key, unwrap)
                 now = time.perf_counter()
-                sequence = InPlaceStandSequence(now, start_q, travel_scale)
+                if sequence_factory is None:
+                    sequence = InPlaceStandSequence(
+                        now, start_q, travel_scale
+                    )
+                else:
+                    sequence = sequence_factory(
+                        now, start_q, travel_scale, controller
+                    )
                 gate.start(now, start_q)
                 print(
                     "[inplace] ENTER accepted: native position control moving "
@@ -676,6 +868,8 @@ def run_hardware(
                 last_print = 0.0
                 index = 0
                 velocity = recorded.EncoderVelocity()
+                tipover_streak = 0
+                last_imu_stale_warn = 0.0
 
                 while True:
                     mb.poll()
@@ -789,6 +983,47 @@ def run_hardware(
                             now, trim_mode, saturated_legs
                         )
 
+                        imu_roll = imu_pitch = None
+                        if imu is not None:
+                            try:
+                                imu_sample = imu.sample()
+                            except Exception:
+                                imu_sample = None
+                            if (
+                                imu_sample is not None
+                                and imu_sample.age_s <= POSTURE_STALE_S
+                            ):
+                                imu_roll = imu_sample.roll_deg
+                                imu_pitch = imu_sample.pitch_deg
+                                if (
+                                    abs(imu_roll) > TIPOVER_ABORT_DEG
+                                    or abs(imu_pitch) > TIPOVER_ABORT_DEG
+                                ):
+                                    tipover_streak += 1
+                                    if tipover_streak >= TIPOVER_CONFIRM_SAMPLES:
+                                        raise RuntimeError(
+                                            f"IMU tip-over: roll="
+                                            f"{imu_roll:+.1f} pitch="
+                                            f"{imu_pitch:+.1f} deg exceeds "
+                                            f"{TIPOVER_ABORT_DEG:.0f} deg"
+                                        )
+                                else:
+                                    tipover_streak = 0
+                            elif (
+                                controller.posture_enabled
+                                and trim_mode == "integrate"
+                                and now - last_imu_stale_warn >= 1.0
+                            ):
+                                last_imu_stale_warn = now
+                                print(
+                                    "[imu] WARNING: stale/no data -- "
+                                    "leveling trim frozen"
+                                )
+                        if controller.posture_enabled:
+                            controller.update_posture_trim(
+                                now, trim_mode, imu_roll, imu_pitch
+                            )
+
                         temps = base._temperatures(mb)
                         misses = miss_monitor.update(mb)
                         errors = mb.errors()
@@ -887,20 +1122,24 @@ def run_hardware(
                             )
                             actual_heights = []
                             target_heights = []
+                            actual_heights_by_leg = {}
+                            target_heights_by_leg = {}
                             for leg_index, leg in enumerate(LEGS):
                                 section = slice(
                                     3 * leg_index, 3 * leg_index + 3
                                 )
-                                actual_heights.append(
-                                    -float(
-                                        dog5_kinematics.foot_position(
-                                            leg, q[section]
-                                        )[2]
-                                    )
+                                actual_height = -float(
+                                    dog5_kinematics.foot_position(
+                                        leg, q[section]
+                                    )[2]
                                 )
-                                target_heights.append(
-                                    -float(controller.final_foot[leg][2])
+                                target_height = -float(
+                                    controller.final_foot[leg][2]
                                 )
+                                actual_heights.append(actual_height)
+                                target_heights.append(target_height)
+                                actual_heights_by_leg[leg] = actual_height
+                                target_heights_by_leg[leg] = target_height
                             print(
                                 f"[inplace] stage={sequence.stage:11s} "
                                 f"crouch_err={pose_error:.2f}rad "
@@ -935,12 +1174,34 @@ def run_hardware(
                                     f"{controller.z_trim_n[leg]:+.1f}"
                                     for leg in LEGS
                                 )
+                                lvl_text = ""
+                                if controller.posture_enabled:
+                                    lvl_mm = ",".join(
+                                        f"{1000.0 * controller.posture_dz_m[leg]:+.1f}"
+                                        for leg in LEGS
+                                    )
+                                    lvl_text = f" lvl_mm=({lvl_mm})"
                                 print(
                                     f"[legs] sag_mm=({sag_text}) "
-                                    f"trim_N=({trim_text}) "
+                                    f"trim_N=({trim_text})"
+                                    f"{lvl_text} "
                                     f"settle={_settle_text(sequence, now)}",
                                     flush=True,
                                 )
+                            status_hook = getattr(
+                                controller, "additional_status", None
+                            )
+                            if callable(status_hook):
+                                extra_status = status_hook(
+                                    sequence.stage,
+                                    actual_heights_by_leg,
+                                    target_heights_by_leg,
+                                )
+                                if extra_status:
+                                    print(extra_status, flush=True)
+                            imu_row = _imu_status(imu)
+                            if imu_row:
+                                print(imu_row, flush=True)
                             last_print = now
 
                     mid = MOTOR_IDS[joint_index]
@@ -981,6 +1242,11 @@ def run_hardware(
                         )
     finally:
         key.close()
+        if imu is not None:
+            try:
+                imu.stop()
+            except Exception:
+                pass
     return 0
 
 
@@ -1054,6 +1320,76 @@ def offline_self_test(stand_height=recorded.DEFAULT_STAND_HEIGHT,
     assert trim_controller.z_trim_n == frozen
     trim_controller.update_support_trim(0.8, "reset")
     assert all(trim_controller.z_trim_n[leg] == 0.0 for leg in LEGS)
+
+    # Posture (IMU leveling) trim: signs, zero-mean, deadband, clamp,
+    # lifecycle, stale freeze.  Tilt in dog FLU degrees.
+    posture = InPlaceStandController(0.25, 0.25, stand_height, 1.0)
+    posture.update_posture_trim(0.0, "integrate", 0.0, 0.0)
+    posture.update_posture_trim(0.1, "integrate", 0.0, 4.0)  # nose DOWN
+    assert posture.posture_dz_m["FL"] < 0.0 and posture.posture_dz_m["FR"] < 0.0, (
+        "nose down must extend the front legs (targets pushed down)"
+    )
+    assert posture.posture_dz_m["RL"] > 0.0 and posture.posture_dz_m["RR"] > 0.0
+    assert abs(sum(posture.posture_dz_m.values())) < 1.0e-12, (
+        "leveling must be zero-mean across legs"
+    )
+    posture.update_posture_trim(0.2, "reset")
+    assert all(posture.posture_dz_m[leg] == 0.0 for leg in LEGS)
+    posture.update_posture_trim(0.3, "integrate", 0.0, 0.0)
+    posture.update_posture_trim(0.4, "integrate", 4.0, 0.0)  # RIGHT side down
+    assert posture.posture_dz_m["FR"] < 0.0 and posture.posture_dz_m["RR"] < 0.0, (
+        "right side down must extend the right legs"
+    )
+    assert posture.posture_dz_m["FL"] > 0.0 and posture.posture_dz_m["RL"] > 0.0
+    posture.update_posture_trim(0.5, "reset")
+    sub_deadband = 0.5 * POSTURE_DEADBAND_DEG
+    posture.update_posture_trim(0.6, "integrate", sub_deadband, sub_deadband)
+    posture.update_posture_trim(0.7, "integrate", sub_deadband, sub_deadband)
+    assert all(posture.posture_dz_m[leg] == 0.0 for leg in LEGS), (
+        "tilt below the deadband must not integrate"
+    )
+    t = 0.8
+    for _ in range(600):  # 60 s of a huge sustained tilt -> clamp
+        posture.update_posture_trim(t, "integrate", 20.0, 20.0)
+        t += 0.1
+    assert all(
+        abs(posture.posture_dz_m[leg]) <= POSTURE_CLAMP_M + 1.0e-12
+        for leg in LEGS
+    )
+    assert any(
+        np.isclose(abs(posture.posture_dz_m[leg]), POSTURE_CLAMP_M)
+        for leg in LEGS
+    )
+    frozen_dz = dict(posture.posture_dz_m)
+    posture.update_posture_trim(t, "freeze", 20.0, 20.0)
+    assert posture.posture_dz_m == frozen_dz
+    posture.update_posture_trim(t + 0.1, "integrate", None, None)
+    assert posture.posture_dz_m == frozen_dz, (
+        "stale IMU (None tilt) must freeze the leveling trim"
+    )
+    posture.update_posture_trim(t + 0.2, "reset")
+    assert all(posture.posture_dz_m[leg] == 0.0 for leg in LEGS)
+
+    # Leveling trim rides the progress ramp: applied at PARK start (progress
+    # 1) and fully faded at PARK end (progress 0).
+    lvl_fade = InPlaceStandController(0.25, 0.25, stand_height, 0.05)
+    lvl_zero = np.zeros(N_JOINTS)
+    lvl_baseline_start = lvl_fade.compute_park(
+        Q_RECORDED_CROUCH.copy(), lvl_zero, 0.0
+    )
+    lvl_baseline_end = lvl_fade.compute_park(
+        Q_RECORDED_CROUCH.copy(), lvl_zero, T_PARK
+    )
+    for leg in LEGS:
+        lvl_fade.posture_dz_m[leg] = 0.005 if leg in ("FL", "FR") else -0.005
+    lvl_start = lvl_fade.compute_park(Q_RECORDED_CROUCH.copy(), lvl_zero, 0.0)
+    lvl_end = lvl_fade.compute_park(Q_RECORDED_CROUCH.copy(), lvl_zero, T_PARK)
+    assert not np.allclose(lvl_start, lvl_baseline_start), (
+        "leveling trim must move the commanded targets"
+    )
+    assert np.allclose(lvl_end, lvl_baseline_end, atol=1.0e-10), (
+        "leveling trim must fade to nothing through PARK"
+    )
 
     # Trim rides the progress ramp: full effect at PARK start, none at end.
     fade = InPlaceStandController(0.25, 0.25, stand_height, 0.05)
@@ -1225,6 +1561,13 @@ def offline_self_test(stand_height=recorded.DEFAULT_STAND_HEIGHT,
         f"+/-{TRIM_CLAMP_N:.1f} N, deadband {1000.0 * TRIM_DEADBAND_M:.0f} mm"
     )
     print(
+        f"  IMU leveling (--imu-level): Ki={POSTURE_KI_PER_S:.2f}/s, "
+        f"deadband {POSTURE_DEADBAND_DEG:.1f} deg, clamp "
+        f"+/-{1000.0 * POSTURE_CLAMP_M:.0f} mm/foot, zero-mean, stale "
+        f"freeze {1000.0 * POSTURE_STALE_S:.0f} ms, tip-over abort "
+        f"{TIPOVER_ABORT_DEG:.0f} deg"
+    )
+    print(
         f"  WAIT_STAND timeout: {WAIT_STAND_TIMEOUT_S:.0f} s -> HOLD_SAG "
         "(rebased hold, park allowed)"
     )
@@ -1345,6 +1688,21 @@ def main():
         action="store_true",
         help="validate targets, trim, sequence, and overspeed without CAN",
     )
+    parser.add_argument(
+        "--no-imu",
+        action="store_true",
+        help="skip the trunk IMU roll/pitch status row (display only)",
+    )
+    parser.add_argument(
+        "--imu-level",
+        action="store_true",
+        help=(
+            "close the IMU leveling loop: slow zero-mean foot-target z "
+            f"trim, deadband {POSTURE_DEADBAND_DEG:.1f} deg, clamp "
+            f"+/-{1000.0 * POSTURE_CLAMP_M:.0f} mm/foot, active in "
+            "WAIT_STAND and HOLD (off by default: display only)"
+        ),
+    )
     args = parser.parse_args()
 
     if not 0.0 < args.tau_max <= base.STAGED_TAU_MAX:
@@ -1380,6 +1738,8 @@ def main():
             "--qd-estop-hard must be above --qd-estop and "
             f"<= {base.QD_ESTOP_CEILING} rad/s"
         )
+    if args.imu_level and args.no_imu:
+        parser.error("--imu-level conflicts with --no-imu")
     if args.self_test:
         return offline_self_test(args.stand_height, args.travel_scale)
 
@@ -1395,6 +1755,8 @@ def main():
             args.crouch_speed_trip,
             args.qd_estop,
             args.qd_estop_hard,
+            use_imu=not args.no_imu,
+            imu_level=args.imu_level,
         )
     except (RuntimeError, ValueError) as exc:
         print(f"[inplace] ERROR: {exc}", file=sys.stderr)
