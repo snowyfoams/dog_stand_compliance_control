@@ -31,6 +31,7 @@ radius) with zero steady-state droop, level attitude, and survives an
 - `dog5_description/stand_dog5.py` — stand-up controller; run without args for the interactive viewer, `--headless` for a metrics-only test
 - `dog5_description/stand_dog5_hw.py` — hardware-only runner; real encoders in, real CAN torque out (no HIL or simulated plant)
 - `dog5_description/stand_dog5_recorded_hw.py` — current pose to the measured crouch, then operator-gated Cartesian compliance stand
+- `dog5_description/stand_dog5_fl_rr_extend_hw.py` — stand in place, then smoothly extend and hold the FL/RR diagonal foot endpoints
 - `dog5_description/dog5_pose_monitor.py` — zero-torque live position monitor; captures a manually arranged pose and can hold it with conservative joint PD
 - `dog5_description/dog5_hardware_map.py` — confirmed DOG5 CAN-to-joint map shared by the verifier and hardware runner
 - `dog5_description/dog5_zero_calibrate.py` — one-time all-joint motor-zero writer (`0x19`, zero torque, confirmed)
@@ -163,6 +164,24 @@ position-limit e-stop and the true `--tau-max` torque command cap are enabled.
 It reports `HOLD_PARTIAL`, not `HOLD`. Use the partial run to inspect signs and
 tracking, then progress toward `--travel-scale 1.0` for the complete 0.20 m
 target.
+
+## Extend FL and RR after standing
+
+`stand_dog5_fl_rr_extend_hw.py` uses the stand-in-place controller, waits for
+the full standing target to settle in `HOLD`, and requires another Enter before
+moving the FL and RR targets farther downward along trunk Z. FR and RL keep
+their normal endpoints. The default diagonal extension is 20 mm over 3 s and
+then remains in `EXTENDED_HOLD`:
+
+```bash
+../.venv/bin/python dog5_description/stand_dog5_fl_rr_extend_hw.py --self-test
+../.venv/bin/python dog5_description/stand_dog5_fl_rr_extend_hw.py \
+  --tau-max 3.0 --extension-mm 20
+```
+
+Keep the robot mechanically supported or tethered. This encoder-only motion
+cannot measure trunk attitude or verify foot contact, and the unequal diagonal
+targets intentionally change the load distribution.
 
 ## Modelling notes (hard-won)
 

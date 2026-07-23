@@ -62,6 +62,34 @@ _X_AXIS = np.array([1.0, 0.0, 0.0])
 _Z_AXIS = np.array([0.0, 0.0, 1.0])
 
 
+@dataclass(frozen=True)
+class LinkInertial:
+    mass: float
+    com: tuple[float, float, float]
+
+
+# Controlled copy of the dog5.xml hip/thigh/shin body inertials (mass and
+# inertial pos in the owning body frame).  Front and rear pairs mirror in x,
+# exactly as in the XML.
+_FRONT_LINK_INERTIALS = (
+    LinkInertial(0.39152916, (0.04378628, -0.00000166, -0.05507725)),
+    LinkInertial(0.36932519, (0.11348071, 0.00014012, -0.01397932)),
+    LinkInertial(0.0381955, (0.07623007, -0.00009226, -0.00002971)),
+)
+_REAR_LINK_INERTIALS = (
+    LinkInertial(0.39152916, (-0.04378728, 0.00000166, -0.05507725)),
+    LinkInertial(0.36932519, (-0.11348071, -0.00014012, -0.01397932)),
+    LinkInertial(0.0381955, (-0.07623007, 0.00009226, -0.00002971)),
+)
+LINK_INERTIALS = {
+    "FL": _FRONT_LINK_INERTIALS,
+    "FR": _FRONT_LINK_INERTIALS,
+    "RL": _REAR_LINK_INERTIALS,
+    "RR": _REAR_LINK_INERTIALS,
+}
+_GRAVITY_M_S2 = 9.81
+
+
 def _checked_q(q) -> np.ndarray:
     q = np.asarray(q, dtype=float)
     if q.shape != (3,):
@@ -133,3 +161,36 @@ def foot_jacobian(leg: str, q) -> np.ndarray:
     return np.column_stack(
         [np.cross(axis, foot - anchor) for anchor, axis in zip(anchors, axes)]
     )
+
+
+def leg_gravity_torque(leg: str, q) -> np.ndarray:
+    """Torque the three motors must hold against the leg's own link weights.
+
+    Statics with no foot contact: measured joint torque equals this value, so
+    subtracting it from torque feedback isolates the external (ground) load.
+    Assumes the trunk is horizontal (gravity along trunk -z).
+    """
+    q_abd, q_pitch, q_knee = _checked_q(q)
+    geom = _geometry(leg)
+
+    hip = np.asarray(geom.hip)
+    r_hip = _rot_x(q_abd)
+    pitch = hip + r_hip @ np.asarray(geom.hip_to_pitch)
+    r_thigh = r_hip @ _rot_z(q_pitch)
+    knee = pitch + r_thigh @ np.asarray(geom.pitch_to_knee)
+    r_shin = r_thigh @ _rot_z(q_knee)
+
+    anchors = (hip, pitch, knee)
+    axes = (_X_AXIS, r_hip @ _Z_AXIS, r_thigh @ _Z_AXIS)
+    com_frames = ((hip, r_hip), (pitch, r_thigh), (knee, r_shin))
+
+    tau = np.zeros(3)
+    for link_index, inertial in enumerate(LINK_INERTIALS[leg]):
+        origin, rotation = com_frames[link_index]
+        com = origin + rotation @ np.asarray(inertial.com)
+        weight = inertial.mass * _GRAVITY_M_S2
+        # A joint only carries links at or below it in the chain.
+        for joint_index in range(link_index + 1):
+            dcom = np.cross(axes[joint_index], com - anchors[joint_index])
+            tau[joint_index] += weight * dcom[2]
+    return tau

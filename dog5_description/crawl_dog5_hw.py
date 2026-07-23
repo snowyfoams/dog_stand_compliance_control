@@ -7,10 +7,14 @@ Only one foot swings at a time.  Every step is:
 
     SHIFT -> UNLOAD -> LIFT -> SWING -> LOWER -> LOAD -> RECENTER
 
-Before liftoff, the trunk moves ``--shift-distance`` diagonally away from the
-next swing leg.  The command is expressed by moving every stance-foot target
-the opposite way in the trunk frame.  Each stance foot has a fixed conceptual
-ground anchor, so changing the body target cannot command stance-foot slip.
+Before liftoff, the trunk shifts by ``--shift-distance`` perpendicular to the
+nearest edge of the current stance triangle -- the edge that limits the
+support margin -- so the shift adapts to whatever (possibly skewed) geometry
+the previous steps left behind, instead of a fixed diagonal that only suits
+the symmetric rectangle.  The command is expressed by moving every stance-foot
+target the opposite way in the trunk frame.  Each stance foot has a fixed
+conceptual ground anchor, so changing the body target cannot command
+stance-foot slip.
 
 The support triangle is calculated directly from encoder FK.  LIFT cannot
 begin until the trunk-frame CoM projection (the origin) is at least 15 mm
@@ -18,9 +22,14 @@ inside the other three feet, and leaving the triangle during swing stops the
 run.  The geometric margin assumes the CoM sits at the body origin, so the
 UNLOAD phase adds a physical check: the swing leg's support feedforward
 fades to zero while the foot is still planted, and LIFT is refused until the
-leg MEASURES unloaded (pitch/knee |tau_fb| below ``--unload-tau-trip`` and
-relative sag below 8 mm).  A real CoM offset that geometry cannot see fails
-this gate before the foot ever leaves the ground.
+leg MEASURES unloaded (gravity-compensated pitch/knee |tau_ext| below
+``--unload-tau-trip`` and relative sag below 8 mm).  While the leg still
+measures loaded, the body keeps shifting deeper along the same inward normal
+(force-feedback, up to +20 mm extra, bounded by the planned support margin
+and the joint soft limits), so a real CoM offset that geometry cannot see is
+walked out by measurement instead of failing the step.  Only when that safe
+budget is exhausted does the gate abort.  Once airborne, a drag watch aborts
+gracefully if the swing foot still measures ground load (foot scraping).
 
 Mid-step gate failures (liftoff margin, unload gate, touchdown, recenter) no
 longer stop the run: the planner reloads the swing leg where it stands,
@@ -36,7 +45,9 @@ The default timing is a conservative 3 s slot per leg (12 s per four-leg gait
 cycle) with nominal duty factor 0.90.  One complete gait cycle is run by
 default, after which targets are again the original symmetric stand targets.
 ENTER repeats another batch; P parks only from a stationary hold; X stops at
-any time.
+any time.  T tares the fz load-map display (press while holding the robot
+with ALL feet off the ground; removes the gear-friction/model-bias residual,
+display only -- gates are never tared).
 
 Mechanically support the robot for initial tests::
 
@@ -74,9 +85,19 @@ POSITION_TARGET_DEG = recorded.POSITION_TARGET_DEG
 T_STAND = recorded.T_STAND
 T_PARK = recorded.T_PARK
 
-# A lateral-sequence static crawl.  Every leg is in stance while any other
+# A diagonal-sequence static crawl.  Every leg is in stance while any other
 # leg is swinging, and the diagonal body shift makes each liftoff static.
-GAIT_ORDER = ("RR", "FR", "RL", "FL")
+# The order is each hind leg followed by the DIAGONALLY OPPOSITE front leg
+# (RR->FL, then RL->FR), which is the maximum-stability crawl sequence: the
+# swing legs alternate across the diagonal so the loaded three-foot triangle
+# stays well-centred instead of collapsing to one side.
+GAIT_ORDER = ("RR", "FL", "RL", "FR")
+
+# Insert a mandatory, ENTER-gated four-foot hold after every this-many steps,
+# i.e. between the two diagonal pairs (RR FL <hold> RL FR <hold> ...).  Unlike
+# --observe-phases (which pauses at every phase boundary), this hold is always
+# active: the robot settles flat on all four feet and waits for the operator.
+MANDATORY_HOLD_EVERY = 2
 
 # Fractions of one per-leg slot.  Only LIFT/SWING/LOWER count as swing, so one
 # leg is airborne for 0.40 of its slot and for 0.10 of a four-slot gait cycle.
@@ -115,27 +136,66 @@ NOMINAL_DUTY_FACTOR = 1.0 - sum(
 ) / len(GAIT_ORDER)
 
 DEFAULT_TAU_MAX = base.STAGED_TAU_MAX
-# 0.19 m is the tallest height at which the default 30 mm forward step stays
-# IK-reachable (the front-leg touchdown combines step + lateral shift and
-# sits at the reach boundary; 0.20 m fails validation for any step > 0).
-# For in-place swing tests --stand-height 0.20 --swing-test is valid and
-# buys ~0.4 deg of abduction-limit margin.
-DEFAULT_STAND_HEIGHT_M = 0.19
-DEFAULT_SHIFT_DISTANCE_M = 0.03
+# Keep the trunk low for a lower CoM.  At 0.10 m, the old 30 mm body shift and
+# 25 mm lift leave the abduction workspace, so the coupled defaults below use
+# a 22.5 mm shift and 20 mm lift.  The full 30 mm forward gait remains
+# reachable and retains about 20 mm of planned support-triangle margin.
+MIN_CRAWL_STAND_HEIGHT_M = 0.10
+# 0.15 m (was 0.10): at 0.10 the abduction joint sits within ~0.1 deg of its
+# soft limit during the body shift, so the gate clamps the outward torque and
+# the shift never completes -- the swing leg then cannot unload.  Letting the
+# legs hang lower (knee -116 -> -90 deg) frees abduction headroom so the shift
+# finishes; conditioning and mg/3 torque stay healthy.  --stand-height still
+# spans 0.10..0.21 for experiments.
+DEFAULT_STAND_HEIGHT_M = 0.15
+# 26 mm (was 22.5): with the adaptive shift and the headroom from 0.15 m, this
+# keeps the worst (skewed second-pair) support-triangle margin near +21 mm --
+# well above the 15 mm liftoff floor -- while leaving ~1.4 deg of abduction.
+DEFAULT_SHIFT_DISTANCE_M = 0.026
 DEFAULT_STEP_LENGTH_M = 0.03
-DEFAULT_SWING_HEIGHT_M = 0.025
+DEFAULT_SWING_HEIGHT_M = 0.020
 DEFAULT_LEG_CYCLE_S = 3.0
 DEFAULT_GAIT_CYCLES = 1
 
 # UNLOAD gate: the swing leg must physically measure unloaded before LIFT.
-# Torque feedback on its pitch and knee must stay below the trip and the
-# RELATIVE sag (swing minus mean stance -- moving 4 -> 3 loaded legs sags the
-# whole trunk, which absolute sag would misread) below the maximum, sustained
-# for the settle time.  Timing out aborts the step instead of lifting.
+# GRAVITY-COMPENSATED torque feedback on its pitch and knee (measured minus
+# the leg's own link-weight holding torque, ~0.4 N*m at the stand pose) must
+# stay below the trip and the RELATIVE sag (swing minus mean stance -- moving
+# 4 -> 3 loaded legs sags the whole trunk, which absolute sag would misread)
+# below the maximum, sustained for the settle time.  Timing out aborts the
+# step instead of lifting.
 DEFAULT_UNLOAD_TAU_TRIP_NM = 0.45
 UNLOAD_REL_SAG_MAX_M = 0.008
 UNLOAD_GATE_SETTLE_S = 0.20
-UNLOAD_GATE_TIMEOUT_S = 1.5
+# Force-feedback shift: geometry says WHERE to shift, but the measured swing
+# torque says WHETHER the leg actually unloaded -- with a real CoM offset the
+# planned shift can complete and still leave the leg loaded (foot drags).  So
+# while the gate reads loaded, keep shifting deeper along the same inward
+# normal, up to an extra budget bounded by the planned support margin and the
+# (linearized) joint limits.  Timeout raised 1.5 -> 3.5 s to give the extra
+# shift time to act; the abort path is unchanged.
+UNLOAD_GATE_TIMEOUT_S = 3.5
+UNLOAD_EXTRA_RATE_M_S = 0.012
+UNLOAD_EXTRA_MAX_M = 0.020
+
+# IMU lean watch (Phase 3): during 3-leg support the encoder-based support
+# triangle assumes rigid geometry, but the body measurably tilts beyond it
+# (Phase 1: stands sag ~1 deg, ramps ~4 deg).  A tilt CHANGE beyond this
+# many degrees from the liftoff attitude means the body is falling toward
+# the airborne corner -> graceful step abort (same reload+recenter path as
+# the drag watch), not a run stop.
+CRAWL_LEAN_ABORT_DEG = 6.0
+CRAWL_LEAN_STREAK = 3           # consecutive fresh samples to confirm
+# Keep this below the abduction headroom left by the base shift (~1.4 deg at
+# H=0.15), or the lateral growth budget collapses to zero and only the
+# longitudinal fallback direction remains.
+UNLOAD_LIMIT_MARGIN_RAD = 0.02
+# Drag watch: once airborne (LIFT/SWING) the compensated swing torque should
+# read ~0; sustained torque means the foot is scraping the ground.  Abort
+# gracefully instead of dragging through the step.  Threshold is deliberately
+# above the unload trip to ignore swing dynamics.
+SWING_DRAG_TAU_TRIP_NM = 0.90
+SWING_DRAG_STREAK = 3
 
 MIN_LIFTOFF_MARGIN_M = 0.015
 SUPPORT_MARGIN_ESTOP_M = 0.0
@@ -241,6 +301,100 @@ def support_triangle_margin(points_xy, com_xy=(0.0, 0.0)):
     return min(margins)
 
 
+def leg_gravity_stack(q):
+    """Stacked per-joint torque holding every leg's own links, at pose q."""
+    q = np.asarray(q, dtype=float)
+    stacked = np.zeros(N_JOINTS)
+    for index, leg in enumerate(LEGS):
+        section = slice(3 * index, 3 * index + 3)
+        stacked[section] = dog5_kinematics.leg_gravity_torque(leg, q[section])
+    return stacked
+
+
+def foot_load_map(q, measured_tau, tau_offset=None):
+    """Per-leg vertical support force (N, positive down into the ground) and
+    the CoM xy implied by the load distribution, from measured joint torque
+    via f = J^-T (tau - tau_leg_gravity - tau_offset).  Subtracting each
+    leg's own link weight isolates the external ground load, so an airborne
+    leg reads ~0 instead of the ~0.4-0.5 N*m it holds against gravity.
+
+    The remaining noise floor is gearbox static friction and small mass-model
+    errors, a few 0.01 N*m per joint -- amplified by the folded-pose Jacobian
+    (sigma_min ~0.018 at crouch) to ~1 N of phantom force.  ``tau_offset``
+    (the operator 'T' tare, captured with all feet OFF the ground) removes
+    the repeatable part of that bias for the display."""
+    q = np.asarray(q, dtype=float)
+    measured_tau = np.asarray(measured_tau, dtype=float)
+    support = {}
+    weighted_xy = np.zeros(2)
+    total = 0.0
+    for index, leg in enumerate(LEGS):
+        section = slice(3 * index, 3 * index + 3)
+        jacobian = dog5_kinematics.foot_jacobian(leg, q[section])
+        # Near-singular legs (folded crouch) turn small torque noise into
+        # huge force estimates; report unknown instead of garbage.
+        if np.linalg.svd(jacobian, compute_uv=False)[-1] < 1.0e-3:
+            support[leg] = np.nan
+            continue
+        external_tau = measured_tau[section] - dog5_kinematics.leg_gravity_torque(
+            leg, q[section]
+        )
+        if tau_offset is not None:
+            external_tau = external_tau - np.asarray(
+                tau_offset, dtype=float
+            )[section]
+        try:
+            force = np.linalg.solve(jacobian.T, external_tau)
+        except np.linalg.LinAlgError:
+            support[leg] = np.nan
+            continue
+        support[leg] = -float(force[2])
+        if support[leg] > 0.0:
+            weighted_xy += support[leg] * dog5_kinematics.foot_position(
+                leg, q[section]
+            )[:2]
+            total += support[leg]
+    com_xy = weighted_xy / total if total > 1.0 else np.full(2, np.nan)
+    return support, com_xy
+
+
+def adaptive_body_shift(swing_xy, stance_points, body_xy, shift_distance):
+    """Body target that moves the CoM away from the current triangle's edge.
+
+    After the first diagonal pair steps forward the four feet are no longer a
+    symmetric rectangle, so a fixed 45-degree diagonal aims the CoM at the
+    wrong place.  This instead shifts along the inward normal of the stance
+    triangle edge NEAREST the CoM -- the edge that limits the support margin --
+    so the shift is always perpendicular to whatever is about to be violated,
+    for any (even skewed, multi-cycle) geometry.  Falls back to the old
+    away-from-swing diagonal only if the triangle is degenerate.
+
+    Returns ``(shifted_body_xy, unit_normal)``; the normal lets the UNLOAD
+    force-feedback extend the shift along the same direction.
+    """
+    body_xy = np.asarray(body_xy, dtype=float)
+    pts = [np.asarray(p, dtype=float) for p in stance_points]
+    centroid = np.mean(pts, axis=0)
+    best_distance, best_normal = np.inf, None
+    for i in range(len(pts)):
+        a, b = pts[i], pts[(i + 1) % len(pts)]
+        edge = b - a
+        length = float(np.linalg.norm(edge))
+        if length < 1.0e-9:
+            continue
+        normal = np.array([-edge[1], edge[0]]) / length
+        if np.dot(normal, centroid - a) < 0.0:
+            normal = -normal
+        distance = float(np.dot(normal, body_xy - a))
+        if distance < best_distance:
+            best_distance, best_normal = distance, normal
+    if best_normal is None:
+        signs = np.sign(np.asarray(swing_xy, dtype=float) - body_xy)
+        signs[signs == 0.0] = 1.0
+        best_normal = -signs / np.sqrt(2.0)
+    return body_xy + shift_distance * best_normal, best_normal
+
+
 class CrawlGaitPlanner:
     """Stateful body/foot-anchor planner for a finite static crawl."""
 
@@ -278,6 +432,7 @@ class CrawlGaitPlanner:
         self.aborted = False
         self.abort_reason = None
         self.paused = False
+        self.mandatory_hold = False
         self.phase = "IDLE"
         self.phase_started_at = 0.0
         self.phase_settle_since = None
@@ -292,6 +447,13 @@ class CrawlGaitPlanner:
         self.touchdown_plane_baseline_m = 0.0
         self.last_unload_tau_nm = np.nan
         self.last_unload_rel_sag_m = np.nan
+        self.shift_normal = np.zeros(2)
+        self.base_shifted_body_xy = np.zeros(2)
+        self.unload_extra_m = 0.0
+        self.unload_extra_cap_m = None
+        self.unload_growth_dir = np.zeros(2)
+        self.unload_grow_at = None
+        self.swing_drag_streak = 0
 
     @property
     def swing_leg(self):
@@ -350,6 +512,7 @@ class CrawlGaitPlanner:
         self.aborted = False
         self.abort_reason = None
         self.paused = False
+        self.mandatory_hold = False
         self.step_index = 0
         self.world_foot_xy = {
             leg: xy.copy() for leg, xy in self.nominal_xy.items()
@@ -358,16 +521,21 @@ class CrawlGaitPlanner:
         self.touchdown_plane_baseline_m = 0.0
         self._begin_step(float(now), pause=False)
 
-    def _begin_step(self, now, pause=False):
+    def _begin_step(self, now, pause=False, mandatory_pause=False):
         leg = GAIT_ORDER[self.step_index % len(GAIT_ORDER)]
-        relative = self.world_foot_xy[leg] - self.body_xy
-        signs = np.sign(relative)
-        if np.any(signs == 0.0):
-            raise RuntimeError(f"cannot choose diagonal shift for {leg}: {relative}")
-        # Body motion is away from the swing corner.  Fixed ground feet appear
-        # to move equally and oppositely (toward that corner) in the body frame.
-        body_shift = -self.shift_distance * signs / np.sqrt(2.0)
-        self.shifted_body_xy = self.body_xy + body_shift
+        # Shift the CoM away from the nearest edge of the ACTUAL stance
+        # triangle (the three planted feet), so the shift adapts to whatever
+        # geometry the previous steps left behind.
+        stance_pts = [self.world_foot_xy[s] for s in LEGS if s != leg]
+        self.shifted_body_xy, self.shift_normal = adaptive_body_shift(
+            self.world_foot_xy[leg], stance_pts, self.body_xy, self.shift_distance
+        )
+        self.base_shifted_body_xy = self.shifted_body_xy.copy()
+        self.unload_extra_m = 0.0
+        self.unload_extra_cap_m = None
+        self.unload_growth_dir = np.asarray(self.shift_normal, dtype=float)
+        self.unload_grow_at = None
+        self.swing_drag_streak = 0
         self.next_body_xy = self.body_xy + np.array(
             [self.step_length / len(GAIT_ORDER), 0.0]
         )
@@ -379,7 +547,11 @@ class CrawlGaitPlanner:
         self.phase_settle_since = None
         self.phase_wait_started = None
         self.gate_timeout_reason = None
-        self.paused = bool(self.observe_phases and pause)
+        # A mandatory pause holds at the SHIFT start, whose target is the
+        # neutral four-foot stance (elapsed 0 => zero body shift), so the
+        # robot waits flat and stable until ENTER.
+        self.mandatory_hold = bool(mandatory_pause)
+        self.paused = bool(mandatory_pause or (self.observe_phases and pause))
 
     def _set_phase(self, phase, now, pause=True):
         self.phase = phase
@@ -387,6 +559,7 @@ class CrawlGaitPlanner:
         self.phase_settle_since = None
         self.phase_wait_started = None
         self.gate_timeout_reason = None
+        self.mandatory_hold = False
         self.paused = bool(self.observe_phases and pause)
 
     def _begin_abort(self, now, q, reason):
@@ -402,12 +575,14 @@ class CrawlGaitPlanner:
         self.aborted = True
         self.abort_reason = reason
         leg = self.swing_leg
-        if self.phase == "LOWER" and q is not None:
+        # Drag aborts (LIFT/SWING) fire precisely because the foot is on the
+        # ground, so they take the same commit-and-reload path as LOWER.
+        if self.phase in ("LIFT", "SWING", "LOWER") and q is not None:
             # The foot physically stands wherever the swing ended; commit the
             # measured position as its anchor so no target drags it sideways.
             feet = self.actual_foot_positions(q)
             self.world_foot_xy[leg] = feet[leg][:2] + self.shifted_body_xy
-        if self.phase in ("UNLOAD", "LOWER"):
+        if self.phase in ("UNLOAD", "LIFT", "SWING", "LOWER"):
             self._set_phase("ABORT_LOAD", now, pause=False)
         else:
             self._set_phase("ABORT_RECENTER", now, pause=False)
@@ -438,6 +613,7 @@ class CrawlGaitPlanner:
         if not self.paused:
             return False, f"{self.phase} is already running"
         self.paused = False
+        self.mandatory_hold = False
         self.phase_started_at = float(now)
         self.phase_settle_since = None
         self.phase_wait_started = None
@@ -614,17 +790,25 @@ class CrawlGaitPlanner:
             self.gate_timeout_reason = error_message
         return False
 
-    def _unload_metrics(self, measured_tau):
-        """Swing-leg pitch/knee torque feedback and relative sag."""
+    def _unload_metrics(self, q, measured_tau):
+        """Swing-leg gravity-compensated pitch/knee torque and relative sag.
+
+        The leg's own link weight holds ~0.4 N*m on the pitch joint even when
+        fully airborne -- nearly the whole 0.45 N*m trip -- so the external
+        (ground) torque is what must be compared, not the raw feedback.
+        """
         leg = self.swing_leg
         index = 3 * LEGS.index(leg)
         if measured_tau is None:
             tau_worst = 0.0
         else:
             measured_tau = np.asarray(measured_tau, dtype=float)
-            tau_worst = float(
-                max(abs(measured_tau[index + 1]), abs(measured_tau[index + 2]))
+            external = measured_tau[
+                index : index + 3
+            ] - dog5_kinematics.leg_gravity_torque(
+                leg, np.asarray(q, dtype=float)[index : index + 3]
             )
+            tau_worst = float(max(abs(external[1]), abs(external[2])))
         sag = self.controller.last_leg_sag_m
         stance_mean = float(
             np.mean([sag[name] for name in LEGS if name != leg])
@@ -632,13 +816,114 @@ class CrawlGaitPlanner:
         rel_sag = float(sag[leg]) - stance_mean
         return tau_worst, rel_sag
 
+    def _direction_cap(self, q, low, high, direction):
+        """Furthest extra shift along ``direction`` that stays safe.
+
+        Two bounds, both cheap enough for the control loop (no IK): the
+        planned support margin of the stance triangle must stay above the
+        liftoff floor, and the linearized joint excursion (dq = J^-1 dx per
+        leg, exact enough over <= 20 mm) must stay inside the soft limits
+        with margin.
+        """
+        cap = UNLOAD_EXTRA_MAX_M
+        move_dir = np.array([-direction[0], -direction[1], 0.0])
+        for index, leg in enumerate(LEGS):
+            section = slice(3 * index, 3 * index + 3)
+            jacobian = dog5_kinematics.foot_jacobian(leg, q[section])
+            if (
+                np.linalg.svd(jacobian, compute_uv=False)[-1]
+                < recorded.MIN_JACOBIAN_SINGULAR
+            ):
+                return 0.0
+            # Feet targets move by -direction per metre of body shift.
+            dq_per_m = np.linalg.solve(jacobian, move_dir)
+            for joint in range(3):
+                rate = float(dq_per_m[joint])
+                if rate > 1.0e-9:
+                    room = (
+                        high[section][joint] - UNLOAD_LIMIT_MARGIN_RAD
+                    ) - q[section][joint]
+                    cap = min(cap, max(0.0, room / rate))
+                elif rate < -1.0e-9:
+                    room = q[section][joint] - (
+                        low[section][joint] + UNLOAD_LIMIT_MARGIN_RAD
+                    )
+                    cap = min(cap, max(0.0, room / -rate))
+        stance_pts = [
+            self.world_foot_xy[name] for name in LEGS if name != self.swing_leg
+        ]
+        extra = 0.002
+        while extra <= cap + 1.0e-9:
+            candidate = self.base_shifted_body_xy + extra * np.asarray(
+                direction
+            )
+            if (
+                support_triangle_margin(stance_pts, candidate)
+                < MIN_LIFTOFF_MARGIN_M
+            ):
+                cap = extra - 0.002
+                break
+            extra += 0.002
+        return max(0.0, cap)
+
+    def _unload_growth_plan(self, q):
+        """Pick the growth direction that buys the most support margin.
+
+        The inward normal is the most efficient direction per millimetre, but
+        at the shifted stance the abduction joints are within ~1.4 deg of
+        their soft limit, so the lateral budget can be a few mm at best.  The
+        longitudinal axis has huge pitch/knee headroom and still gains margin
+        at normal_x per metre, so a mostly-x fallback often buys MORE total
+        margin.  Score = cap x (direction . normal); best wins.
+        """
+        q = np.asarray(q, dtype=float)
+        low, high = base.soft_limits()
+        candidates = [np.asarray(self.shift_normal, dtype=float)]
+        if abs(self.shift_normal[0]) > 1.0e-6:
+            longitudinal = np.array(
+                [np.sign(self.shift_normal[0]), 0.0]
+            )
+            blend = self.shift_normal + longitudinal
+            candidates.append(blend / np.linalg.norm(blend))
+            candidates.append(longitudinal)
+        best_dir = candidates[0]
+        best_cap = 0.0
+        best_score = -np.inf
+        for direction in candidates:
+            cap = self._direction_cap(q, low, high, direction)
+            score = cap * float(direction @ self.shift_normal)
+            if score > best_score:
+                best_dir, best_cap, best_score = direction, cap, score
+        return best_dir, best_cap
+
     def update(self, now, q, qd, measured_tau=None):
         """Advance phases only after geometric/tracking gates are satisfied."""
         if not self.active:
             return None
+        now = float(now)
+        # Drag watch: an airborne leg should measure ~0 external torque.
+        # Sustained torque means the foot is scraping the ground (the CoM
+        # never truly left it, or the trunk sagged back onto it) -- abort
+        # gracefully instead of dragging.  Runs every tick, pause included,
+        # because the foot is (supposedly) airborne the whole time.
+        if self.phase in ("LIFT", "SWING") and measured_tau is not None:
+            tau_worst, rel_sag = self._unload_metrics(q, measured_tau)
+            self.last_unload_tau_nm = tau_worst
+            self.last_unload_rel_sag_m = rel_sag
+            if tau_worst > SWING_DRAG_TAU_TRIP_NM:
+                self.swing_drag_streak += 1
+                if self.swing_drag_streak >= SWING_DRAG_STREAK:
+                    return self._begin_abort(
+                        now,
+                        q,
+                        f"{self.swing_leg} foot still loaded while airborne "
+                        f"(|tau_ext|={tau_worst:.2f} N*m > "
+                        f"{SWING_DRAG_TAU_TRIP_NM:.2f}): dragging",
+                    )
+            else:
+                self.swing_drag_streak = 0
         if self.paused:
             return None
-        now = float(now)
         if now - self.phase_started_at < self.duration(self.phase):
             return None
 
@@ -670,23 +955,46 @@ class CrawlGaitPlanner:
             )
 
         if self.phase == "UNLOAD":
-            tau_worst, rel_sag = self._unload_metrics(measured_tau)
+            tau_worst, rel_sag = self._unload_metrics(q, measured_tau)
             self.last_unload_tau_nm = tau_worst
             self.last_unload_rel_sag_m = rel_sag
             good = (
                 tau_worst < self.unload_tau_trip
                 and abs(rel_sag) < UNLOAD_REL_SAG_MAX_M
             )
+            # Force-feedback shift: the planned shift completed but the leg
+            # still measures loaded (real CoM is not where geometry assumes),
+            # so keep moving the body along the same inward normal until the
+            # torque drops, the safe budget runs out, or the gate times out.
+            if self.unload_extra_cap_m is None:
+                (
+                    self.unload_growth_dir,
+                    self.unload_extra_cap_m,
+                ) = self._unload_growth_plan(q)
+                self.unload_grow_at = now
+            if not good and self.unload_extra_m < self.unload_extra_cap_m:
+                grow_dt = max(0.0, now - self.unload_grow_at)
+                self.unload_extra_m = min(
+                    self.unload_extra_m + UNLOAD_EXTRA_RATE_M_S * grow_dt,
+                    self.unload_extra_cap_m,
+                )
+                self.shifted_body_xy = (
+                    self.base_shifted_body_xy
+                    + self.unload_extra_m * self.unload_growth_dir
+                )
+            self.unload_grow_at = now
             if not self._settled(
                 now,
                 good,
                 UNLOAD_GATE_SETTLE_S,
                 UNLOAD_GATE_TIMEOUT_S,
-                f"{leg} unload gate timed out: pitch/knee |tau_fb|="
+                f"{leg} unload gate timed out: pitch/knee |tau_ext|="
                 f"{tau_worst:.2f} N*m (trip {self.unload_tau_trip:.2f}), "
                 f"rel_sag={1000.0 * rel_sag:+.1f} mm (max "
-                f"{1000.0 * UNLOAD_REL_SAG_MAX_M:.0f}) -- the leg still "
-                "carries load; the CoM is not where geometry assumes",
+                f"{1000.0 * UNLOAD_REL_SAG_MAX_M:.0f}), extra shift "
+                f"{1000.0 * self.unload_extra_m:.1f}/"
+                f"{1000.0 * self.unload_extra_cap_m:.1f} mm exhausted -- the "
+                "leg still carries load beyond the safe shift budget",
             ):
                 if self.gate_timeout_reason:
                     return self._begin_abort(now, q, self.gate_timeout_reason)
@@ -698,8 +1006,9 @@ class CrawlGaitPlanner:
             )
             self._set_phase("LIFT", now)
             return (
-                f"{leg} measured unloaded (|tau_fb|={tau_worst:.2f} N*m, "
-                f"rel_sag={1000.0 * rel_sag:+.1f} mm); liftoff enabled, "
+                f"{leg} measured unloaded (|tau_ext|={tau_worst:.2f} N*m, "
+                f"rel_sag={1000.0 * rel_sag:+.1f} mm, extra shift "
+                f"{1000.0 * self.unload_extra_m:.1f} mm); liftoff enabled, "
                 f"plane baseline "
                 f"{1000.0 * self.touchdown_plane_baseline_m:+.1f} mm"
             )
@@ -805,7 +1114,16 @@ class CrawlGaitPlanner:
                     "cycle(s)); neutral Cartesian HOLD restored",
                 )
             completed = leg
-            self._begin_step(now, pause=True)
+            # Hold flat on four feet between diagonal pairs (after RR FL, and
+            # after RL FR) and wait for ENTER, regardless of observe mode.
+            mandatory = self.step_index % MANDATORY_HOLD_EVERY == 0
+            self._begin_step(now, pause=True, mandatory_pause=mandatory)
+            if mandatory:
+                return (
+                    f"{completed} step complete; diagonal pair done -- "
+                    "HOLDING on four feet, press ENTER for the next pair "
+                    f"(starting with {self.swing_leg})"
+                )
             return f"{completed} step complete; shifting for {self.swing_leg}"
 
         if self.phase == "ABORT_LOAD":
@@ -1024,8 +1342,10 @@ def _planned_gait_segments(controller, shift_distance, step_length, swing_height
     z = {leg: float(controller.final_foot[leg][2]) for leg in LEGS}
     body = np.zeros(2)
     for step_index, swing in enumerate(GAIT_ORDER):
-        signs = np.sign(anchors[swing] - body)
-        shifted = body - shift_distance * signs / np.sqrt(2.0)
+        stance_pts = [anchors[s] for s in LEGS if s != swing]
+        shifted, _ = adaptive_body_shift(
+            anchors[swing], stance_pts, body, shift_distance
+        )
         body_end = body + np.array([step_length / len(GAIT_ORDER), 0.0])
         new_anchor = anchors[swing] + np.array([step_length, 0.0])
 
@@ -1132,6 +1452,28 @@ def validate_crawl_configuration(controller, shift_distance, step_length, swing_
     return max_static_tau, minimum_planned_margin
 
 
+class CrawlSafetyGate(inplace.ConfirmedSafetyGate):
+    """ConfirmedSafetyGate whose overspeed e-stop can be switched off.
+
+    With ``overspeed_enabled=False`` (operator ``--no-overspeed``) the driver
+    and encoder speed tiers never stop the run.  The encoder/driver
+    bookkeeping still updates every cycle so the status line stays truthful
+    and the guard can be re-enabled by simply not passing the flag; ALL other
+    e-stops (joint-limit, over-temp, CAN-miss, motor-fault) remain active.
+    """
+
+    def __init__(self, tau_cap, qd_estop=base.QD_ESTOP,
+                 qd_estop_hard=base.QD_ESTOP_HARD, overspeed_enabled=True):
+        super().__init__(tau_cap, qd_estop=qd_estop, qd_estop_hard=qd_estop_hard)
+        self.overspeed_enabled = bool(overspeed_enabled)
+
+    def overspeed_reason(self, qd, q, now):
+        # Run the real check for its side effects (encoder_qd, peaks, streaks),
+        # then suppress the trip verdict when the operator disabled it.
+        reason = super().overspeed_reason(qd, q, now)
+        return reason if self.overspeed_enabled else None
+
+
 def _saturated_legs(requested_tau, gate, now, controller, candidate_legs):
     saturated = set()
     if requested_tau is None:
@@ -1169,7 +1511,12 @@ def run_hardware(args):
         observe_phases=args.observe_phases,
         unload_tau_trip=args.unload_tau_trip,
     )
-    gate = inplace.ConfirmedSafetyGate(args.tau_max, args.qd_estop, args.qd_estop_hard)
+    gate = CrawlSafetyGate(
+        args.tau_max,
+        args.qd_estop,
+        args.qd_estop_hard,
+        overspeed_enabled=not args.no_overspeed,
+    )
     unwrap = [base.CalibratedEncoderUnwrap() for _ in base.HARDWARE_JOINTS]
 
     print(
@@ -1177,8 +1524,9 @@ def run_hardware(args):
         "ENTER -> CRAWL -> CRAWL_HOLD; P parks from a hold, X stops"
     )
     print(
-        f"[crawl] mode={planner.gait_mode}, order={','.join(GAIT_ORDER)}, "
-        f"cycles={args.gait_cycles}, "
+        f"[crawl] mode={planner.gait_mode}, order={','.join(GAIT_ORDER)} "
+        f"(hind then diagonal fore; ENTER-gated hold every "
+        f"{MANDATORY_HOLD_EVERY} steps), cycles={args.gait_cycles}, "
         f"leg slot={args.leg_cycle:.2f}s, nominal duty={NOMINAL_DUTY_FACTOR:.2f}"
     )
     if args.observe_phases:
@@ -1192,8 +1540,8 @@ def run_hardware(args):
             "--swing-test --observe-phases."
         )
     print(
-        f"[crawl] diagonal body shift={1000.0 * args.shift_distance:.0f}mm "
-        f"away from swing leg; planned minimum triangle margin="
+        f"[crawl] adaptive body shift={1000.0 * args.shift_distance:.0f}mm "
+        f"perp. to the nearest stance-triangle edge; planned minimum margin="
         f"{1000.0 * planned_margin:.1f}mm"
     )
     print(
@@ -1207,10 +1555,12 @@ def run_hardware(args):
         "through LOAD."
     )
     print(
-        f"[crawl] pre-lift UNLOAD gate: swing pitch/knee |tau_fb| < "
-        f"{args.unload_tau_trip:.2f} N*m and relative sag < "
+        f"[crawl] pre-lift UNLOAD gate: swing pitch/knee gravity-compensated "
+        f"|tau_ext| < {args.unload_tau_trip:.2f} N*m and relative sag < "
         f"{1000.0 * UNLOAD_REL_SAG_MAX_M:.0f} mm, sustained "
         f"{UNLOAD_GATE_SETTLE_S:.1f}s within {UNLOAD_GATE_TIMEOUT_S:.1f}s; "
+        f"while loaded the shift keeps growing (force feedback) up to "
+        f"+{1000.0 * UNLOAD_EXTRA_MAX_M:.0f} mm within margin/joint budgets; "
         "a failure reloads the leg and ends the batch instead of stopping "
         "the run."
     )
@@ -1224,7 +1574,27 @@ def run_hardware(args):
             "[crawl] PARTIAL STAND TEST: crawl will remain locked out until "
             "--travel-scale is 1.0."
         )
+    if args.no_overspeed:
+        print(
+            "[crawl] !! OVERSPEED E-STOP DISABLED (--no-overspeed): neither "
+            "the driver nor the encoder speed tier will stop the run. A real "
+            "runaway will NOT be caught -- keep a hand on X and the robot "
+            "supported. Joint-limit/temp/CAN-miss/fault e-stops still apply."
+        )
     print("[crawl] ROBOT MUST REMAIN MECHANICALLY SUPPORTED DURING FIRST TESTS.")
+
+    imu = None if args.no_imu else inplace._open_imu()
+    if imu is not None:
+        print(
+            f"[imu] tip-over abort armed: |roll| or |pitch| > "
+            f"{inplace.TIPOVER_ABORT_DEG:.0f} deg for "
+            f"{inplace.TIPOVER_CONFIRM_SAMPLES} consecutive fresh samples"
+        )
+        print(
+            f"[imu] lean watch armed: tilt change > "
+            f"{CRAWL_LEAN_ABORT_DEG:.0f} deg from the liftoff attitude "
+            "during LIFT/SWING -> graceful step abort (reload + recenter)"
+        )
 
     key = base.KeyPoller()
     try:
@@ -1264,6 +1634,10 @@ def run_hardware(args):
                 index = 0
                 velocity = recorded.EncoderVelocity()
                 margin_trip_streak = 0
+                tau_tare = None
+                tipover_streak = 0
+                lean_baseline = None
+                lean_streak = 0
 
                 while True:
                     mb.poll()
@@ -1332,7 +1706,13 @@ def run_hardware(args):
                                     f"{planner.diagnostic_context} "
                                     f"paused={'YES' if planner.paused else 'NO'}"
                                 )
-                                if planner.paused:
+                                if planner.mandatory_hold:
+                                    print(
+                                        "[phase] DIAGONAL-PAIR HOLD: flat on "
+                                        "four feet. Inspect, then press ENTER "
+                                        "for the next pair."
+                                    )
+                                elif planner.paused:
                                     print(
                                         "[phase] HOLDING endpoint safely; "
                                         "inspect motion, then press ENTER."
@@ -1435,11 +1815,103 @@ def run_hardware(args):
                                 args.crouch_speed_trip,
                                 args.crouch_torque_trip,
                             )
+
+                        imu_sample = None
+                        if imu is not None:
+                            try:
+                                imu_sample = imu.sample()
+                            except Exception:
+                                imu_sample = None
+                            if (
+                                imu_sample is not None
+                                and imu_sample.age_s <= inplace.POSTURE_STALE_S
+                            ):
+                                if (
+                                    abs(imu_sample.roll_deg)
+                                    > inplace.TIPOVER_ABORT_DEG
+                                    or abs(imu_sample.pitch_deg)
+                                    > inplace.TIPOVER_ABORT_DEG
+                                ):
+                                    tipover_streak += 1
+                                    if (
+                                        stop_reason is None
+                                        and tipover_streak
+                                        >= inplace.TIPOVER_CONFIRM_SAMPLES
+                                    ):
+                                        stop_reason = (
+                                            f"IMU tip-over: roll="
+                                            f"{imu_sample.roll_deg:+.1f} pitch="
+                                            f"{imu_sample.pitch_deg:+.1f} deg "
+                                            f"exceeds "
+                                            f"{inplace.TIPOVER_ABORT_DEG:.0f} deg"
+                                        )
+                                else:
+                                    tipover_streak = 0
+                                # Lean watch: real (measured) body tilt drift
+                                # away from the liftoff attitude while only
+                                # three feet support -- the encoder support
+                                # triangle cannot see this because the body
+                                # tilts beyond the rigid geometry it assumes.
+                                if (
+                                    sequence.stage == "CRAWL"
+                                    and planner.active
+                                    and planner.phase in ("LIFT", "SWING")
+                                ):
+                                    if lean_baseline is None:
+                                        lean_baseline = (
+                                            imu_sample.roll_deg,
+                                            imu_sample.pitch_deg,
+                                        )
+                                        lean_streak = 0
+                                    else:
+                                        d_roll = (
+                                            imu_sample.roll_deg
+                                            - lean_baseline[0]
+                                        )
+                                        d_pitch = (
+                                            imu_sample.pitch_deg
+                                            - lean_baseline[1]
+                                        )
+                                        if (
+                                            max(abs(d_roll), abs(d_pitch))
+                                            > CRAWL_LEAN_ABORT_DEG
+                                        ):
+                                            lean_streak += 1
+                                            if lean_streak >= CRAWL_LEAN_STREAK:
+                                                event = planner._begin_abort(
+                                                    now,
+                                                    q,
+                                                    f"IMU lean: d_roll="
+                                                    f"{d_roll:+.1f} d_pitch="
+                                                    f"{d_pitch:+.1f} deg from "
+                                                    f"liftoff exceeds "
+                                                    f"{CRAWL_LEAN_ABORT_DEG:.0f}",
+                                                )
+                                                print(f"[stage] {event}")
+                                                lean_baseline = None
+                                                lean_streak = 0
+                                        else:
+                                            lean_streak = 0
+                                else:
+                                    lean_baseline = None
+                                    lean_streak = 0
                         latched = [mid for mid, error in errors.items() if error & 0x80]
                         unverified = [mid for mid in MOTOR_IDS if mb.rec(mid).error is None]
 
                         pressed = key.get()
-                        if pressed in ("x", "X"):
+                        if pressed in ("t", "T"):
+                            # Tare the load map: capture the current external
+                            # torque residual (friction + model error) as the
+                            # display offset.  Only meaningful when every
+                            # foot is OFF the ground (robot held up).
+                            tau_tare = measured_torque - leg_gravity_stack(q)
+                            print(
+                                "[legs] fz TARED at current pose -- valid "
+                                "only if ALL feet were off the ground "
+                                f"(residual max {np.max(np.abs(tau_tare)):.2f}"
+                                " N*m); press T again to re-tare"
+                            )
+                        elif pressed in ("x", "X"):
                             stop_reason = "operator X"
                         elif pressed in ("p", "P"):
                             _, message = sequence.request_park(
@@ -1489,11 +1961,17 @@ def run_hardware(args):
                                 if not np.isfinite(support_margin)
                                 else f"{1000.0 * support_margin:.1f}mm"
                             )
-                            if crawling and phase == "UNLOAD":
+                            if crawling and phase in (
+                                "UNLOAD",
+                                "LIFT",
+                                "SWING",
+                            ):
                                 margin_text += (
-                                    f" unload_tau={planner.last_unload_tau_nm:.2f}"
+                                    f" tau_ext={planner.last_unload_tau_nm:.2f}"
                                     f"N*m rel_sag="
                                     f"{1000.0 * planner.last_unload_rel_sag_m:+.1f}mm"
+                                    f" extra_shift="
+                                    f"{1000.0 * planner.unload_extra_m:.1f}mm"
                                 )
                             print(
                                 f"[crawl] mode={planner.gait_mode:10s} "
@@ -1512,11 +1990,53 @@ def run_hardware(args):
                                 f"Tmax={int(np.max(temps))}C latched={len(latched)}",
                                 flush=True,
                             )
-                            if not position_stage:
-                                trim_text = ",".join(
-                                    f"{leg}{controller.z_trim_n[leg]:+.1f}" for leg in LEGS
+                            # Measured load map: per-leg vertical support
+                            # (J^-T tau, all three joints) plus the CoM xy the
+                            # distribution implies.  Printed in every stage --
+                            # the CROUCH map vs the STAND map separates joint-
+                            # zero/geometry error (asymmetry flips or a foot
+                            # unloads between poses) from real mass asymmetry
+                            # (same-side in both).  trim_N is the commanded
+                            # integral top-up, NOT measured load.
+                            support, com_xy = foot_load_map(
+                                q, measured_torque, tau_tare
+                            )
+                            fz_text = ",".join(
+                                f"{leg}{support[leg]:+.1f}" for leg in LEGS
+                            )
+                            com_text = (
+                                f"({1000.0 * com_xy[0]:+.0f},"
+                                f"{1000.0 * com_xy[1]:+.0f})mm"
+                                if np.all(np.isfinite(com_xy))
+                                else "(-)"
+                            )
+                            trim_text = (
+                                "-"
+                                if position_stage
+                                else ",".join(
+                                    f"{leg}{controller.z_trim_n[leg]:+.1f}"
+                                    for leg in LEGS
                                 )
-                                print(f"[legs] trim_N=({trim_text})", flush=True)
+                            )
+                            tare_text = " (tared)" if tau_tare is not None else ""
+                            imu_text = ""
+                            if imu_sample is not None:
+                                stale = (
+                                    " STALE"
+                                    if imu_sample.age_s
+                                    > inplace.POSTURE_STALE_S
+                                    else ""
+                                )
+                                imu_text = (
+                                    f" rp=({imu_sample.roll_deg:+.2f},"
+                                    f"{imu_sample.pitch_deg:+.2f})deg{stale}"
+                                )
+                            print(
+                                f"[legs] trim_N=({trim_text}) "
+                                f"fz_N=({fz_text}) com={com_text}{tare_text}"
+                                f"{imu_text}",
+                                flush=True,
+                            )
                             last_print = now
 
                     mid = MOTOR_IDS[joint_index]
@@ -1562,6 +2082,11 @@ def run_hardware(args):
                         )
     finally:
         key.close()
+        if imu is not None:
+            try:
+                imu.stop()
+            except Exception:
+                pass
     return 0
 
 
@@ -1578,6 +2103,54 @@ def offline_self_test(args):
     assert max_static < base.STAGED_TAU_MAX, max_static
     assert planned_margin >= MIN_LIFTOFF_MARGIN_M, planned_margin
     assert NOMINAL_DUTY_FACTOR >= 0.75
+
+    # foot_load_map round-trip: joint torques synthesized from a known
+    # per-leg vertical load PLUS each leg's own gravity-holding torque must
+    # reproduce that load and the CoM implied by the distribution (here 60/40
+    # left-heavy at the neutral stand pose).  A leg holding only its own
+    # weight (airborne) must read ~0.
+    q_stand = np.zeros(N_JOINTS)
+    known_fz = {"FL": 15.0, "FR": 10.0, "RL": 15.0, "RR": 10.0}
+    tau_synth = np.zeros(N_JOINTS)
+    for check_index, check_leg in enumerate(LEGS):
+        section = slice(3 * check_index, 3 * check_index + 3)
+        q_stand[section] = _ik_to_target(
+            check_leg,
+            recorded.Q_RECORDED_CROUCH[section],
+            np.asarray(controller.final_foot[check_leg], dtype=float),
+        )
+        jac = dog5_kinematics.foot_jacobian(check_leg, q_stand[section])
+        tau_synth[section] = dog5_kinematics.leg_gravity_torque(
+            check_leg, q_stand[section]
+        ) + jac.T @ np.array([0.0, 0.0, -known_fz[check_leg]])
+    support_check, com_check = foot_load_map(q_stand, tau_synth)
+    for check_leg in LEGS:
+        assert abs(support_check[check_leg] - known_fz[check_leg]) < 1.0e-6
+    tau_airborne = tau_synth.copy()
+    tau_airborne[0:3] = dog5_kinematics.leg_gravity_torque("FL", q_stand[0:3])
+    support_air, _ = foot_load_map(q_stand, tau_airborne)
+    assert abs(support_air["FL"]) < 1.0e-6, support_air
+    # A friction-like torque bias reads as phantom force; the tare offset
+    # removes exactly that bias.
+    bias = np.full(N_JOINTS, 0.05)
+    support_biased, _ = foot_load_map(q_stand, tau_synth + bias)
+    assert any(
+        abs(support_biased[leg] - known_fz[leg]) > 0.1 for leg in LEGS
+    ), support_biased
+    support_tared, _ = foot_load_map(q_stand, tau_synth + bias, bias)
+    for check_leg in LEGS:
+        assert abs(support_tared[check_leg] - known_fz[check_leg]) < 1.0e-6
+    feet_check = {
+        leg: dog5_kinematics.foot_position(
+            leg, q_stand[3 * i : 3 * i + 3]
+        )[:2]
+        for i, leg in enumerate(LEGS)
+    }
+    com_expected = sum(
+        known_fz[leg] * feet_check[leg] for leg in LEGS
+    ) / sum(known_fz.values())
+    assert np.allclose(com_check, com_expected, atol=1.0e-9), com_check
+    assert com_check[1] > 0.005, com_check  # left-heavy load -> CoM left
 
     # Touchdown accepts the reported hardware signature when the actual foot
     # is on the stance plane and the target is 16 mm below it.  Lateral miss,
@@ -1648,8 +2221,10 @@ def offline_self_test(args):
     else:
         raise AssertionError("degenerate stance plane was accepted")
 
-    # A symmetric rectangle has zero margin at liftoff; the commanded diagonal
-    # shift must put the origin strictly inside every three-foot triangle.
+    # A symmetric rectangle has zero margin at liftoff; the adaptive shift must
+    # put the origin strictly inside every three-foot triangle, and (the whole
+    # point of the change) it must do at least as well as the old fixed diagonal
+    # on the SKEWED geometry after a diagonal pair has stepped forward.
     symmetric = {
         "FL": np.array([+0.34, +0.112]),
         "FR": np.array([+0.34, -0.112]),
@@ -1657,16 +2232,29 @@ def offline_self_test(args):
         "RR": np.array([-0.34, -0.112]),
     }
     for swing in LEGS:
-        unshifted = support_triangle_margin(
-            [symmetric[leg] for leg in LEGS if leg != swing]
+        stance = [symmetric[leg] for leg in LEGS if leg != swing]
+        unshifted = support_triangle_margin(stance)
+        shifted_body, _ = adaptive_body_shift(
+            symmetric[swing], stance, np.zeros(2), args.shift_distance
         )
-        signs = np.sign(symmetric[swing])
-        body_shift = -args.shift_distance * signs / np.sqrt(2.0)
-        shifted = support_triangle_margin(
-            [symmetric[leg] - body_shift for leg in LEGS if leg != swing]
-        )
+        shifted = support_triangle_margin(stance, com_xy=shifted_body)
         assert abs(unshifted) < 1.0e-12, (swing, unshifted)
         assert shifted >= MIN_LIFTOFF_MARGIN_M, (swing, shifted)
+
+    # Skewed geometry: FL and RR have stepped 30 mm forward (the first diagonal
+    # pair).  The adaptive shift must still clear the liftoff floor for the
+    # second pair, where a fixed diagonal left the thinnest margin.
+    skewed = dict(symmetric)
+    skewed["FL"] = symmetric["FL"] + np.array([0.030, 0.0])
+    skewed["RR"] = symmetric["RR"] + np.array([0.030, 0.0])
+    body_skew = np.array([0.015, 0.0])
+    for swing in ("RL", "FR"):
+        stance = [skewed[leg] for leg in LEGS if leg != swing]
+        shifted_body, _ = adaptive_body_shift(
+            skewed[swing], stance, body_skew, args.shift_distance
+        )
+        margin = support_triangle_margin(stance, com_xy=shifted_body)
+        assert margin >= MIN_LIFTOFF_MARGIN_M, (swing, margin)
 
     # Stance-anchor invariant: target_xy + body_xy is constant during SHIFT
     # and RECENTER; only the swing anchor changes during SWING.
@@ -1764,7 +2352,20 @@ def offline_self_test(args):
     state_planner.start(0.0)
     zero_qd = np.zeros(N_JOINTS)
     transitions = 0
+    mandatory_holds = 0
+    now_t = 0.0
     while not state_planner.finished:
+        # A mandatory diagonal-pair hold pauses at the SHIFT start; the
+        # operator (here, the test) resumes it with settled feet.
+        if state_planner.paused:
+            assert state_planner.mandatory_hold, "only mandatory holds here"
+            mandatory_holds += 1
+            for index, leg in enumerate(LEGS):
+                desired = state_planner.target(leg, now_t)[0]
+                section = slice(3 * index, 3 * index + 3)
+                q_state[section] = _ik_to_target(leg, q_state[section], desired)
+            resumed, _ = state_planner.resume(now_t)
+            assert resumed
         phase = state_planner.phase
         endpoint_time = (
             state_planner.phase_started_at + state_planner.duration(phase)
@@ -1785,11 +2386,14 @@ def offline_self_test(args):
             event = state_planner.update(
                 endpoint_time + dwell + 0.01, q_state, zero_qd
             )
+        now_t = endpoint_time + 1.0
         assert event is not None, (phase, state_planner.phase)
         transitions += 1
-        assert transitions <= len(GAIT_ORDER) * len(state_planner.phases)
+        assert transitions <= len(GAIT_ORDER) * (len(state_planner.phases) + 1)
     assert state_planner.step_index == len(GAIT_ORDER)
     assert not state_planner.aborted
+    # One cycle (RR FL RL FR) holds once, between the two diagonal pairs.
+    assert mandatory_holds == 1, mandatory_holds
     for index, leg in enumerate(LEGS):
         section = slice(3 * index, 3 * index + 3)
         actual = dog5_kinematics.foot_position(leg, q_state[section])
@@ -1874,6 +2478,85 @@ def offline_self_test(args):
             abort_controller.final_foot[leg], hold_before[leg], atol=1.0e-9
         ), leg
 
+    # Force-feedback shift: a persistently loaded swing leg grows the body
+    # shift along the stored inward normal (never beyond the safe cap)
+    # before the gate finally aborts.
+    grow_planner = CrawlGaitPlanner(
+        abort_controller,
+        args.shift_distance,
+        args.step_length,
+        args.swing_height,
+        args.leg_cycle,
+        1,
+    )
+    grow_planner.start(0.0)
+    q_grow = q_abort.copy()
+    _drive(grow_planner, q_grow, stop_phase="UNLOAD")
+    assert grow_planner.phase == "UNLOAD"
+    loaded_grow = np.zeros(N_JOINTS)
+    loaded_grow[3 * LEGS.index(grow_planner.swing_leg) + 1] = 2.0
+    tick = grow_planner.phase_started_at + grow_planner.duration("UNLOAD")
+    grow_planner.update(tick + 0.01, q_grow, zero_qd, measured_tau=loaded_grow)
+    cap = grow_planner.unload_extra_cap_m
+    assert cap is not None and cap > 0.001, cap
+    grow_planner.update(tick + 0.51, q_grow, zero_qd, measured_tau=loaded_grow)
+    grown = grow_planner.unload_extra_m
+    assert 0.001 < grown <= cap + 1.0e-9, (grown, cap)
+    # The chosen direction must still gain support margin (positive
+    # projection on the inward normal) even when the lateral budget is
+    # abduction-starved and the longitudinal fallback wins.
+    assert float(
+        grow_planner.unload_growth_dir @ grow_planner.shift_normal
+    ) > 0.1
+    assert np.allclose(
+        grow_planner.shifted_body_xy,
+        grow_planner.base_shifted_body_xy
+        + grown * grow_planner.unload_growth_dir,
+    )
+    text = _drive(grow_planner, q_grow, measured_tau=loaded_grow)
+    assert grow_planner.finished and grow_planner.aborted, text
+    assert "safe shift budget" in text, text
+
+    # Airborne drag watch: sustained external torque during SWING aborts
+    # gracefully and commits the measured foot position as the anchor.
+    drag_planner = CrawlGaitPlanner(
+        abort_controller,
+        args.shift_distance,
+        args.step_length,
+        args.swing_height,
+        args.leg_cycle,
+        1,
+    )
+    drag_planner.start(0.0)
+    q_drag = q_abort.copy()
+    _drive(drag_planner, q_drag, stop_phase="SWING")
+    assert drag_planner.phase == "SWING"
+    drag_leg = drag_planner.swing_leg
+    drag_tau = np.zeros(N_JOINTS)
+    drag_tau[3 * LEGS.index(drag_leg) + 2] = 2.0
+    drag_event = None
+    for streak in range(SWING_DRAG_STREAK):
+        drag_event = drag_planner.update(
+            drag_planner.phase_started_at + 0.01 * (streak + 1),
+            q_drag,
+            zero_qd,
+            measured_tau=drag_tau,
+        )
+    assert drag_event and "dragging" in drag_event, drag_event
+    assert drag_planner.phase == "ABORT_LOAD"
+    drag_section = slice(
+        3 * LEGS.index(drag_leg), 3 * LEGS.index(drag_leg) + 3
+    )
+    expected_drag_anchor = (
+        dog5_kinematics.foot_position(drag_leg, q_drag[drag_section])[:2]
+        + drag_planner.shifted_body_xy
+    )
+    assert np.allclose(
+        drag_planner.world_foot_xy[drag_leg], expected_drag_anchor
+    )
+    text = _drive(drag_planner, q_drag)
+    assert drag_planner.finished and drag_planner.aborted, text
+
     # SHIFT gate failure (robot never tracks the shift) also aborts cleanly.
     shift_planner = CrawlGaitPlanner(
         abort_controller,
@@ -1951,7 +2634,7 @@ def offline_self_test(args):
         f"nominal duty factor={NOMINAL_DUTY_FACTOR:.2f}"
     )
     print(
-        f"  body shift={1000.0 * args.shift_distance:.0f} mm diagonal, "
+        f"  body shift={1000.0 * args.shift_distance:.0f} mm adaptive (perp. to nearest edge), "
         f"minimum planned support margin={1000.0 * planned_margin:.1f} mm"
     )
     print(
@@ -1963,9 +2646,15 @@ def offline_self_test(args):
         "  stance anchors fixed; swing trim frozen from UNLOAD through LOAD"
     )
     print(
-        f"  pre-lift UNLOAD gate: |tau_fb| < {args.unload_tau_trip:.2f} N*m "
-        f"and rel sag < {1000.0 * UNLOAD_REL_SAG_MAX_M:.0f} mm, else the "
-        "step aborts"
+        f"  pre-lift UNLOAD gate: gravity-compensated |tau_ext| < "
+        f"{args.unload_tau_trip:.2f} N*m and rel sag < "
+        f"{1000.0 * UNLOAD_REL_SAG_MAX_M:.0f} mm; while loaded the shift "
+        f"grows on force feedback (up to +{1000.0 * UNLOAD_EXTRA_MAX_M:.0f} "
+        "mm within margin/joint budgets), else the step aborts"
+    )
+    print(
+        f"  airborne drag watch: |tau_ext| > {SWING_DRAG_TAU_TRIP_NM:.2f} "
+        "N*m during LIFT/SWING aborts the step (foot scraping)"
     )
     print(
         "  gate timeouts reload + recenter to a four-foot hold (no run stop);"
@@ -2084,6 +2773,24 @@ def build_parser():
     parser.add_argument("--qd-estop", type=float, default=base.QD_ESTOP)
     parser.add_argument("--qd-estop-hard", type=float, default=base.QD_ESTOP_HARD)
     parser.add_argument(
+        "--no-overspeed",
+        action="store_true",
+        help=(
+            "disable the overspeed e-stop (both driver and encoder speed "
+            "tiers) for this run; the fast leg swing near the crouched "
+            "geometry can trip the encoder tier.  Joint-limit, over-temp, "
+            "CAN-miss and motor-fault e-stops stay active."
+        ),
+    )
+    parser.add_argument(
+        "--no-imu",
+        action="store_true",
+        help=(
+            "skip the trunk IMU: no rp=() on the [legs] line and no "
+            f"{inplace.TIPOVER_ABORT_DEG:.0f} deg tip-over abort"
+        ),
+    )
+    parser.add_argument(
         "--self-test", action="store_true", help="validate gait without opening CAN"
     )
     return parser
@@ -2098,15 +2805,15 @@ def main():
         parser.error("--cart-gain-scale must be > 0 and <= 1")
     if not 0.0 <= args.support_scale <= 1.0:
         parser.error("--support-scale must be between 0 and 1")
-    if not recorded.MIN_STAND_HEIGHT <= args.stand_height <= inplace.MAX_STAND_HEIGHT:
+    if not MIN_CRAWL_STAND_HEIGHT_M <= args.stand_height <= inplace.MAX_STAND_HEIGHT:
         parser.error(
-            f"--stand-height must be between {recorded.MIN_STAND_HEIGHT} and "
+            f"--stand-height must be between {MIN_CRAWL_STAND_HEIGHT_M} and "
             f"{inplace.MAX_STAND_HEIGHT} m"
         )
     if not 0.05 <= args.travel_scale <= 1.0:
         parser.error("--travel-scale must be between 0.05 and 1.0")
-    if not 0.03 <= args.shift_distance <= 0.05:
-        parser.error("--shift-distance must be between 0.03 and 0.05 m")
+    if not 0.02 <= args.shift_distance <= 0.05:
+        parser.error("--shift-distance must be between 0.02 and 0.05 m")
     if not 0.0 <= args.step_length <= 0.06:
         parser.error("--step-length must be between 0 and 0.06 m")
     if args.swing_test:
