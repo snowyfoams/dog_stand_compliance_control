@@ -15,11 +15,13 @@ diagnosed safely before the next robot session.
    + Sim rehearsal     hardware-faithful 3-leg stand (de-risked in sim first)
 5. Hardware           crawl attempt -> FAILED (leg dragged on weight shift)
 6. Sim                diagnose the drag, fix it, simulate the full gait
+7. Hardware           fix ported to CAN hardware -> autonomous multi-cycle walk <- video below
 ```
 
-Stages 0-2 and 4's sim rehearsal, 6 live in this branch (`main`). Stage 3 and
-5's hardware controllers live on [`dog5-live-mirror`](../../tree/dog5-live-mirror);
-the more complete, hardware-mirrored crawl gait lives on
+Stages 0-2 and 4's sim rehearsal, 6 live in this branch (`main`). Stage 3, 5
+and 7's hardware controllers live on
+[`dog5-live-mirror`](../../tree/dog5-live-mirror); the more complete,
+hardware-mirrored crawl gait lives on
 [`dog5-crawl-sim`](../../tree/dog5-crawl-sim). Links to both are in
 [Branches](#branches) below.
 
@@ -117,6 +119,8 @@ repo's hardware branches build a thin per-joint wrapper on top of it.
 ## Stage 4 — Hardware: Cartesian-compliance stand
 
 ![DOG5 hardware stand-up (real robot)](dog5_description/dog5_stand_hw.gif)
+
+(Full source video: [`result_hw/cartesian_compliance_stand.MOV`](result_hw/cartesian_compliance_stand.MOV).)
 
 The hardware result: DOG5 standing itself up under Cartesian compliance
 control on the real robot, encoder-only, no dynamics model — the physical
@@ -227,18 +231,51 @@ python dog5_description/walk_dog5.py --headless       # metrics + PASS/FAIL verd
 python dog5_description/walk_dog5.py                  # interactive viewer
 ```
 
+## Stage 7 — Hardware: the crawl fix, ported and proven
+
+Stage 6's fix (shift → pre-lift → confirm clearance from encoder-FK → only
+then swing) went back to the real robot as `crawl_hw2.0` (branch
+[`dog5-live-mirror`](../../tree/dog5-live-mirror)), plus one lesson the sim
+hadn't hit: the sim's sprawl stand pose needs the feet to slide ~8 cm
+outward, and on the real, grippy floor a knee stalled 46° short of target
+with zero speed and no torque trip. Fix: rise **vertically over the crouch
+feet** instead of sliding into a sprawl — nothing slides, and all four legs
+become swing-feasible where the sprawl had blocked the rear two.
+
+Result, same session: 3-leg stand hold passed on all four legs, one gait
+cycle passed, then a multi-cycle **autonomous walk** — 3+ cycles, 120+ mm,
+40 mm steps, no operator input, no aborts:
+
+Full video: [`result_hw/crawl.mp4`](result_hw/crawl.mp4).
+
+Measured against the sim's predictions: clear-gate rise 19.7–19.9 mm at a
+20 mm pre-lift (sim guessed ~12 mm of sag from unloading; real servos are
+far stiffer — actual sag ≈ 0.2 mm), stance margins 20.5–30.9 mm against a
+15 mm gate, peak joint torque 2.0 N·m against the pre-raised 6.0 N·m trip.
+
+The walk also surfaced a new problem: an uncommanded **7.2° peak body
+roll** during FL's swing, invisible to encoder FK (the servos track their
+own targets to <0.2 mm) — the deflection lives in gear backlash, foot-
+rubber compression, and frame flex, none of which an encoder can see.
+Designed fix (`work_review.md`, not yet the default on hardware): port the
+torque-mode stand's IMU-leveling trim onto the walk as an opt-in
+`--imu-level` flag — filtered tilt, a deadband, a per-leg integrator that
+is zero-mean across the stance legs, and frozen during every gate
+measurement so it can't corrupt the clearance/touchdown checks.
+
 ## Next
 
-From the latest hardware session: review the (unpushed) foot-force-sensor
-estimator and extend it to estimate body roll/pitch/yaw with streaming
-visualization, then take the sim-validated crawl fix back to the real robot.
+Land `--imu-level` on the hardware walk (designed in Stage 7, not yet
+proven there) and tighten the lean-abort watch once a trimmed walk shows
+peak roll ≤ 4°.
 
 ## Branches
 
 - **`main`** (this branch) — MJCF model, hardware-independent kinematics, and
   every sim stage above.
 - [`dog5-live-mirror`](../../tree/dog5-live-mirror) — the real hardware
-  controllers. This is the code that actually runs on DOG5.
+  controllers, including the `crawl_hw2.0` generation (Stage 7). This is
+  the code that actually runs on DOG5.
 - [`dog5-crawl-sim`](../../tree/dog5-crawl-sim) — a more complete,
   hardware-mirrored crawl sim than `walk_dog5.py` on `main`.
 
@@ -283,6 +320,10 @@ either only exists on one branch or has diverged slightly between them.
 | `dog5_description/dog5_hardware_map.py` | confirmed CAN id → joint map + direction signs |
 | `dog5_description/hw_jointmap.py` | naming/order bridge between MJCF, CAN ids, and gear/encoder scale |
 | `dog5_description/direction_check.py` | 12-motor zero-torque direction verifier / hardware set-zero |
+| `crawl_hw2.0/stand3_hold_hw.py` | Stage 7 in-place 3-leg stand hold — passed on all four legs |
+| `crawl_hw2.0/walk1_hw.py` | Stage 7 one slow gait cycle -> multi-cycle autonomous walk (`result_hw/crawl.mp4`); `--imu-level` roll-trim flag |
+| `crawl_hw2.0/step_order_hw.py`, `walk2_fl_hw.py` | FL-specific diagnostics isolating step-order and CoM-shift effects on the walk |
+| `crawl_hw2.0/work_review.md` | Stage 7 write-up: what was proven, the roll problem, the IMU-trim fix plan |
 
 **[`dog5-crawl-sim`](../../tree/dog5-crawl-sim) — advanced, hardware-mirrored crawl sim**
 
