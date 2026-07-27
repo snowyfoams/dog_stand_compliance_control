@@ -235,6 +235,12 @@ python dog5_description/walk_dog5.py                  # interactive viewer
 
 ## Stage 7 — Hardware: the crawl fix, ported and proven
 
+![DOG5 hardware crawl (real robot)](dog5_description/dog5_crawl_hw.gif)
+
+(Full source video: [`result_hw/crawl.mp4`](result_hw/crawl.mp4) — GitHub
+doesn't play mp4 inline, so the GIF above is the re-encoded preview;
+`make_gif_crawl_hw.py` regenerates it.)
+
 Stage 6's fix (shift → pre-lift → confirm clearance from encoder-FK → only
 then swing) went back to the real robot as `crawl_hw2.0` (branch
 [`dog5-live-mirror`](../../tree/dog5-live-mirror)), plus one lesson the sim
@@ -246,9 +252,7 @@ become swing-feasible where the sprawl had blocked the rear two.
 
 Result, same session: 3-leg stand hold passed on all four legs, one gait
 cycle passed, then a multi-cycle **autonomous walk** — 3+ cycles, 120+ mm,
-40 mm steps, no operator input, no aborts:
-
-Full video: [`result_hw/crawl.mp4`](result_hw/crawl.mp4).
+40 mm steps, no operator input, no aborts.
 
 Measured against the sim's predictions: clear-gate rise 19.7–19.9 mm at a
 20 mm pre-lift (sim guessed ~12 mm of sag from unloading; real servos are
@@ -360,6 +364,7 @@ either only exists on one branch or has diverged slightly between them.
 | `dog5_description/walk_dog5.py` | Stage 6 fixed kinematic crawl |
 | `dog5_description/twostand_dog5.py` | Stage 9 real2sim port diagnosing the 2-leg BALANCE limit cycle |
 | `dog5_description/make_gif.py`, `make_gif3.py`, `make_gif_walk.py` | regenerate the sim GIFs above |
+| `dog5_description/make_gif_crawl_hw.py` | re-encodes `result_hw/crawl.mp4` into the Stage 7 GIF (GitHub won't play mp4 inline) |
 
 **[`dog5-live-mirror`](../../tree/dog5-live-mirror) — real hardware controllers (the code that actually runs on DOG5)**
 
