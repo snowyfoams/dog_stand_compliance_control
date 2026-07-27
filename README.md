@@ -16,10 +16,12 @@ diagnosed safely before the next robot session.
 5. Hardware           crawl attempt -> FAILED (leg dragged on weight shift)
 6. Sim                diagnose the drag, fix it, simulate the full gait
 7. Hardware           fix ported to CAN hardware -> autonomous multi-cycle walk <- video below
+8. Hardware           2-leg diagonal stand attempt (IMU) -> FAILED (second leg never lifts)
+9. Sim                reproduce the limit cycle, partial fix -> vertical solved, horizontal open
 ```
 
-Stages 0-2 and 4's sim rehearsal, 6 live in this branch (`main`). Stage 3, 5
-and 7's hardware controllers live on
+Stages 0-2, 4's sim rehearsal, 6 and 9 live in this branch (`main`). Stage 3,
+5, 7 and 8's hardware controllers live on
 [`dog5-live-mirror`](../../tree/dog5-live-mirror); the more complete,
 hardware-mirrored crawl gait lives on
 [`dog5-crawl-sim`](../../tree/dog5-crawl-sim). Links to both are in
@@ -263,19 +265,71 @@ torque-mode stand's IMU-leveling trim onto the walk as an opt-in
 is zero-mean across the stance legs, and frozen during every gate
 measurement so it can't corrupt the clearance/touchdown checks.
 
+## Stage 8 — Hardware: two-leg diagonal stand attempt — FAILED
+
+With an IMU freshly assembled and wired, the next hardware session tried the
+next step up from Stage 4's 3-leg stand: pre-lift both feet of a diagonal
+pair (FL+RR) and hold on the remaining two. It failed to hold — the BALANCE
+stage (creep the body horizontally, steer by sign-of-tilt) only ever frees
+**one** of the two lifted legs; the other stays loaded on the ground no
+matter how long it waits. The stand itself never fell over — only the
+2-leg balance never converged — so the session ended with a controlled
+put-down rather than a fall.
+
+## Stage 9 — Sim: reproducing the two-leg limit cycle
+
+`twostand_dog5.py` is a real2sim port of the hardware controller
+(`crawl_hw2.0/twostand_hw.py`), built on the same discipline as Stage 4's
+`stand3_dog5.py` — position-command-only motion, all FK/IK from
+`dog5_kinematics`, MuJoCo's privileged state used only as an `Oracle` that
+grades the run afterward. New here: the hardware BALANCE stage is not
+encoder-only, so the sim adds a legitimate physical sensor, `SimIMU`
+(roll/pitch straight off the trunk orientation, sign convention checked
+algebraically in `--self-test`).
+
+The original hardware law reproduces exactly as a genuine limit cycle —
+still not converged after 90 s at 3.3× slower gain. Swapping it for a
+**per-leg vertical trim** (the same PI structure as the hardware-proven
+walk `--imu-level` trim: filtered tilt, deadband, integrator, clamp — but
+only ever raising a lifted foot's own pre-lift) removes the oscillation and
+lets one leg (RR, for the default FL+RR pair) reach genuine, sustained
+clearance. Measured (`--headless`, 521-sample BALANCE window): RR force
+0.00 N / clearance 23.1 mm — clean — while FL stays at force 8.65 N /
+clearance −0.3 mm, still on the ground; BALANCE times out at 7.2° trunk
+tilt and puts both feet back down. A `--sweep` across both diagonal pairs,
+±5 mm CoM bias in x and y, and an IMU-disabled control case all land the
+same way: **0/9 PASS** — one leg airborne, one still loaded, every time.
+
+That's the real diagnosis, not a tuning problem: once one leg is genuinely
+airborne the robot is standing on a true 2-point line and starts to
+physically rotate about it under gravity if the CoM isn't exactly on that
+line — a vertical trim on the other lifted leg can't counter a rigid-body
+tip it isn't touching anything to resist. The vertical half is solved; the
+horizontal half — a damped horizontal CoM correction, not the bang-bang law
+that oscillated — is still open.
+
+```bash
+python dog5_description/twostand_dog5.py --self-test   # offline IK/IMU-sign checks
+python dog5_description/twostand_dog5.py                # interactive viewer
+python dog5_description/twostand_dog5.py --headless     # metrics + PASS/FAIL verdict
+python dog5_description/twostand_dog5.py --sweep        # diagonal pair x CoM-bias grid
+```
+
 ## Next
 
-Land `--imu-level` on the hardware walk (designed in Stage 7, not yet
-proven there) and tighten the lean-abort watch once a trimmed walk shows
-peak roll ≤ 4°.
+Design and validate the damped horizontal CoM correction in sim
+(`twostand_dog5.py`, Stage 9) needed to stop the rigid-body tip once one
+diagonal leg lifts clear, then take the fixed 2-leg balance back to
+hardware. Separately, `--imu-level` from Stage 7 is still designed but not
+yet proven on the hardware walk.
 
 ## Branches
 
 - **`main`** (this branch) — MJCF model, hardware-independent kinematics, and
   every sim stage above.
 - [`dog5-live-mirror`](../../tree/dog5-live-mirror) — the real hardware
-  controllers, including the `crawl_hw2.0` generation (Stage 7). This is
-  the code that actually runs on DOG5.
+  controllers, including the `crawl_hw2.0` generation (Stage 7) and
+  `twostand_hw.py` (Stage 8). This is the code that actually runs on DOG5.
 - [`dog5-crawl-sim`](../../tree/dog5-crawl-sim) — a more complete,
   hardware-mirrored crawl sim than `walk_dog5.py` on `main`.
 
@@ -304,6 +358,7 @@ either only exists on one branch or has diverged slightly between them.
 | `dog5_description/SIM_APPROACH_HW.md` | how the sim is kept hardware-faithful, plus measured transfer notes |
 | `dog5_description/hw_gap_experiments.py` | Stage 6 diagnosis of the crawl leg-drag |
 | `dog5_description/walk_dog5.py` | Stage 6 fixed kinematic crawl |
+| `dog5_description/twostand_dog5.py` | Stage 9 real2sim port diagnosing the 2-leg BALANCE limit cycle |
 | `dog5_description/make_gif.py`, `make_gif3.py`, `make_gif_walk.py` | regenerate the sim GIFs above |
 
 **[`dog5-live-mirror`](../../tree/dog5-live-mirror) — real hardware controllers (the code that actually runs on DOG5)**
@@ -324,6 +379,7 @@ either only exists on one branch or has diverged slightly between them.
 | `crawl_hw2.0/walk1_hw.py` | Stage 7 one slow gait cycle -> multi-cycle autonomous walk (`result_hw/crawl.mp4`); `--imu-level` roll-trim flag |
 | `crawl_hw2.0/step_order_hw.py`, `walk2_fl_hw.py` | FL-specific diagnostics isolating step-order and CoM-shift effects on the walk |
 | `crawl_hw2.0/work_review.md` | Stage 7 write-up: what was proven, the roll problem, the IMU-trim fix plan |
+| `crawl_hw2.0/twostand_hw.py` | Stage 8 2-leg diagonal stand attempt — IMU-equipped, BALANCE fails to free both legs |
 
 **[`dog5-crawl-sim`](../../tree/dog5-crawl-sim) — advanced, hardware-mirrored crawl sim**
 
