@@ -38,6 +38,9 @@
       <!-- robot collision geoms use contype=2 conaffinity=1: collide with the
            floor (contype=1 conaffinity=1) but never with each other. -->
       <geom type="mesh" mesh="trunk" pos="0 0.1 0.04" quat="0.70710678 -0.70710678 0 0" contype="2" conaffinity="1"/>
+      <!-- IMU site at the trunk origin, aligned with the FLU trunk frame. Feeds
+           the state estimator with body-frame specific force + angular rate. -->
+      <site name="imu" pos="0 0 0" size="0.01" group="4"/>
       <body name="hip_FL" pos="0.2205 0.06 0">
         <joint name="hip_abd_FL" type="hinge" axis="1 0 0"/>
         <inertial pos="0.04378628 -0.00000166 -0.05507725" mass="0.39152916" fullinertia="0.00023699 0.00029178 0.0002584 0.00000001 0.00007462 -0.00000001"/>
@@ -126,6 +129,16 @@
     <motor name="hip_pitch_RR_motor" joint="hip_pitch_RR" gear="1"/>
     <motor name="knee_RR_motor" joint="knee_RR" gear="1"/>
   </actuator>
+  <sensor>
+    <!-- Body-frame IMU feed for the state estimator (accelerometer reports
+         specific force incl. gravity; ~[0,0,+9.81] at rest and level). The
+         frame* sensors are ground-truth taps for closed-loop validation. -->
+    <accelerometer name="imu_acc" site="imu"/>
+    <gyro name="imu_gyro" site="imu"/>
+    <framequat name="imu_quat" objtype="site" objname="imu"/>
+    <framepos name="trunk_pos" objtype="site" objname="imu"/>
+    <framelinvel name="trunk_linvel" objtype="site" objname="imu"/>
+  </sensor>
   <keyframe>
     <key name="home" qpos="0 0 0.089 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"/>
   </keyframe>
