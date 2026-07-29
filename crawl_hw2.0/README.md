@@ -72,3 +72,55 @@ cd ~/Documents/can_motor_control
 
 Robot mechanically supported for first runs.  ENTER advances at every
 phase boundary; X stops; P (at HOLD4) parks back to the crouch.
+
+## walk1 + read-only EKF (full-state stream)
+
+`walk1_hw.py` now hosts the DOG5 state estimator (read-only, worker thread,
+same pattern as the validated `vmc/ekf_stand_hw.py` stand run).  The gait
+stage machine feeds it a contact schedule (swing foot airborne from UNLOAD
+through TOUCHDOWN; rising edge at the measured-anchor commit), and a 2 Hz
+`[ekf]` terminal line streams the full state: z, body velocity, roll/pitch/yaw
+vs AHRS, bias norms, contact bits, health.
+
+```bash
+cd ~/Documents/can_motor_control
+V=.venv/bin/python
+$V dog_stand_compliance_control/crawl_hw2.0/walk1_hw.py --self-test   # first
+$V dog_stand_compliance_control/crawl_hw2.0/walk1_hw.py \
+    --raw-log walk_$(date +%m%d_%H%M).npz                             # hardware
+python3 dog_stand_compliance_control/state_estimator/hw_replay.py \
+    walk_*.npz --gait                                                 # analyse
+```
+
+No sudo.  In WAIT_CROUCH, **wait for `[ekf] init: bw=... bf=...` before
+ENTER** (it initialises on the static crouch).  During the walk watch:
+`H=OK` throughout; `c=` flips exactly one leg 0 at UNLOAD and back 1 at
+LOAD; `vb` returns to ~0 in every HOLD4; EKF roll/pitch within ~2 deg of
+`ahrs`; `blk` staying < ~5 ms (10 ms motor-watchdog budget).  Keys
+unchanged (ENTER/X/P; tip-over + lean aborts use the same AHRS, now via
+the EKF's IMU feed).  `--no-ekf` keeps posture checks but skips the
+estimator; `--ekf-verbose` adds per-leg footholds + innovations.
+
+### Live browser dashboard (`--web`)
+
+The 2 Hz `[ekf]` text line is hard to read while the dog moves, so the
+estimator state can be streamed to a browser instead — scrolling strip charts
+for z, body velocity, roll/pitch (EKF vs AHRS), yaw, and a contact timeline:
+
+```bash
+$V dog_stand_compliance_control/crawl_hw2.0/walk1_hw.py \
+    --raw-log walk_$(date +%m%d_%H%M).npz --web
+# then on your laptop:  http://192.168.137.2:8080/   (the run prints the URLs)
+```
+
+Stdlib `http.server` only — nothing to install, no X forwarding.  A sampler
+thread reads the same `EkfShared` mailbox at 20 Hz and the page polls for new
+samples; the CAN control thread only rebinds a small status dict per sweep, so
+a stalled or closed browser cannot affect the walk.  `--web 9000` picks a port.
+
+The same page replays a recorded log after the run (serves once the replay
+finishes — tens of seconds for a long log):
+
+```bash
+python3 dog_stand_compliance_control/state_estimator/ekf_web.py walk_*.npz
+```

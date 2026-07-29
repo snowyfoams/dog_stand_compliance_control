@@ -37,14 +37,21 @@ Hardware (robot supported until proven):
 from __future__ import annotations
 
 import argparse
+import math
 import sys
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 
+# Fast GIL handoff so the EKF worker thread cannot stall the 250 Hz CAN loop
+# (validated in vmc/ekf_stand_hw.py against the 10 ms motor watchdog).
+sys.setswitchinterval(0.0005)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dog5_description"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "state_estimator"))
 
 import dog5_kinematics                      # noqa: E402
 import stand3_hold_hw as s3                 # noqa: E402
@@ -55,6 +62,10 @@ from crawl_dog5_hw import (                 # noqa: E402
     signed_distance_to_stance_plane,
     support_triangle_margin,
 )
+from ekf_runtime import EkfShared, ekf_worker, _rpy  # noqa: E402
+from imu_ekf_feed import ImuEkfFeed         # noqa: E402
+from imu_dog import DEFAULT_PORT as IMU_DEFAULT_PORT  # noqa: E402
+import ekf_web                              # noqa: E402
 
 LEGS = s3.LEGS
 MOTOR_IDS = s3.MOTOR_IDS
@@ -171,6 +182,21 @@ STAGES = [
     ("PARK", "move"), ("PARKED", "wait"),
 ]
 STAGE_INDEX = {name: i for i, (name, _) in enumerate(STAGES)}
+
+# ---- EKF contact schedule -------------------------------------------------
+# Stages in which the swing foot is treated as AIRBORNE by the estimator.
+# Conservative from UNLOAD entry (foot commanded up 20-30 mm; a false planted
+# constraint is strictly worse than 3-leg dead-reckoning) through the
+# TOUCHDOWN *stage* (descending/settling).  The contact rising edge fires at
+# the TOUCHDOWN->LOAD transition -- the same sweep that commits the MEASURED
+# anchor, so the EKF re-anchors from exactly the alpha that defined it.
+EKF_AIRBORNE_STAGES = frozenset(
+    ("UNLOAD", "CLEAR_GATE", "WAIT_SWING", "LIFT", "SWING", "LOWER",
+     "TOUCHDOWN"))
+# z-offset guard: after a CLEAR_GATE-exhausted abort the sequence jumps to
+# RECENTER with pre_m still ~30 mm (the foot stays pre-lifted through the
+# following HOLD4) -- the stage name alone would falsely say "planted".
+EKF_SWING_Z_EPS_M = 0.003
 STREAM_T = {"STAND": s3.T_STAND, "SHIFT": s3.T_SHIFT, "UNLOAD": s3.T_UNLOAD,
             "LIFT": s3.T_LIFT, "SWING": T_SWING, "LOWER": T_LOWER,
             "RECENTER": s3.T_SHIFT}
@@ -243,6 +269,30 @@ class WalkSequence:
     @property
     def kind(self):
         return STAGES[self.stage_i][1]
+
+    @property
+    def contacts(self):
+        """EKF contact schedule (bool[4], LEGS order FL,FR,RL,RR).
+
+        All planted, except: STAND (feet drag during the vertical rise --
+        the EKF dead-reckons through it, matching the validated
+        ekf_stand_hw choice) and the swing leg while airborne (stage set
+        OR residual commanded z-offset -- covers the CLEAR_GATE-abort path
+        where pre_m persists into RECENTER/HOLD4).
+        """
+        if self.stage == "STAND":
+            return np.zeros(4, dtype=bool)
+        c = np.ones(4, dtype=bool)
+        swing = self.plan.swing
+        if swing is not None:
+            airborne = (
+                self.stage in EKF_AIRBORNE_STAGES
+                or self.pre_m + self.lift_frac * self.plan.lift_m
+                > EKF_SWING_Z_EPS_M
+            )
+            if airborne:
+                c[LEGS.index(swing)] = False
+        return c
 
     def _snapshot(self):
         return {
@@ -621,11 +671,27 @@ def run_hardware(args):
               "settle checks unchanged")
     print("[walk1] ROBOT MUST REMAIN MECHANICALLY SUPPORTED UNTIL PROVEN.")
 
-    imu = None if args.no_imu else inplace._open_imu()
-    if imu is not None:
+    # One serial-port owner: ImuEkfFeed REPLACES inplace._open_imu() -- it
+    # wraps the same ImuDog (AHRS attitude via feed.attitude()) and adds the
+    # raw 0x40 stream the EKF predicts on.
+    feed = None
+    ekf_enabled = False
+    if not args.no_imu:
+        feed = ImuEkfFeed(args.imu_port).start()
         print(f"[imu] tip-over {inplace.TIPOVER_ABORT_DEG:.0f} deg; lean "
               f"watch {s3.LEAN_ABORT_DEG:.0f} deg in LIFT/SWING")
+        ekf_enabled = not args.no_ekf
+        if ekf_enabled and not feed.wait_for_raw(timeout=3.0):
+            print("[ekf] WARNING: no raw IMU (0x40) packets -- EKF disabled "
+                  "(walk continues on AHRS posture checks only)")
+            ekf_enabled = False
+    if args.raw_log and not ekf_enabled:
+        raise RuntimeError("--raw-log needs the EKF (raw IMU stream) enabled")
 
+    shared = None
+    worker = None
+    web_stop = None
+    enc_log = []       # (t_mono, alpha12, contacts4, roll_ahrs, pitch_ahrs)
     key = base.KeyPoller()
     try:
         with base.motorbus.MotorBus(MOTOR_IDS, dirs=MOTOR_DIRECTIONS) as mb:
@@ -645,6 +711,22 @@ def run_hardware(args):
                                         unload_trip=args.unload_trip,
                                         time_scale=args.time_scale)
                 safety.start(now, start_q)
+
+                if ekf_enabled:
+                    shared = EkfShared(start_q)
+                    worker = threading.Thread(
+                        target=ekf_worker, args=(shared, feed),
+                        kwargs=dict(quiet_stages=("WAIT_CROUCH",),
+                                    verbose=args.ekf_verbose),
+                        daemon=True)
+                    worker.start()
+                    print("[ekf] worker started (read-only, 100 Hz); "
+                          "initialises during WAIT_CROUCH -- wait for "
+                          "'[ekf] init' before ENTER")
+                    if args.web:
+                        web_stop, urls = ekf_web.start(shared, port=args.web)
+                        for u in urls:
+                            print(f"[web] live EKF dashboard: {u}")
 
                 slot = mb.slot(base.CONTROL_HZ)
                 deadline = time.perf_counter() + slot
@@ -670,6 +752,7 @@ def run_hardware(args):
                 imu_sample = None
                 initial_yaw_deg = None
                 last_yaw_deg = None
+                bias_printed = False
 
                 while True:
                     mb.poll()
@@ -690,6 +773,19 @@ def run_hardware(args):
                         )
                         if event:
                             print(f"[stage] {event}")
+                        if shared is not None:
+                            shared.q = q
+                            shared.qd = qd_encoder
+                            shared.stage = sequence.stage
+                            shared.contacts = sequence.contacts
+                            if (not shared.log_enabled
+                                    and sequence.stage != "CROUCH"):
+                                # raw log starts at the static WAIT_CROUCH ->
+                                # clean all-contact init prefix for hw_replay
+                                shared.log_enabled = True
+                            if not bias_printed and shared.est_ready:
+                                print(f"[ekf] init: {shared.bias_str}")
+                                bias_printed = True
                         if (sequence.stage == "HOLD4"
                                 and not sequence.torque_table_printed):
                             s3._print_torque_table(measured_torque)
@@ -711,9 +807,9 @@ def run_hardware(args):
                             )
 
                         imu_sample = None
-                        if imu is not None:
+                        if feed is not None:
                             try:
-                                imu_sample = imu.sample()
+                                imu_sample = feed.attitude()
                             except Exception:
                                 imu_sample = None
                             fresh = (
@@ -766,6 +862,34 @@ def run_hardware(args):
                                 else:
                                     lean_baseline = None
                                     lean_streak = 0
+
+                        if shared is not None:
+                            # display state for the web dashboard: REBIND a
+                            # fresh dict (the sampler thread reads it lock-free)
+                            shared.status = {
+                                "stage": sequence.stage,
+                                "step": f"{min(sequence.step_index + 1, 4)}/4",
+                                "swing": plan.swing or "--",
+                                "blk_ms": round(worst_block_ms, 2),
+                                "ahrs_roll": (
+                                    None if imu_sample is None
+                                    else round(imu_sample.roll_deg, 3)),
+                                "ahrs_pitch": (
+                                    None if imu_sample is None
+                                    else round(imu_sample.pitch_deg, 3)),
+                            }
+
+                        if (args.raw_log and shared is not None
+                                and shared.log_enabled):
+                            r_a = p_a = float("nan")
+                            if (imu_sample is not None
+                                    and imu_sample.age_s
+                                    <= inplace.POSTURE_STALE_S):
+                                r_a = math.radians(imu_sample.roll_deg)
+                                p_a = math.radians(imu_sample.pitch_deg)
+                            enc_log.append(
+                                (time.monotonic(), *q,
+                                 *shared.contacts.astype(int), r_a, p_a))
 
                         latched = [
                             mid for mid, error in errors.items()
@@ -859,6 +983,49 @@ def run_hardware(args):
                                 f"{imu_text}",
                                 flush=True,
                             )
+                            if shared is not None:
+                                out = shared.out
+                                if shared.est_ready and out is not None:
+                                    re_, pe, ye = _rpy(out["C"])
+                                    vb = out["v_body"] * 1e3
+                                    cbits = "".join(
+                                        "1" if c else "0"
+                                        for c in shared.contacts)
+                                    ahrs_text = "--"
+                                    if imu_sample is not None:
+                                        ahrs_text = (
+                                            f"({imu_sample.roll_deg:+.1f},"
+                                            f"{imu_sample.pitch_deg:+.1f})")
+                                    print(
+                                        f"[ekf] z={out['r'][2]*1e3:+5.0f}mm "
+                                        f"vb=({vb[0]:+4.0f},{vb[1]:+4.0f},"
+                                        f"{vb[2]:+4.0f})mm/s "
+                                        f"rpy=({math.degrees(re_):+5.1f},"
+                                        f"{math.degrees(pe):+5.1f},"
+                                        f"{math.degrees(ye):+6.1f})deg "
+                                        f"ahrs={ahrs_text} "
+                                        f"|bf|={np.linalg.norm(out['bf']):.3f} "
+                                        f"|bw|={np.linalg.norm(out['bw']):.1e} "
+                                        f"c={cbits} "
+                                        f"H={'OK' if out['healthy'] else '!!'}",
+                                        flush=True,
+                                    )
+                                    if args.ekf_verbose and shared.extra:
+                                        ex = shared.extra
+                                        foot_text = " ".join(
+                                            f"{leg}=({p[0]*1e3:+4.0f},"
+                                            f"{p[1]*1e3:+4.0f})"
+                                            for leg, p in ex["foot"].items())
+                                        innov_text = " ".join(
+                                            f"{leg}:{e:.1f}"
+                                            for leg, e in ex["innov"].items())
+                                        print(f"[ekf+] foot_xy_mm {foot_text}"
+                                              f" | innov_sig {innov_text}",
+                                              flush=True)
+                                else:
+                                    print("[ekf] initialising"
+                                          " (needs static WAIT_CROUCH)...",
+                                          flush=True)
                             last_print = now
                             worst_block_ms = 0.0
                         worst_block_ms = max(
@@ -885,8 +1052,12 @@ def run_hardware(args):
                             )
 
                     index += 1
-                    mb.pace(deadline)
+                    overrun = mb.pace(deadline)
                     deadline += slot
+                    if overrun and overrun > 2.0 * slot:
+                        # resync after a stall (GIL/IO hiccup) instead of
+                        # send-bursting to catch up (ENOBUFS lesson)
+                        deadline = time.perf_counter() + slot
 
             except KeyboardInterrupt as exc:
                 stop_reason = str(exc) or "KeyboardInterrupt"
@@ -906,11 +1077,33 @@ def run_hardware(args):
                     mb.stop_all()
     finally:
         key.close()
-        if imu is not None:
+        if web_stop is not None:
+            web_stop()
+        if shared is not None:
+            shared.run = False
+        if worker is not None:
+            worker.join(timeout=1.0)
+        if feed is not None:
             try:
-                imu.stop()
+                feed.stop()
             except Exception:
                 pass
+        if args.raw_log and shared is not None:
+            imu_arr = np.array(shared.imu_log, dtype=float)
+            enc_arr = np.array(enc_log, dtype=float)
+            if len(imu_arr) and len(enc_arr):
+                np.savez(args.raw_log,
+                         imu_t=imu_arr[:, 0], imu_f=imu_arr[:, 1:4],
+                         imu_w=imu_arr[:, 4:7],
+                         enc_t=enc_arr[:, 0], enc_alpha=enc_arr[:, 1:13],
+                         enc_contacts=enc_arr[:, 13:17],
+                         ahrs_rp=enc_arr[:, 17:19],
+                         init_secs=1.0)
+                print(f"[raw] wrote {args.raw_log} ({len(imu_arr)} IMU, "
+                      f"{len(enc_arr)} enc frames); analyse with "
+                      f"hw_replay.py --gait")
+            else:
+                print("[raw] nothing to write (no IMU/enc frames logged)")
     return 0
 
 
@@ -928,6 +1121,7 @@ def offline_self_test(args):
     plan = WalkPlan(**plan_args)
     seq = WalkSequence(0.0, plan, unload_trip=args.unload_trip)
     now = 0.0
+    observed = set()      # (stage, swing, contact-bits) seen by the EKF feed
 
     def spin(stop_stages, limit_s=90.0, tau=None):
         nonlocal now
@@ -938,6 +1132,8 @@ def offline_self_test(args):
             seq.sweep(now, seq.q_cmd.copy(), np.zeros(N_JOINTS), True, tt)
             for k in range(4):
                 seq.refine_leg(k)
+            observed.add((seq.stage, plan.swing,
+                          tuple(int(c) for c in seq.contacts)))
             assert now < deadline, f"stuck in {seq.stage}"
 
     def enter():
@@ -947,17 +1143,42 @@ def offline_self_test(args):
         assert ok, msg
 
     spin(("WAIT_CROUCH",))
+    assert tuple(seq.contacts) == (1, 1, 1, 1)
     enter()
     spin(("HOLD4",))
     for step in range(4):
         enter()                      # HOLD4 -> SHIFT
         spin(("WAIT_UNLOAD",))
+        assert tuple(seq.contacts) == (1, 1, 1, 1), (
+            "shifted stance must be all-planted", seq.contacts)
         enter()                      # -> UNLOAD
         spin(("WAIT_SWING",))
+        swing_i = LEGS.index(plan.swing)
+        assert not seq.contacts[swing_i], "pre-lifted foot must be airborne"
         enter()                      # -> LIFT/SWING/LOWER/TOUCHDOWN...
         spin(("HOLD4",))
+        assert tuple(seq.contacts) == (1, 1, 1, 1), (
+            "post-step HOLD4 must be all-planted", seq.contacts)
         assert seq.aborted is None, seq.aborted
         assert seq.step_index == step + 1, (seq.step_index, step)
+
+    # EKF contact-schedule oracle over everything the dry run visited:
+    # STAND dead-reckons (all off); otherwise exactly the swing leg is off in
+    # the airborne stages and never anywhere else; support is always >= 3.
+    for stage, swing, bits in observed:
+        if stage == "STAND":
+            assert bits == (0, 0, 0, 0), (stage, bits)
+            continue
+        assert sum(bits) >= 3, ("support < 3 outside STAND", stage, bits)
+        if stage in EKF_AIRBORNE_STAGES:
+            assert bits[LEGS.index(swing)] == 0, (stage, swing, bits)
+    for leg in GAIT_ORDER:
+        expect = tuple(0 if l == leg else 1 for l in LEGS)
+        for st in ("UNLOAD", "SWING", "TOUCHDOWN"):
+            assert (st, leg, expect) in observed, (st, leg)
+        assert ("LOAD", leg, (1, 1, 1, 1)) in observed, leg
+    print("EKF contact schedule: STAND dead-reckons, exactly the swing leg "
+          "airborne UNLOAD->TOUCHDOWN, re-planted from LOAD")
     assert np.isclose(plan.neutral[0], args.step), plan.neutral
     for leg in LEGS:
         expected = (dog5_kinematics.foot_position(
@@ -1002,11 +1223,60 @@ def offline_self_test(args):
     spin2(("SWING",))
     print("[synthetic lean abort] " + seq2._abort(now, "test lean"))
     assert seq2.stage == "LOWER"
+    assert not seq2.contacts[LEGS.index(plan2.swing)], \
+        "aborted swing foot still airborne through LOWER"
     spin2(("HOLD4",))
     assert seq2.aborted is not None
     assert seq2.step_index == 0, "aborted step must not count"
+    assert tuple(seq2.contacts) == (1, 1, 1, 1), \
+        "abort-via-LOWER re-plants the foot by HOLD4"
     print("abort mid-SWING: lowered, anchor committed, recentered, "
           "step not counted")
+
+    # CLEAR_GATE exhaustion: high swing torque defeats the gate; the pre-lift
+    # ladder (20->25->30 mm) times out and aborts straight to RECENTER with
+    # the foot STILL pre-lifted -- the z-offset guard (not the stage name)
+    # must keep the EKF contact off through RECENTER and the ensuing HOLD4.
+    plan3 = WalkPlan(**plan_args)
+    seq3 = WalkSequence(0.0, plan3, unload_trip=args.unload_trip)
+    now = 0.0
+    tau_high = np.full(N_JOINTS, 5.0)
+
+    def spin3(stop_stages, limit_s=90.0, tau=None):
+        nonlocal now
+        deadline = now + limit_s
+        while seq3.stage not in stop_stages:
+            now += 0.048
+            tt = np.zeros(N_JOINTS) if tau is None else tau
+            seq3.sweep(now, seq3.q_cmd.copy(), np.zeros(N_JOINTS), True, tt)
+            for k in range(4):
+                seq3.refine_leg(k)
+            assert now < deadline, f"stuck in {seq3.stage}"
+
+    def enter3():
+        nonlocal now
+        now += base.WAIT_DWELL_S + 0.1
+        ok, msg = seq3.request_next(now, seq3.q_cmd, np.zeros(N_JOINTS), True)
+        assert ok, msg
+
+    spin3(("WAIT_CROUCH",))
+    enter3()
+    spin3(("HOLD4",))
+    enter3()                         # -> SHIFT (swing = RR)
+    spin3(("WAIT_UNLOAD",))
+    enter3()                         # -> UNLOAD; gate never clears
+    spin3(("RECENTER",), limit_s=120.0, tau=tau_high)
+    swing3 = LEGS.index(plan3.swing)
+    assert seq3.aborted is not None and "exhausted" in seq3.aborted, \
+        seq3.aborted
+    assert seq3.pre_m > EKF_SWING_Z_EPS_M, seq3.pre_m
+    assert not seq3.contacts[swing3], \
+        "z-guard: pre-lifted foot must stay airborne through the abort RECENTER"
+    spin3(("HOLD4",), tau=tau_high)
+    assert not seq3.contacts[swing3], \
+        "z-guard: foot still pre-lifted in post-abort HOLD4 -> still airborne"
+    print("CLEAR_GATE exhaustion: abort keeps the pre-lifted foot airborne "
+          "for the EKF through RECENTER and HOLD4 (z-offset guard)")
     # Time scale plumbing: streams scale, the stand rise does not.
     fast = WalkSequence(0.0, WalkPlan(**plan_args), time_scale=0.5)
     assert np.isclose(fast.stream_t["SWING"], 0.5 * T_SWING)
@@ -1063,7 +1333,25 @@ def main():
     parser.add_argument("--qd-estop-hard", type=float,
                         default=base.QD_ESTOP_HARD)
     parser.add_argument("--no-imu", action="store_true")
+    parser.add_argument("--no-ekf", action="store_true",
+                        help="skip the read-only EKF worker (IMU still "
+                             "drives the posture checks)")
+    parser.add_argument("--ekf-verbose", action="store_true",
+                        help="extra [ekf+] line: per-leg foothold xy + max "
+                             "normalised innovation")
+    parser.add_argument("--imu-port", default=IMU_DEFAULT_PORT)
+    parser.add_argument("--raw-log", default=None,
+                        help="NPZ raw IMU+enc+contacts log for "
+                             "hw_replay.py --gait")
+    parser.add_argument("--web", type=int, nargs="?", const=8080, default=None,
+                        metavar="PORT",
+                        help="serve the live EKF dashboard on PORT "
+                             "(default 8080); open it in a browser on any "
+                             "machine that can reach this Pi")
     args = parser.parse_args()
+
+    if args.raw_log and args.no_imu:
+        parser.error("--raw-log needs the IMU (drop --no-imu)")
 
     if not 0.4 <= args.time_scale <= 1.5:
         parser.error("--time-scale must be between 0.4 and 1.5")

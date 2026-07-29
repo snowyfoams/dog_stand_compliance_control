@@ -10,6 +10,8 @@ system python3 (no CAN, no hardware, no mujoco).
 Usage:
     python3 hw_replay.py rest.npz
     python3 hw_replay.py rest.npz --static      # also check |v|~0, level
+    python3 hw_replay.py walk.npz --gait        # gait log: time-varying
+                                                # contacts, touchdown table
 
 Diagnostic reading (plan.md 6.5):
     one leg persistently offset  -> that leg's kinematic zero / link length
@@ -59,14 +61,17 @@ def replay(data):
     res = {k: [] for k in ("t", "z", "v", "roll_e", "pitch_e", "roll_a", "pitch_a",
                            "bf", "bw", "healthy", "min_eig")}
     innov = {"t": [], "y": [], "e": [], "legs": []}   # per encoder update
+    touchdowns = []    # (t, leg_i, |d_foothold| m, d_z_base m, |d_v| m/s)
 
     init_end = t0 + init_secs
     last_t = init_end
     ii = int(np.searchsorted(imu_t, init_end))        # first IMU sample after init
+    prev_c = contacts0.copy()
 
     for m in range(len(enc_t)):
         te = enc_t[m]
         if te <= init_end:
+            prev_c = enc_c[m].astype(bool)
             continue
         # predict every IMU sample up to this encoder frame
         contacts = enc_c[m].astype(bool)
@@ -76,6 +81,13 @@ def replay(data):
             last_t = imu_t[ii]
             ii += 1
         alpha = enc_alpha[m].reshape(4, 3)
+
+        # touchdown (contact rising edge): snapshot state before the
+        # re-anchor + update to measure the discontinuity it introduces
+        rising = np.flatnonzero(contacts & ~prev_c)
+        if len(rising):
+            pre = {i: est.state.p(i).copy() for i in rising}
+            r_pre, v_pre = est.state.r.copy(), est.state.v.copy()
 
         # peek the innovation the filter is about to apply (post re-anchor)
         est.handle_transitions(contacts, alpha)
@@ -88,6 +100,16 @@ def replay(data):
             innov["e"].append(e.copy())
             innov["legs"].append(list(legs))
         est.update(alpha, contacts)
+
+        if len(rising):
+            for i in rising:
+                touchdowns.append((
+                    te, int(i),
+                    float(np.linalg.norm(est.state.p(i) - pre[i])),
+                    float(est.state.r[2] - r_pre[2]),
+                    float(np.linalg.norm(est.state.v - v_pre)),
+                ))
+        prev_c = contacts
 
         out = est.outputs(last_w_meas=imu_w[min(ii, len(imu_w)) - 1])
         re_, pe = _roll_pitch(out["q"])
@@ -109,11 +131,18 @@ def replay(data):
         res[k] = np.array(res[k])
     res["healthy"] = np.array(res["healthy"])
     res["innov"] = innov
+    res["touchdowns"] = touchdowns
     return res
 
 
-def report(res, static=False):
-    """Print a pass/fail summary. Returns True if all checks pass."""
+def report(res, static=False, gait=False):
+    """Print a pass/fail summary. Returns True if all checks pass.
+
+    gait=True relaxes the static-biased checks for a walking log: wider
+    attitude/containment/offset thresholds, bias-settled checks become
+    informational (observability alternates during a walk), and a
+    per-touchdown re-anchor table is gated instead.
+    """
     ok = True
     n = len(res["t"])
     print(f"replayed {n} encoder updates, {len(res['innov']['t'])} with contact")
@@ -127,22 +156,25 @@ def report(res, static=False):
         print(f"  [{'PASS' if passed else 'FAIL'}] {name}" + (f"  ({detail})" if detail else ""))
 
     # attitude vs AHRS reference (roll/pitch trusted)
+    att_lim = 2.5 if gait else 1.5     # motion transients on a walking log
     tail = slice(int(0.3 * n), None)   # skip the convergence transient
     droll = np.degrees(np.abs(res["roll_e"] - res["roll_a"]))[tail]
     dpitch = np.degrees(np.abs(res["pitch_e"] - res["pitch_a"]))[tail]
-    line("EKF roll matches AHRS (<1.5 deg mean)", np.nanmean(droll) < 1.5,
+    line(f"EKF roll matches AHRS (<{att_lim} deg mean)", np.nanmean(droll) < att_lim,
          f"mean {np.nanmean(droll):.2f} max {np.nanmax(droll):.2f} deg")
-    line("EKF pitch matches AHRS (<1.5 deg mean)", np.nanmean(dpitch) < 1.5,
+    line(f"EKF pitch matches AHRS (<{att_lim} deg mean)", np.nanmean(dpitch) < att_lim,
          f"mean {np.nanmean(dpitch):.2f} max {np.nanmax(dpitch):.2f} deg")
 
-    # innovation: zero-mean & 3-sigma containment
+    # innovation: zero-mean & 3-sigma containment (stance legs only, by
+    # construction -- build_measurement emits contacted legs)
+    contain_lim = 0.90 if gait else 0.95
     if res["innov"]["e"]:
         e_all = np.concatenate(res["innov"]["e"])
         contain = float(np.mean(np.abs(e_all) < 3.0))
         line("innovation zero-mean (|mean normalised| < 0.5)",
              abs(float(np.mean(e_all))) < 0.5, f"{np.mean(e_all):+.3f}")
-        line("innovation 3-sigma containment >= 95%", contain >= 0.95,
-             f"{contain*100:.1f}%")
+        line(f"innovation 3-sigma containment >= {contain_lim*100:.0f}%",
+             contain >= contain_lim, f"{contain*100:.1f}%")
 
         # per-leg persistent offset (mean raw innovation magnitude, mm)
         per_leg = {l: [] for l in LEGS}
@@ -153,22 +185,46 @@ def report(res, static=False):
                 for l, v in per_leg.items()}
         worst = max(LEGS, key=lambda l: np.linalg.norm(offs[l]))
         worst_mm = float(np.linalg.norm(offs[worst]) * 1e3)
+        off_lim = 10.0 if gait else 8.0
         print("    per-leg mean innovation (mm): " +
               "  ".join(f"{l}={np.linalg.norm(offs[l])*1e3:.1f}" for l in LEGS))
-        line("no persistent per-leg offset (< 8 mm)", worst_mm < 8.0,
-             f"worst {worst} {worst_mm:.1f} mm")
+        line(f"no persistent per-leg offset (< {off_lim:.0f} mm)",
+             worst_mm < off_lim, f"worst {worst} {worst_mm:.1f} mm")
 
-    # bias convergence (settled over the last 20%)
+    # bias convergence (settled over the last 20%) -- informational on a gait
+    # log: leg lifts modulate observability, so settling is not a fair gate.
     bf, bw = res["bf"], res["bw"]
     bf_settle = float(np.max(np.std(bf[int(0.8 * n):], axis=0)))
     bw_settle = float(np.max(np.std(bw[int(0.8 * n):], axis=0)))
-    line("gyro bias settled", bw_settle < 5e-4, f"std {bw_settle:.2e} rad/s")
-    line("accel bias settled", bf_settle < 5e-3, f"std {bf_settle:.2e} m/s^2")
+    if gait:
+        print(f"    [info] bias tail std  bw {bw_settle:.2e} rad/s  "
+              f"bf {bf_settle:.2e} m/s^2 (not gated on a gait log)")
+    else:
+        line("gyro bias settled", bw_settle < 5e-4, f"std {bw_settle:.2e} rad/s")
+        line("accel bias settled", bf_settle < 5e-3, f"std {bf_settle:.2e} m/s^2")
     print(f"    final bias  bf={np.round(bf[-1],4)}  bw={np.round(bw[-1],5)}")
 
     # health
     line("healthy throughout (>=99%)", float(np.mean(res["healthy"])) > 0.99,
          f"{np.mean(res['healthy'])*100:.1f}%")
+
+    if gait:
+        tds = res.get("touchdowns", [])
+        print(f"    {len(tds)} touchdown (contact rising-edge) events:")
+        worst_dz = worst_dv = 0.0
+        for te, leg_i, dp, dz, dv in tds:
+            print(f"      t={te - res['t'][0]:7.2f}s  {LEGS[leg_i]}  "
+                  f"foothold jump {dp*1e3:6.1f} mm  base dz {dz*1e3:+5.1f} mm  "
+                  f"|dv| {dv*1e3:5.1f} mm/s")
+            worst_dz = max(worst_dz, abs(dz))
+            worst_dv = max(worst_dv, dv)
+        if tds:
+            line("touchdowns: base z jump < 5 mm", worst_dz < 0.005,
+                 f"worst {worst_dz*1e3:.1f} mm")
+            line("touchdowns: velocity jump < 50 mm/s", worst_dv < 0.05,
+                 f"worst {worst_dv*1e3:.1f} mm/s")
+        # (foothold jump is informational: it measures landing miss vs the
+        # dead-reckoned prediction, expect ~<30 mm on a 40 mm step)
 
     if static:
         vmax = float(np.max(np.linalg.norm(res["v"][tail], axis=1)))
@@ -182,14 +238,17 @@ def report(res, static=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("npz")
-    ap.add_argument("--static", action="store_true",
-                    help="also check |v|~0 and level (dog held still)")
+    grp = ap.add_mutually_exclusive_group()
+    grp.add_argument("--static", action="store_true",
+                     help="also check |v|~0 and level (dog held still)")
+    grp.add_argument("--gait", action="store_true",
+                     help="walking log: relaxed thresholds, touchdown table")
     args = ap.parse_args()
     print("=" * 66)
     print(f"EKF hardware replay -- {args.npz}")
     print("=" * 66)
     res = replay(load(args.npz))
-    ok = report(res, static=args.static)
+    ok = report(res, static=args.static, gait=args.gait)
     print("=" * 66)
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
