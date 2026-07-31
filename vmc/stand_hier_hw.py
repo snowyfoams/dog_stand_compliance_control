@@ -5,20 +5,30 @@ Architecture (agreed 2026-07-30 after the torque-mode VMC stand failed on
 hardware -- software torque at the 20.8 Hz per-joint CAN rate cannot
 stabilise the legs; native position mode is proven on this rig):
 
-    high level  (Pi, per ~20.8 Hz sweep)
+    high level  (Pi, per 250 Hz sweep)
+        MotorBus.slot(rate_hz) = 1/(rate_hz * n_motors), so at CONTROL_HZ
+        250 with 12 motors a slot is 333 us and a full sweep is 4 ms --
+        i.e. EVERY motor is commanded at 250 Hz and this block (the
+        joint_index == 0 branch) also runs at 250 Hz.
         EKF attitude (IMU-driven, 100 Hz worker)  ->  per-foot Cartesian
         targets: x/y pinned to the crouch FK anchors, z ramps crouch ->
         -stand_height, plus per-foot leveling z-offsets from the EKF
         roll/pitch (the hardware-proven inplace posture-trim law)
     mid level   (Pi, one leg per 3rd CAN slot)
         warm-started damped-least-squares IK (stand3's proven spread --
-        4 legs of IK in one sweep block costs 5-7 ms and trips the 10 ms
-        motor watchdog; spread it never blocks > ~2 ms)
+        4 legs of IK in one block costs 5-7 ms, far past the 333 us slot
+        and past the motor input-timeout window; spread one leg per 3rd
+        slot it never blocks long enough to starve a motor)
     low level   (motor drivers, kHz)
         0xA4 native position loops, motor-side speed caps
 
 NO software torque is commanded anywhere.  The EKF is advisory: it feeds
 the leveling trim and the displays; every motion gate is encoder-based.
+
+There is NO speed trip (removed 2026-07-31 -- it kept aborting good stands).
+Joint speed is bounded by the motor-side max_dps in the 0xA4 frame, and the
+commanded path is proven inside the soft position limits offline before any
+motor moves.  See the SPEED_WATCH_ONLY note for what still aborts a run.
 
 Stages:
     ZERO-TORQUE preflight -> CROUCH (native 0xA4 to the recorded pose)
@@ -30,8 +40,15 @@ Stages:
 Run:
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
     $V stand_hier_hw.py --self-test
+    $V stand_hier_hw.py --level-gain 0 --no-ekf      # bisect input-lost:
+                                                    # nothing but the CAN loop
     $V stand_hier_hw.py --level-gain 0 --log run1.csv --raw-log run1.npz
     $V stand_hier_hw.py                      # leveling on (0.25/s, +/-12 mm)
+
+Watch `blk=` (worst ms spent in the joint_index == 0 block) and `txfail=` in
+the status line: a motor input-lost latch needs a stall far longer than the
+333 us slot, so `blk` is the thing that finds it.  `qd=<now>/pk<peak>(trip N)`
+shows how much headroom the encoder-speed trip actually has.
 
 The robot must be supported/tethered until the runbook's sign checks pass.
 """
@@ -83,9 +100,67 @@ Q_RECORDED_CROUCH = recorded.Q_RECORDED_CROUCH   # the EKF-validated crouch
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+# dog5.xml gives every foot a CONTACT SPHERE of radius 0.02 m centred on the
+# foot site, and dog5_kinematics.foot_position() returns that SITE -- i.e. the
+# sphere centre, not the contact point.  Ground contact is 20 mm below it, so
+# the trunk origin stands FOOT_RADIUS_M higher above the floor than every
+# "trunk height" this codebase prints.  (Harmless inside the EKF -- a constant
+# offset is absorbed when the landmark is planted -- but it makes every height
+# comparison against a tape measure wrong by 20 mm.)
+FOOT_RADIUS_M = 0.020
+
+# The FK trunk origin is the HIP AXIS PLANE: dog5.xml puts all four hip bodies
+# at z = 0 and the IMU site at (0, 0, 0).  Measure to the hip pivot centre, not
+# to the chassis top or bottom, when comparing against a tape measure.
+#
+# VALIDATED 2026-07-31 on hardware at the 0.200 m stand pose:
+#   predicted ground -> hip axis  220 mm  (200 foot site + 20 contact sphere)
+#   measured  ground -> hip axis  216 mm  (8.5 in)
+# 4 mm agreement -- the leg kinematics and the encoder zeros are sound.
+#
+# The same session measured ground -> trunk bottom / IMU at 178 mm (7 in), so
+# the IMU sits ~38 mm BELOW the trunk origin.  dog5.xml places the IMU site at
+# (0, 0, 0), and the estimator's propagate_state has no lever-arm term, so:
+#   * the EKF's `r` really tracks the IMU, not the trunk origin;
+#   * leg_fk() returns feet in the TRUNK frame, so the measurement model
+#     s_pred = C (p_i - r) is short by this lever arm.
+# The constant part is absorbed when the landmark is planted, leaving only an
+# attitude-coupled residual: ~38 mm * sin(tilt), i.e. ~3 mm at 5 deg.  Small,
+# but it is a real unmodelled term -- do not chase a few mm of EKF/FK
+# disagreement without accounting for it.
+IMU_BELOW_TRUNK_ORIGIN_M = 0.038
+
 T_PARK = 8.0                    # reverse ramp duration (s)
 SETTLE_TIMEOUT_S = 30.0
 LOAD_STATUS_HZ = 4.0            # foot_load_map costs 1.6 ms -- display path ONLY
+DEFAULT_LOG_HZ = 20.0           # CSV rows/s.  The sweep is 250 Hz: writing a
+                                # row per sweep is 250 rows/s of file I/O in
+                                # the CAN loop, and one SD-card flush stall is
+                                # enough to starve every motor's input timeout.
+
+# NO SPEED TRIP.  Removed 2026-07-31 at the operator's direction after it kept
+# aborting good stands.  Speed is still BOUNDED, just not tripped on:
+#
+#   * the 0xA4 frame carries a motor-side max_dps the driver enforces in
+#     hardware (100 dps during RISE/PARK) -- that cap is untouched and is the
+#     real speed limit;
+#   * validate_configuration proves the whole commanded path, including the
+#     full leveling envelope, stays inside the soft position limits before any
+#     motor moves.
+#
+# What was removed, and why neither was salvageable:
+#   * posbase.position_fault's encoder-speed branch -- a host-side finite
+#     difference over one 4 ms sweep, then EWMA'd by EncoderVelocity at
+#     alpha=0.35.  The filter SMEARS a single raw spike across several sweeps
+#     (0.35, 0.2275, 0.148, ... of the spike), so one spike above ~6.8 rad/s
+#     clears a 3-sweep streak by itself -- debouncing it does not work.
+#   * SafetyGate's driver-side overspeed tier -- neutralised by passing inf
+#     thresholds, NOT by editing base (twostand/stand3/walk1 share it).
+#
+# Still protecting the rig: measured-torque trip, overtemp, CAN miss estop,
+# motor hard-fault flags, IMU tip-over + rise lean abort, IK residual watch,
+# target-rate clamp, and the motor-side speed cap above.
+SPEED_WATCH_ONLY = True
 
 # Leveling trim: port of the hardware-proven inplace.update_posture_trim law
 # (Phase-2 leveling stand PASSED), attitude sourced from the EKF instead of
@@ -105,6 +180,37 @@ MAX_TARGET_RATE_M_S = 0.050     # 1.5x the 33 mm/s nominal rise peak
 RATE_CLAMP_STUCK_S = 1.0
 IK_RESID_TRIP_M = 0.008
 IK_RESID_TRIP_S = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Position-mode fault check (torque only -- no speed trip)
+# ---------------------------------------------------------------------------
+class SpeedWatch:
+    """Observes encoder speed for the status line.  NEVER trips.
+
+    Kept purely so the operator can still see what the joints are doing --
+    `qd=<now>/pk<peak>` in the status line.  All abort authority was
+    removed; see the SPEED_WATCH_ONLY note above for what still protects
+    the rig.  `check()` forwards to posbase.position_fault with the speed
+    branch disabled (np.inf), so the measured-torque and
+    non-finite-feedback faults keep their original immediacy.
+    """
+
+    def __init__(self):
+        self.peak = 0.0          # worst |qd| since the last peek
+
+    def peek_peak(self, reset=True):
+        value = self.peak
+        if reset:
+            self.peak = 0.0
+        return value
+
+    def check(self, qd_encoder, measured_torque, velocity_ready, torque_trip):
+        if velocity_ready:
+            self.peak = max(self.peak, float(
+                np.max(np.abs(np.asarray(qd_encoder, dtype=float)))))
+        return posbase.position_fault(qd_encoder, measured_torque,
+                                      velocity_ready, np.inf, torque_trip)
 
 
 # ---------------------------------------------------------------------------
@@ -275,9 +381,28 @@ INSTRUCTION = {
     "PARKED": "back at crouch; X stops",
 }
 
-# EKF contact schedule (validated in ekf_stand_hw): feet drag during the
-# streams -> all-False (dead-reckon r; attitude stays IMU-driven and valid);
-# static in every other stage -> all-True.
+# EKF contact schedule.
+#
+# This was inherited from ekf_stand_hw (contacts OFF during its STAND ramp)
+# and it is WRONG for this runner.  ekf_stand_hw's ramp could drag its feet;
+# StandHierPlan cannot -- x/y are pinned to the crouch anchors and only z
+# moves, so the feet are stationary in the INERTIAL frame for the whole rise
+# while the trunk climbs over them.  That is precisely the case the foothold
+# landmark model is built for: s_meas = leg_fk(alpha) tracks the trunk's climb
+# through the encoders, s_pred = C (p_i - r) tracks it through r, and the
+# innovation drives r to the encoder-measured height.
+#
+# Declaring the feet airborne throws that measurement away and leaves r as
+# pure accelerometer double-integration for the full 8 s stream.  Only ~10
+# mm/s of residual velocity error (or 0.0025 m/s^2 of accel bias) is needed to
+# reach 80 mm over 8 s, and its sign varies run to run -- which is exactly the
+# +/-70-80 mm sign-flipping close-out error measured on hardware (2 runs,
+# 2026-07-31).  Height is unobservable in that window, so nothing corrects it,
+# and handle_transitions then replants the landmarks onto the drifted r at
+# touchdown, making the error permanent.
+#
+# Default is therefore all-planted throughout.  `--rise-contacts airborne`
+# restores the old schedule for A/B comparison.
 _STREAM_STAGES = ("RISE", "PARK")
 
 
@@ -288,9 +413,11 @@ class StandHierSequence:
     self-test and the MuJoCo sim gate can drive it through every path.
     """
 
-    def __init__(self, now, plan, trim, t_rise=8.0, t_park=T_PARK):
+    def __init__(self, now, plan, trim, t_rise=8.0, t_park=T_PARK,
+                 stream_feet_planted=True):
         self.plan = plan
         self.trim = trim
+        self.stream_feet_planted = bool(stream_feet_planted)
         self.stream_t = {"RISE": float(t_rise), "PARK": float(t_park)}
         self.stage_i = 0
         self.stage_started = float(now)
@@ -323,7 +450,9 @@ class StandHierSequence:
 
     @property
     def contacts(self):
-        if self.stage in _STREAM_STAGES:
+        # The feet never leave the ground on this trajectory (x/y pinned), so
+        # all-planted is the physically true schedule -- see _STREAM_STAGES.
+        if not self.stream_feet_planted and self.stage in _STREAM_STAGES:
             return np.zeros(4, dtype=bool)
         return np.ones(4, dtype=bool)
 
@@ -640,6 +769,74 @@ def validate_configuration(plan, level_clamp, torque_trip):
             "worst_static_tau_nm": worst_tau}
 
 
+def geometry_report(q_meas, q_cmd, tag):
+    """Print FK predictions for quantities a tape measure can check.
+
+    Separates the three explanations for a commanded-vs-measured height
+    gap.  Compare, in order:
+      1. worst |q_cmd - q_meas| -- if it is large the joints simply are
+         not tracking (sag, torque limit, speed cap) and the model is
+         fine.  If it is small, the encoders believe the pose is correct
+         and the gap is in the model or the encoder zeros.
+      2. hip-axis height -- the FK trunk origin, +FOOT_RADIUS_M for the
+         contact sphere.  This is the number to measure to the hip pivot
+         centre.
+      3. foot spreads and knee height -- HEIGHT-INDEPENDENT checks of the
+         same joint angles.  If the spreads match the tape but the height
+         does not, the error is in the pitch/knee chain; if the spreads
+         are wrong too, suspect the encoder zeros or the link lengths.
+    """
+    q_meas = np.asarray(q_meas, dtype=float)
+    q_cmd = np.asarray(q_cmd, dtype=float)
+
+    def sl(leg):
+        i = LEGS.index(leg)
+        return slice(3 * i, 3 * i + 3)
+
+    def geom(q):
+        feet = {leg: dog5_kinematics.foot_position(leg, q[sl(leg)])
+                for leg in LEGS}
+        knees = {leg: dog5_kinematics._state(leg, q[sl(leg)])[1][2]
+                 for leg in LEGS}
+        h_site = -float(np.mean([feet[leg][2] for leg in LEGS]))
+        fore = float(np.mean([feet["FL"][0], feet["FR"][0]]))
+        rear = float(np.mean([feet["RL"][0], feet["RR"][0]]))
+        left = float(np.mean([feet["FL"][1], feet["RL"][1]]))
+        right = float(np.mean([feet["FR"][1], feet["RR"][1]]))
+        knee_above_ground = float(np.mean(
+            [knees[leg][2] for leg in LEGS])) + h_site + FOOT_RADIUS_M
+        return {"hip_axis": h_site + FOOT_RADIUS_M,
+                "site": h_site,
+                "fore_aft": fore - rear,
+                "lateral": left - right,
+                "knee": knee_above_ground}
+
+    gm, gc = geom(q_meas), geom(q_cmd)
+    worst = int(np.argmax(np.abs(q_meas - q_cmd)))
+    print(f"[geom] {tag}: worst joint tracking error "
+          f"{JOINT_LABELS[worst]}={np.rad2deg(q_meas[worst] - q_cmd[worst]):+.1f}"
+          f" deg (tol {np.rad2deg(posbase.POSITION_POSE_TOL):.1f})")
+    hip_in = gm["hip_axis"] / 0.0254
+    trunk_bottom = gm["hip_axis"] - IMU_BELOW_TRUNK_ORIGIN_M
+    print(f"[geom]   MEASURE ground -> hip pivot centre: predict "
+          f"{gm['hip_axis'] * 1e3:.0f} mm = {hip_in:.2f} in "
+          f"(foot site {gm['site'] * 1e3:.0f} + {FOOT_RADIUS_M * 1e3:.0f} mm "
+          f"contact sphere)")
+    print(f"[geom]   MEASURE ground -> trunk bottom / IMU: predict "
+          f"{trunk_bottom * 1e3:.0f} mm = {trunk_bottom / 0.0254:.2f} in "
+          f"(hip axis - {IMU_BELOW_TRUNK_ORIGIN_M * 1e3:.0f} mm IMU offset)")
+    print(f"[geom]   MEASURE ground -> knee pivot centre: predict "
+          f"{gm['knee'] * 1e3:.0f} mm")
+    print(f"[geom]   MEASURE front-foot to rear-foot spacing: predict "
+          f"{gm['fore_aft'] * 1e3:.0f} mm")
+    print(f"[geom]   MEASURE left-foot to right-foot spacing: predict "
+          f"{gm['lateral'] * 1e3:.0f} mm")
+    print(f"[geom]   (from commanded q the same four are "
+          f"{gc['hip_axis'] * 1e3:.0f} / {gc['knee'] * 1e3:.0f} / "
+          f"{gc['fore_aft'] * 1e3:.0f} / {gc['lateral'] * 1e3:.0f} mm)",
+          flush=True)
+
+
 def report_limit_margins(q, tag):
     """Report-only soft-limit check of a MEASURED pose (never gates: the
     limits are software bounds against the encoder zeros, and a wrong zero
@@ -686,6 +883,21 @@ def run_hardware(args):
         print("  leveling: OFF (--level-gain 0)")
     print(f"  speed caps (motor dps): crouch {args.crouch_max_speed_dps:.0f} "
           f"rise {args.rise_max_speed_dps:.0f} stream 250")
+    print(f"  sweep {base.CONTROL_HZ:.0f} Hz per motor "
+          f"({1e6 / (base.CONTROL_HZ * N_JOINTS):.0f} us slot, "
+          f"{1e3 / base.CONTROL_HZ:.0f} ms sweep)")
+    print("  speed: NO TRIP (encoder + driver overspeed both removed); "
+          f"bounded by the motor-side cap only")
+    print(f"  position: path validated offline (hard); measured-pose limit "
+          f"estop {'ON' if args.enforce_limits else 'OFF (report-only)'}")
+    print(f"  torque trip {args.torque_trip:.1f} N*m; overtemp, CAN miss, "
+          f"motor faults, IMU tip-over, IK residual all live")
+    print(f"  EKF contacts during RISE/PARK: {args.rise_contacts}"
+          + ("  (feet never slide here -- height stays observable)"
+             if args.rise_contacts == "planted"
+             else "  (A/B: dead-reckons r for the whole stream)"))
+    if args.log:
+        print(f"  CSV log: {args.log} at {args.log_hz:.0f} Hz")
     print("  ROBOT MUST REMAIN SUPPORTED/TETHERED UNTIL THE RUNBOOK "
           "SIGN CHECKS PASS.")
     print("=" * 74)
@@ -697,8 +909,12 @@ def run_hardware(args):
     trim = LevelingTrim(plan.anchors_xy, gain_per_s=args.level_gain,
                         clamp_m=args.level_clamp)
     unwrap = [base.CalibratedEncoderUnwrap() for _ in MOTOR_IDS]
-    safety = base.SafetyGate(tau_cap=1.0, qd_estop=base.QD_ESTOP,
-                             qd_estop_hard=base.QD_ESTOP_HARD)
+    # inf thresholds disable SafetyGate's overspeed tier without editing base
+    # (twostand / stand3 / walk1 share that class).  Every other SafetyGate
+    # check -- overtemp, CAN miss estop, motor hard faults -- stays live.
+    safety = base.SafetyGate(tau_cap=1.0, qd_estop=np.inf,
+                             qd_estop_hard=np.inf)
+    speed_watch = SpeedWatch()
 
     # One serial-port owner: ImuEkfFeed wraps the AHRS (feed.attitude()) and
     # the raw 0x40 stream the EKF predicts on (walk1 pattern).
@@ -724,7 +940,11 @@ def run_hardware(args):
         csv_file = open(args.log, "w", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(
-            ["t", "stage", "rz_m", "vx", "vy", "vz",
+            # h_fk_m / dh_fk_m are the encoder-side truth for rz_m: with the
+            # feet planted the EKF height is essentially leg odometry, so
+            # (rz_m - dh_fk_m) is the estimator's running error against a
+            # reference that cannot drift.  Plot that, not rz_m alone.
+            ["t", "stage", "rz_m", "h_fk_m", "dh_fk_m", "vx", "vy", "vz",
              "roll_est_deg", "pitch_est_deg", "roll_ahrs_deg",
              "pitch_ahrs_deg", "healthy",
              "off_FL_mm", "off_FR_mm", "off_RL_mm", "off_RR_mm",
@@ -740,17 +960,23 @@ def run_hardware(args):
             armed = False
             stop_reason = None
             try:
-                print(f"[ARM] arming for up to {posbase.ARM_TIMEOUT_S:.0f}s")
+                print(f"[ARM] arming for up to {posbase.ARM_TIMEOUT_S:.0f}s; "
+                      "power the motors on now if they are off, Ctrl-C aborts")
+                # verbose=True: stand3/walk1 pass False, which makes a 15 s arm
+                # look like a dead hang.  The stream prints which motors are
+                # still pending every 0.5 s and names any that need a power
+                # cycle -- that is the whole diagnosis, so do not silence it.
                 if not mb.arm(rate_hz=base.CONTROL_HZ,
-                              timeout_s=posbase.ARM_TIMEOUT_S, verbose=False):
+                              timeout_s=posbase.ARM_TIMEOUT_S, verbose=True):
                     raise RuntimeError("arming timed out: "
                                        + posbase.arm_failure_summary(mb))
                 armed = True
                 start_q = posbase.zero_torque_preflight(mb, key, unwrap)
                 report_limit_margins(start_q, "rest pose")
                 now = time.perf_counter()
-                sequence = StandHierSequence(now, plan, trim,
-                                             t_rise=args.t_rise)
+                sequence = StandHierSequence(
+                    now, plan, trim, t_rise=args.t_rise,
+                    stream_feet_planted=(args.rise_contacts == "planted"))
                 safety.start(now, start_q)
 
                 if ekf_enabled:
@@ -783,6 +1009,8 @@ def run_hardware(args):
                                 for mid in MOTOR_IDS}
                 last_print = 0.0
                 last_load_print = 0.0
+                last_csv = 0.0
+                csv_period = 1.0 / max(args.log_hz, 1e-6)
                 index = 0
                 velocity = posbase.EncoderVelocity()
                 qd_encoder = np.zeros(N_JOINTS)
@@ -831,6 +1059,32 @@ def run_hardware(args):
                                                velocity.ready)
                         if event:
                             print(f"[stage] {event}")
+                            # Close-out metric: WAIT_CROUCH and PARKED are the
+                            # SAME physical pose, and the EKF defines r = 0 at
+                            # its init in WAIT_CROUCH -- so z at PARKED is the
+                            # accumulated drift over one rise+park cycle,
+                            # measured against an exactly known truth of 0.
+                            # FK height is the encoder-side reference.
+                            if sequence.stage in ("HOLD", "PARKED"):
+                                geometry_report(q, sequence.q_cmd,
+                                                sequence.stage)
+                                if (shared is not None
+                                        and shared.out is not None):
+                                    z_ekf = float(shared.out["r"][2])
+                                    h_fk = -float(np.mean(
+                                        [dog5_kinematics.foot_position(
+                                            leg, q[plan._sl(leg)])[2]
+                                         for leg in LEGS]))
+                                    d_fk = h_fk - crouch_h
+                                    print(
+                                        f"[ekf] {sequence.stage} close-out: "
+                                        f"z_ekf={z_ekf * 1e3:+.0f}mm "
+                                        f"vs FK rise={d_fk * 1e3:+.0f}mm "
+                                        f"-> error "
+                                        f"{(z_ekf - d_fk) * 1e3:+.0f}mm"
+                                        + ("  (PARKED truth is 0)"
+                                           if sequence.stage == "PARKED"
+                                           else ""), flush=True)
                         if sequence.fault and stop_reason is None:
                             stop_reason = sequence.fault
 
@@ -852,11 +1106,11 @@ def run_hardware(args):
                         if stop_reason is None:
                             stop_reason = safety.estop_reason(
                                 q, qd_driver, temps, misses, errors, now,
-                                enforce_position_limits=False)
+                                enforce_position_limits=args.enforce_limits)
                         if stop_reason is None:
-                            stop_reason = posbase.position_fault(
+                            stop_reason = speed_watch.check(
                                 qd_encoder, measured_torque, velocity.ready,
-                                args.speed_trip, args.torque_trip)
+                                args.torque_trip)
 
                         # IMU judges (never steers): tip-over + rise lean
                         if (imu_sample is not None
@@ -947,7 +1201,12 @@ def run_hardware(args):
                                 mb, recover, elapsed, last_recover,
                                 next_fault_status)
 
-                        if csv_writer is not None:
+                        # Throttled: a row per 250 Hz sweep is 250 rows/s of
+                        # file I/O inside the CAN loop, and one SD-card flush
+                        # stall starves every motor's input timeout.
+                        if (csv_writer is not None
+                                and now - last_csv >= csv_period):
+                            last_csv = now
                             rz = vx = vy = vz = float("nan")
                             r_e = p_e = float("nan")
                             hlt = 0
@@ -963,8 +1222,13 @@ def run_hardware(args):
                             if imu_sample is not None:
                                 r_a = imu_sample.roll_deg
                                 p_a = imu_sample.pitch_deg
+                            h_fk = -float(np.mean(
+                                [dog5_kinematics.foot_position(
+                                    leg, q[plan._sl(leg)])[2]
+                                 for leg in LEGS]))
                             csv_writer.writerow(
                                 [f"{now:.4f}", sequence.stage, f"{rz:.4f}",
+                                 f"{h_fk:.4f}", f"{h_fk - crouch_h:.4f}",
                                  f"{vx:.4f}", f"{vy:.4f}", f"{vz:.4f}",
                                  f"{r_e:.3f}", f"{p_e:.3f}",
                                  f"{r_a:.3f}", f"{p_a:.3f}", hlt,
@@ -1003,7 +1267,8 @@ def run_hardware(args):
                                 f"[hier] {sequence.stage:<12} "
                                 f"{INSTRUCTION[sequence.stage]} | "
                                 f"h={100 * sequence.height_frac:3.0f}% "
-                                f"max|qd|={np.max(np.abs(qd_encoder)):.2f} "
+                                f"qd={np.max(np.abs(qd_encoder)):.2f}"
+                                f"/pk{speed_watch.peek_peak():.2f} "
                                 f"max|tau|="
                                 f"{np.max(np.abs(measured_torque)):.2f} "
                                 f"Tmax={int(np.max(temps))}C "
@@ -1198,6 +1463,9 @@ def offline_self_test(args):
     check("decay ramps offsets to zero",
           max(abs(v) for v in trim2.offsets.values()) < 1e-9)
 
+    # 0.004 s is the real cadence (250 Hz per motor, 12 x 333 us slots);
+    # 0.048 s is a 20x-slower stress case, kept to prove the laws are all
+    # dt-based and the stage walk is rate-independent.
     print("[4] sequence walk (synthetic instant-tracking plant), dt sweep")
     final = {}
     for dt in (0.048, 0.004):
@@ -1244,8 +1512,32 @@ def offline_self_test(args):
         check(f"dt={dt}: PARKED q_cmd snaps to the recorded crouch",
               float(np.max(np.abs(seq.q_cmd - Q_RECORDED_CROUCH))) < 1e-12)
         final[dt] = stages_seen
-    check("stage walk identical at 20.8 Hz and 250 Hz sweep cadence",
+    check("stage walk identical at the 250 Hz cadence and 20x slower",
           final[0.048] == final[0.004])
+
+    print("[4b] EKF contact schedule")
+    seq_p = StandHierSequence(0.0, plan, LevelingTrim(plan.anchors_xy),
+                              stream_feet_planted=True)
+    seq_a = StandHierSequence(0.0, plan, LevelingTrim(plan.anchors_xy),
+                              stream_feet_planted=False)
+    planted_all = airborne_streams = True
+    for name, _kind in STAGES:
+        seq_p.stage_i = seq_a.stage_i = STAGE_INDEX[name]
+        if not seq_p.contacts.all():
+            planted_all = False
+        expect_off = name in _STREAM_STAGES
+        if bool(seq_a.contacts.any()) == expect_off:
+            airborne_streams = False
+    check("planted schedule keeps all four feet in contact everywhere",
+          planted_all)
+    check("airborne schedule still drops contact in RISE/PARK only",
+          airborne_streams)
+    # the x/y pinning that makes 'planted' physically true
+    tgt_lo = plan.foot_targets(0.0, {leg: 0.0 for leg in LEGS})
+    tgt_hi = plan.foot_targets(1.0, {leg: 0.0 for leg in LEGS})
+    check("feet never slide during the rise (x/y identical, only z moves)",
+          all(np.allclose(tgt_lo[leg][:2], tgt_hi[leg][:2]) for leg in LEGS)
+          and all(abs(tgt_lo[leg][2] - tgt_hi[leg][2]) > 1e-3 for leg in LEGS))
 
     print("[5] stream guards")
     trim4 = LevelingTrim(plan.anchors_xy)
@@ -1273,21 +1565,81 @@ def offline_self_test(args):
           seq2.fault is not None and "IK residual" in seq2.fault,
           str(seq2.fault))
 
-    print("[6] position_fault + EncoderVelocity")
+    print("[6] SpeedWatch (no speed trip) + EncoderVelocity")
     vel = posbase.EncoderVelocity()
     t = 0.0
     for _ in range(6):
-        t += 0.048
+        t += 0.004
         vel.update(Q_RECORDED_CROUCH + 1e-4 * t, t)
     check("EncoderVelocity ready after 5 samples", vel.ready)
-    msg = posbase.position_fault(
-        np.zeros(N_JOINTS), np.full(N_JOINTS, 7.0), True, 1.0, 6.0)
-    check("torque trip message", msg is not None and "torque" in msg, msg)
-    qd_hot = np.zeros(N_JOINTS)
-    qd_hot[4] = 1.5
-    msg = posbase.position_fault(
-        qd_hot, np.zeros(N_JOINTS), True, 1.0, 6.0)
-    check("speed trip message", msg is not None and "speed" in msg, msg)
+
+    zero = np.zeros(N_JOINTS)
+    watch = SpeedWatch()
+    msg = watch.check(zero, np.full(N_JOINTS, 7.0), True, 6.0)
+    check("torque trip survives and is immediate",
+          msg is not None and "torque" in msg, msg)
+    msg = watch.check(zero, np.full(N_JOINTS, np.nan), True, 6.0)
+    check("invalid torque feedback still faults",
+          msg is not None and "invalid" in msg, msg)
+
+    # every speed that used to abort a run must now be silent
+    watch = SpeedWatch()
+    silent = True
+    for level in (1.5, 7.0, 13.0, 550.0):        # trip, QD_ESTOP, ceiling,
+        qd = np.zeros(N_JOINTS)                  # 360 deg unwrap step
+        qd[4] = level
+        for _ in range(50):
+            if watch.check(qd, zero, True, 6.0) is not None:
+                silent = False
+    check("no encoder speed ever aborts the run (1.5 -> 550 rad/s)", silent)
+
+    watch = SpeedWatch()
+    watch.check(np.full(N_JOINTS, 3.0), zero, True, 6.0)
+    check("peak still tracked for the status line",
+          abs(watch.peek_peak() - 3.0) < 1e-9)
+    check("peek_peak resets", abs(watch.peek_peak()) < 1e-9)
+    watch.check(np.full(N_JOINTS, 9.0), zero, False, 6.0)
+    check("peak ignores samples before EncoderVelocity is ready",
+          abs(watch.peek_peak()) < 1e-9)
+
+    print("[7] SafetyGate overspeed neutralised, other checks intact")
+    gate = base.SafetyGate(tau_cap=1.0, qd_estop=np.inf, qd_estop_hard=np.inf)
+    q_ok = Q_RECORDED_CROUCH.copy()
+    ok_args = dict(temps=np.zeros(N_JOINTS, dtype=int),
+                   miss_streaks=np.zeros(N_JOINTS, dtype=int),
+                   errors={mid: 0 for mid in MOTOR_IDS})
+    gate.start(0.0, q_ok)
+    quiet = True
+    for k in range(10):
+        if gate.estop_reason(q_ok, np.full(N_JOINTS, 500.0), now=0.004 * k,
+                             enforce_position_limits=False, **ok_args):
+            quiet = False
+    check("driver overspeed cannot trip at 500 rad/s", quiet)
+    hot = dict(ok_args)
+    hot["temps"] = np.full(N_JOINTS, 200, dtype=int)
+    check("overtemp still trips",
+          gate.estop_reason(q_ok, np.zeros(N_JOINTS), now=1.0,
+                            enforce_position_limits=False, **hot) is not None)
+    miss = dict(ok_args)
+    miss["miss_streaks"] = np.full(N_JOINTS, 10_000, dtype=int)
+    check("CAN miss estop still trips",
+          gate.estop_reason(q_ok, np.zeros(N_JOINTS), now=1.0,
+                            enforce_position_limits=False, **miss) is not None)
+    bad = dict(ok_args)
+    bad["errors"] = {mid: (0x02 if mid == MOTOR_IDS[0] else 0)
+                     for mid in MOTOR_IDS}
+    check("motor hard fault still trips",
+          gate.estop_reason(q_ok, np.zeros(N_JOINTS), now=1.0,
+                            enforce_position_limits=False, **bad) is not None)
+    low, high = base.soft_limits()
+    q_bad = q_ok.copy()
+    q_bad[0] = high[0] + 1.0
+    check("position limit trips only when --enforce-limits is on",
+          gate.estop_reason(q_bad, np.zeros(N_JOINTS), now=1.0,
+                            enforce_position_limits=False, **ok_args) is None
+          and gate.estop_reason(q_bad, np.zeros(N_JOINTS), now=1.0,
+                                enforce_position_limits=True, **ok_args)
+          is not None)
 
     print()
     if failures:
@@ -1329,14 +1681,29 @@ def main():
                     help="motor-side dps cap for RISE/PARK")
     ap.add_argument("--torque-trip", type=float, default=6.0,
                     help="measured-torque trip N*m (position_fault)")
-    ap.add_argument("--speed-trip", type=float, default=1.0,
-                    help="encoder-speed trip rad/s (position_fault)")
+    ap.add_argument("--enforce-limits", action="store_true",
+                    help="also estop on a MEASURED pose outside the soft "
+                         "position limits.  Off by default: the limits are "
+                         "bounds against the encoder zeros, and a wrong zero "
+                         "rejects a mechanically fine pose.  The commanded "
+                         "path is validated against them offline either way.")
+    ap.add_argument("--rise-contacts", choices=("planted", "airborne"),
+                    default="planted",
+                    help="EKF contact schedule during RISE/PARK. 'planted' "
+                         "(default) is physically true here -- the feet never "
+                         "slide -- and keeps height observable. 'airborne' "
+                         "restores the old ekf_stand_hw schedule, which "
+                         "dead-reckons r for the whole stream (+/-80 mm "
+                         "close-out error on hardware); A/B only.")
     ap.add_argument("--no-imu", action="store_true")
     ap.add_argument("--no-ekf", action="store_true")
     ap.add_argument("--web", type=int, default=0,
                     help="EKF live dashboard port (0 = off)")
     ap.add_argument("--ekf-verbose", action="store_true")
     ap.add_argument("--log", default="", help="CSV log path")
+    ap.add_argument("--log-hz", type=float, default=DEFAULT_LOG_HZ,
+                    help="CSV rows/s (the sweep is 250 Hz; logging every "
+                         "sweep puts 250 rows/s of file I/O in the CAN loop)")
     ap.add_argument("--raw-log", default="", help="NPZ raw log for hw_replay")
     ap.add_argument("--self-test", action="store_true",
                     help="offline checks, no hardware")
