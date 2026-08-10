@@ -361,6 +361,11 @@ def run(model, data, args, viewer=None, frame_hook=None, quiet=False):
                                   kp=S.KP_SERVO * args.kp_scale)
 
     steps_per_tick = max(1, round(1.0 / (S.CONTROL_HZ * model.opt.timestep)))
+    # One control tick = one whole-bus CAN sweep, so every motor is refreshed
+    # at S.CONTROL_HZ (250 Hz).  --can-roundrobin restores the old
+    # one-motor-per-tick model (250/12 = 20.8 Hz per joint).
+    roundrobin = bool(getattr(args, "can_roundrobin", False))
+    ticks_per_sweep = N_JOINTS if roundrobin else 1
     slot = 0
     q_targets = data.qpos[qadr].copy()
     last_print = -np.inf
@@ -368,7 +373,7 @@ def run(model, data, args, viewer=None, frame_hook=None, quiet=False):
 
     while controller.stop_reason is None:
         now = data.time
-        if slot % N_JOINTS == 0:
+        if slot % ticks_per_sweep == 0:
             q_enc, qd_reported, tau_measured = servo.telemetry()
             q_targets = controller.sweep(now, q_enc, qd_reported, tau_measured)
             oracle.sample(controller.stage, q_enc, tau_measured)
@@ -379,8 +384,10 @@ def run(model, data, args, viewer=None, frame_hook=None, quiet=False):
                       f"margin={1000 * oracle.true_margin():+6.1f} mm",
                       flush=True)
                 last_print = now
-        motor = slot % N_JOINTS
-        servo.command(motor, q_targets[motor], controller._cap_for_stage())
+        cap_dps = controller._cap_for_stage()
+        motors = (slot % N_JOINTS,) if roundrobin else range(N_JOINTS)
+        for motor in motors:
+            servo.command(motor, q_targets[motor], cap_dps)
         for _ in range(steps_per_tick):
             data.ctrl[:] = servo.step(data.qpos[qadr], model.opt.timestep)
             mujoco.mj_step(model, data)
@@ -480,6 +487,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--can-roundrobin", action="store_true",
+        help="legacy CAN model: one motor per 250 Hz tick (20.8 Hz per "
+             "joint); the real bus carries all 12 motors at 250 Hz each")
     parser.add_argument("--step", type=float, default=DEFAULT_STEP_M)
     parser.add_argument("--shift", type=float, default=DEFAULT_SHIFT_M)
     parser.add_argument("--prelift", type=float, default=DEFAULT_PRELIFT_M)

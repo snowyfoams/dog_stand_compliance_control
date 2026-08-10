@@ -9,9 +9,10 @@ gates (``crawl_dog5_hw.py``), both from the ``dog5-live-mirror`` branch:
 
 * motion is native-position-command style only: joint targets + motor-side
   speed caps, no torque law, no dynamics model (kinematic control);
-* feedback is encoder-only: quantized joint angles at ~20.8 Hz (one CAN
-  round-robin sweep), velocity from the hardware ``EncoderVelocity`` filter,
-  and per-joint measured torque (driver telemetry);
+* feedback is encoder-only: quantized joint angles at 250 Hz (every driver
+  is commanded and replies once per control cycle -- see the CAN budget
+  below), velocity from the hardware ``EncoderVelocity`` filter, and
+  per-joint measured torque (driver telemetry);
 * MuJoCo is treated as the physical dog: the control side never reads any
   MuJoCo kinematics (no ``mj_jacSite``, ``site_xpos``, frames, or ``qvel``)
   — all FK/IK/Jacobians come from the NumPy ``dog5_kinematics`` module, and
@@ -59,7 +60,18 @@ N_JOINTS = 12
 JOINT_LABELS = [f"{leg}_{j}" for leg in LEGS for j in ("abd", "pitch", "knee")]
 
 # ---- constants copied from the hardware runners (dog5-live-mirror) ----
-CONTROL_HZ = 250.0            # stand_dog5_hw.CONTROL_HZ; one motor per tick
+# CAN budget (corrected 2026-08-10).  All 12 drivers sit on ONE 1 Mbit/s bus.
+# A 0xA4 native-position command is a single 8-byte frame and the driver's
+# reply is another; with worst-case bit stuffing an 8-byte frame is ~130 bits,
+# so a command+reply pair costs ~260 us and a full 12-motor sweep ~3.1 ms --
+# a ceiling of ~320 Hz per motor.  CONTROL_HZ is therefore the rate EVERY
+# motor is refreshed at (12 x 250 Hz = 78% bus load), not a budget to be
+# divided across the drivers.  The earlier sim commanded one motor per tick
+# and so ran each joint at 250/12 = 20.8 Hz -- a 12x under-run of the real
+# hardware; ``--can-roundrobin`` reproduces that old behaviour for comparison.
+CONTROL_HZ = 250.0            # stand_dog5_hw.CONTROL_HZ; per-motor rate
+MOTORS_PER_BUS = N_JOINTS     # all 12 drivers share the one CAN bus
+CAN_FRAME_PAIR_S = 260.0e-6   # command + reply at 1 Mbit/s, worst-case stuffing
 GEAR = 10.0                   # speed field is motor-side; joint side = /GEAR
 POSITION_POSE_TOL = 0.08      # stand_by_position_command settle gates
 POSITION_QD_TOL = 0.25
@@ -70,7 +82,9 @@ ABD_LIM, PITCH_LIM, KNEE_LIM = 1.75, 2.6, 2.6   # stand_dog5_hw soft limits
 LIMIT_ESTOP_MARGIN = 0.05
 QD_ESTOP = 7.0                # sustained, encoder-confirmed
 QD_ESTOP_HARD = 8.0           # single-sample driver speed
-QD_ESTOP_STREAK = 3
+QD_ESTOP_CONFIRM_S = 0.15     # confirmation window (was 3 sweeps @ 20.8 Hz);
+                              # expressed in seconds so the trip means the
+                              # same thing at any control rate
 TAU_HARD = 9.0                # driver capability; 0xA4 has no commanded cap
 MIN_LIFTOFF_MARGIN_M = 0.015  # crawl_dog5_hw liftoff gate
 # The crawl's torque-mode unload fades feedforward with the foot planted and
@@ -116,7 +130,12 @@ KP_SERVO = 120.0              # N*m/rad   guessed 0xA4 internal position loop
 KD_SERVO = 2.5                # N*m*s/rad
 ENCODER_QUANTUM_RAD = 0.0005
 
-SWEEPS_PER_STATE = N_JOINTS   # gates/trips run once per round-robin sweep
+
+def can_bus_load(control_hz=CONTROL_HZ, motors=MOTORS_PER_BUS):
+    """Fraction of the 1 Mbit/s bus used to refresh every motor at
+    ``control_hz`` (command + reply per motor per cycle).  >= 1.0 is
+    infeasible; the hardware ceiling is ~320 Hz per motor for 12 drivers."""
+    return float(control_hz) * int(motors) * CAN_FRAME_PAIR_S
 
 
 def _stack_pose(pose_deg):
@@ -161,10 +180,19 @@ def support_triangle_margin(points_xy, com_xy=(0.0, 0.0)):
 
 
 def _ik_to_target(leg, q_start, target):
-    """Damped-least-squares IK (crawl_dog5_hw copy)."""
+    """Damped-least-squares IK (crawl_dog5_hw copy).
+
+    Same iteration and the same 100-iteration cap as the hardware copy;
+    the only addition is an exit once the residual is numerically zero
+    (1 nm).  At 250 Hz per motor the targets move 12x less between solves,
+    so a warm start converges in a handful of iterations -- the exit buys
+    speed, never a different answer.
+    """
     q = np.asarray(q_start, dtype=float).copy()
     for _ in range(100):
         error = np.asarray(target) - dog5_kinematics.foot_position(leg, q)
+        if float(np.max(np.abs(error))) < 1.0e-9:
+            break
         jacobian = dog5_kinematics.foot_jacobian(leg, q)
         q += 0.35 * jacobian.T @ np.linalg.solve(
             jacobian @ jacobian.T + 1.0e-5 * np.eye(3), error
@@ -376,7 +404,7 @@ def _smoothstep(u):
 class Stand3Controller:
     """Encoder-only stage machine streaming position commands.
 
-    Sees: quantized q at ~20.8 Hz, EncoderVelocity, measured torque.
+    Sees: quantized q at 250 Hz, EncoderVelocity, measured torque.
     Never sees: trunk pose, contacts, true CoM, MuJoCo internals.
     """
 
@@ -400,7 +428,7 @@ class Stand3Controller:
         self.q_cmd = Q_ZERO.copy()          # last commanded joint targets
         self.stop_reason = None
         self.aborted = None
-        self.qd_streak = 0
+        self.qd_over_since = None
         self.events = []
 
     @property
@@ -467,13 +495,14 @@ class Stand3Controller:
             return (f"hard overspeed: {JOINT_LABELS[j]}="
                     f"{qd_reported[j]:+.1f} rad/s > {QD_ESTOP_HARD}")
         if self.velocity.ready and np.any(np.abs(self.qd) > QD_ESTOP):
-            self.qd_streak += 1
-            if self.qd_streak >= QD_ESTOP_STREAK:
+            if self.qd_over_since is None:
+                self.qd_over_since = now
+            elif now - self.qd_over_since >= QD_ESTOP_CONFIRM_S:
                 j = int(np.argmax(np.abs(self.qd)))
                 return (f"sustained overspeed: {JOINT_LABELS[j]}="
                         f"{self.qd[j]:+.1f} rad/s > {QD_ESTOP}")
         else:
-            self.qd_streak = 0
+            self.qd_over_since = None
         if np.any(np.abs(tau_measured) > self.torque_trip):
             j = int(np.argmax(np.abs(tau_measured)))
             return (f"measured-torque trip: {JOINT_LABELS[j]}="
@@ -481,7 +510,7 @@ class Stand3Controller:
         return None
 
     def sweep(self, now, q_enc, qd_reported, tau_measured):
-        """One per-round-robin update: state estimate, gates, target refresh.
+        """One per-sweep (250 Hz) update: state estimate, gates, target refresh.
 
         Returns the 12 joint targets to stream this sweep (rad).
         """
@@ -684,6 +713,11 @@ def run(model, data, args, viewer=None, frame_hook=None, quiet=False):
         zero_error=zero_error)
 
     steps_per_tick = max(1, round(1.0 / (CONTROL_HZ * model.opt.timestep)))
+    # One control tick = one whole-bus sweep: all 12 drivers are commanded
+    # and all 12 reply, so every motor runs at CONTROL_HZ.  --can-roundrobin
+    # restores the old (wrong) one-motor-per-tick model, i.e. CONTROL_HZ/12.
+    roundrobin = bool(getattr(args, "can_roundrobin", False))
+    ticks_per_sweep = N_JOINTS if roundrobin else 1
     slot = 0
     q_targets = Q_ZERO.copy()
     last_print = -np.inf
@@ -691,7 +725,7 @@ def run(model, data, args, viewer=None, frame_hook=None, quiet=False):
 
     while controller.stop_reason is None:
         now = data.time
-        if slot % SWEEPS_PER_STATE == 0:
+        if slot % ticks_per_sweep == 0:
             # The controller sees only CAN telemetry; every kinematic
             # quantity it uses comes from dog5_kinematics (NumPy).
             q_enc, qd_reported, tau_measured = servo.telemetry()
@@ -706,8 +740,10 @@ def run(model, data, args, viewer=None, frame_hook=None, quiet=False):
                       f"swing|tau|={np.max(np.abs(tau_measured[sl][1:])):4.2f}",
                       flush=True)
                 last_print = now
-        motor = slot % N_JOINTS
-        servo.command(motor, q_targets[motor], controller._cap_for_stage())
+        cap_dps = controller._cap_for_stage()
+        motors = (slot % N_JOINTS,) if roundrobin else range(N_JOINTS)
+        for motor in motors:
+            servo.command(motor, q_targets[motor], cap_dps)
         for _ in range(steps_per_tick):
             data.ctrl[:] = servo.step(data.qpos[qadr], model.opt.timestep)
             mujoco.mj_step(model, data)
@@ -804,6 +840,17 @@ def self_test(args):
           f"worst joint torque {worst_tau:.2f} N*m "
           f"(driver capability {TAU_HARD} N*m; set hw torque trip above this)")
 
+    # CAN budget: 12 drivers at CONTROL_HZ must fit on the one 1 Mbit/s bus,
+    # and the old one-motor-per-tick model must be the 12x under-run it is.
+    load = can_bus_load()
+    ceiling_hz = 1.0 / (MOTORS_PER_BUS * CAN_FRAME_PAIR_S)
+    if load >= 1.0:
+        raise SystemExit(f"FAIL: {CONTROL_HZ:.0f} Hz x {MOTORS_PER_BUS} motors "
+                         f"needs {100 * load:.0f}% of the CAN bus")
+    print(f"CAN budget: {MOTORS_PER_BUS} motors x {CONTROL_HZ:.0f} Hz = "
+          f"{100 * load:.0f}% of 1 Mbit/s (ceiling {ceiling_hz:.0f} Hz/motor; "
+          f"round-robin would be only {CONTROL_HZ / MOTORS_PER_BUS:.1f} Hz/motor)")
+
     assert support_triangle_margin([(1, 0), (0, 1), (-1, -1)]) > 0
     assert support_triangle_margin([(1, 0), (0, 1), (-1, -1)], (2, 2)) < 0
     velocity = EncoderVelocity()
@@ -865,6 +912,12 @@ def main():
                         help="crouch = hardware method (placed in crouch, "
                              "CROUCH->STAND native moves); flat = sim-only "
                              "stand-up from the calibration pose")
+    parser.add_argument(
+        "--can-roundrobin", action="store_true",
+        help="legacy CAN model: command ONE motor per 250 Hz tick, so each "
+             "joint is only refreshed at 250/12 = 20.8 Hz.  Kept to "
+             "reproduce the pre-2026-08-10 results; the real bus carries "
+             "all 12 motors at 250 Hz each (78%% load)")
     parser.add_argument("--swing-leg", default=DEFAULT_SWING_LEG, choices=LEGS)
     parser.add_argument("--shift", type=float, default=DEFAULT_SHIFT_M)
     parser.add_argument("--lift", type=float, default=DEFAULT_LIFT_M)

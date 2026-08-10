@@ -98,7 +98,7 @@ Motors calibrated against the coordinate convention from Stage 2, then a
 basic position controller held the assembled robot standing — the first time
 DOG5 stood on its own legs. This is native `0xA4` position-command control
 (joint targets + motor-side speed caps, no torque law, encoder-only
-feedback at ~20.8 Hz from a 12-motor CAN round-robin). That controller
+feedback at 250 Hz, every motor refreshed once per 4 ms sweep). That controller
 (`stand_by_position_command.py`, `stand_dog5_hw.py`) lives on
 [`dog5-live-mirror`](../../tree/dog5-live-mirror) — it is real-hardware code
 and doesn't belong in the sim tree.
@@ -110,9 +110,13 @@ commands are used: `0xA4` absolute multi-turn position (with a motor-side
 speed cap, used for CROUCH/STAND moves) and a torque command (used once
 Cartesian compliance takes over); telemetry back is encoder position, speed,
 and measured torque, nothing else — no IMU, no foot-force sensor. The control
-loop runs at 250 Hz but services one motor per tick, so a full 12-motor state
-sweep lands at ~20.8 Hz — the real rate the robot "knows" its own state, and
-the single most important fidelity constraint the sim mirrors in Stage 4.
+loop runs at 250 Hz **per motor**: one sweep commands all 12 and takes 4 ms,
+each motor's slot inside it ~333 µs. A `0xA4` command and its reply are ~130
+bits each, so a command+reply pair costs ~260 µs and a full sweep ~3.1 ms —
+**78% of the 1 Mbit/s bus**, against a ceiling of ~320 Hz per motor. The bus
+is nearly full, so the scarce resource is host time inside the 4 ms sweep:
+every motor must hear from the host within 10 ms or its driver latches
+*input lost*.
 The low-level protocol driver (frame encoding, the position/torque/telemetry
 calls, single-motor bring-up) is its own project:
 [can_motor_control](https://github.com/snowyfoams/can_motor_control); this
@@ -141,7 +145,7 @@ comes from `dog5_kinematics.py`, and the only plant read is the emulated
 `0xA4` position servo's own quantized encoder. Privileged MuJoCo state still
 exists, but only as an *oracle* that judges the run afterward, never steers
 it. Exactly how the sim is kept hardware-faithful — the servo model, the
-20.8 Hz CAN round-robin, what the controller is forbidden to read — is
+250 Hz CAN sweep, what the controller is forbidden to read — is
 documented in
 [`SIM_APPROACH_HW.md`](dog5_description/SIM_APPROACH_HW.md).
 
@@ -297,12 +301,13 @@ still not converged after 90 s at 3.3× slower gain. Swapping it for a
 walk `--imu-level` trim: filtered tilt, deadband, integrator, clamp — but
 only ever raising a lifted foot's own pre-lift) removes the oscillation and
 lets one leg (RR, for the default FL+RR pair) reach genuine, sustained
-clearance. Measured (`--headless`, 521-sample BALANCE window): RR force
-0.00 N / clearance 23.1 mm — clean — while FL stays at force 8.65 N /
-clearance −0.3 mm, still on the ground; BALANCE times out at 7.2° trunk
-tilt and puts both feet back down. A `--sweep` across both diagonal pairs,
-±5 mm CoM bias in x and y, and an IMU-disabled control case all land the
-same way: **0/9 PASS** — one leg airborne, one still loaded, every time.
+clearance. Measured (`--headless`, 6250-sample BALANCE window at the
+corrected 250 Hz rate — see Stage 10): RR force 0.00 N / clearance 23.5 mm
+— clean — while FL stays at force 9.38 N / clearance −0.4 mm, still on the
+ground; BALANCE times out at 7.2° trunk tilt and puts both feet back down.
+A `--sweep` across both diagonal pairs, ±5 mm CoM bias in x and y, and an
+IMU-disabled control case all land the same way: **0/9 PASS** — one leg
+airborne, one still loaded, every time.
 
 That's the real diagnosis, not a tuning problem: once one leg is genuinely
 airborne the robot is standing on a true 2-point line and starts to
@@ -317,6 +322,56 @@ python dog5_description/twostand_dog5.py --self-test   # offline IK/IMU-sign che
 python dog5_description/twostand_dog5.py                # interactive viewer
 python dog5_description/twostand_dog5.py --headless     # metrics + PASS/FAIL verdict
 python dog5_description/twostand_dog5.py --sweep        # diagonal pair x CoM-bias grid
+```
+
+## Stage 10 — Sim: fixing a 12× control-rate error, and re-running everything
+
+Every sim up to this point drove the CAN bus wrong. The loop ran at 250 Hz
+but commanded **one motor per tick**, round-robin, so each individual joint
+was only refreshed — and only read back — at 250/12 = **20.8 Hz**. That was
+never the hardware: 250 Hz is the rate *every* motor is refreshed at. The
+bus arithmetic says so (12 motors × 250 Hz × ~260 µs per command+reply pair
+= 78% of a 1 Mbit/s bus, ceiling ~320 Hz per motor), and so does the driver
+watchdog — at 48 ms per motor every driver would latch *input lost* on every
+sweep and the robot could not have stood at all.
+
+The fix is one line of intent in each runner: a control tick is now a whole
+12-motor bus sweep, and the stage machine, gates, trips and encoder reads run
+once per tick at 250 Hz. Two rate-dependent constants were re-expressed in
+seconds rather than sweeps (the sustained-overspeed confirmation, and the
+BALANCE tilt low-pass, which held a fixed per-sweep α that only meant 0.135 s
+at the wrong rate) so that the command rate is the *only* thing that changed.
+`--can-roundrobin` reproduces the old behaviour on all three runners for
+comparison, and `--self-test` now asserts the bus budget.
+
+Every result was re-run. **Nothing flipped:**
+
+| Run | 20.8 Hz/motor (old) | 250 Hz/motor (corrected) |
+| --- | --- | --- |
+| `stand3 --headless` | PASS · clearance 41.9 mm, tilt 0.43°, CoM margin 46.6 mm, peak τ 4.47 N·m | PASS · clearance 41.9 mm, tilt 0.43°, CoM margin 46.6 mm, peak τ **4.25** N·m |
+| `stand3 --sweep` | 10/10 PASS | **10/10 PASS** |
+| `walk_dog5 --headless` | PASS · travel 66.9 mm, clearance 13.5 mm, tilt 2.59° | PASS · travel 67.9 mm, clearance **16.1** mm, tilt 2.47° |
+| `twostand --headless` | FAIL · FL 8.65 N / −0.3 mm, RR 0.00 N / 23.1 mm, tilt 7.22°, BALANCE timeout | FAIL · FL 9.38 N / −0.4 mm, RR 0.00 N / **23.5** mm, tilt 7.22°, BALANCE timeout |
+| `twostand --sweep` | 0/9 PASS | **0/9 PASS** |
+
+The three-leg stand and the crawl were proven on hardware after being proven
+in sim at the *slower* rate, so this is the direction that costs nothing:
+they were validated against pessimistic feedback and the real robot got
+better feedback than the sim assumed. Peak torque drops slightly and swing
+clearance improves slightly — a tighter loop tracks the streamed IK better.
+
+The result that matters is the last row. Stage 9's two-leg failure is
+**not** an artifact of the wrong rate: at a full 250 Hz per motor, with the
+tilt filter's time constant held fixed, one diagonal leg still reaches
+23.5 mm of clean clearance while the other sits at −0.4 mm under 9.4 N,
+across every diagonal pair and CoM bias tested. A 12× faster loop cannot
+resist a rigid-body tip about a two-point line with nothing to push on. The
+open work is unchanged, and now it is open for the right reason.
+
+```bash
+python dog5_description/stand3_dog5.py --self-test           # prints the CAN budget
+python dog5_description/twostand_dog5.py --headless          # 250 Hz per motor
+python dog5_description/twostand_dog5.py --headless --can-roundrobin   # old 20.8 Hz
 ```
 
 ## Next
@@ -371,7 +426,7 @@ either only exists on one branch or has diverged slightly between them.
 | File | What it does |
 |---|---|
 | `stand_dog5_fixed_fend_hw.py` (root) | fixed-foothold stand from the polished crouch; runs the L/R leg-length roll check |
-| `dog5_description/stand_dog5_hw.py` | base operator-gated Cartesian-compliance stand on CAN hardware; CAN round-robin loop, `MOTOR_IDS`/directions |
+| `dog5_description/stand_dog5_hw.py` | base operator-gated Cartesian-compliance stand on CAN hardware; 250 Hz slotted CAN sweep, `MOTOR_IDS`/directions |
 | `dog5_description/stand_dog5_recorded_hw.py` | reaches the recorded crouch via `0xA4`, then Cartesian STAND from it |
 | `dog5_description/stand_dog5_inplace_hw.py` | stand-in-place (no foot drag); runs the runtime roll-trim integrator |
 | `dog5_description/crawl_dog5_hw.py` | the real crawl gait — shift/unload/lift/swing/lower/load, encoder-FK support-triangle gates |

@@ -65,18 +65,32 @@ CAN telemetry only: `(q_enc, qd_est, τ)`.
   stiff guess (120 N·m/rad, 2.5 N·m·s/rad) — treat absolute tracking-error
   numbers as provisional, trends as valid.
 
-### 2.2 The CAN round-robin
+### 2.2 The CAN budget
 
 The control process is not 500 Hz and not parallel. Mirror
 `stand_by_position_command.py` exactly:
 
-- Loop at `CONTROL_HZ = 250`; each tick services **one** motor
-  (sends its position target).
+- `CONTROL_HZ = 250` is the rate **every** motor is refreshed at, not a
+  budget divided across the drivers. One sweep commands all 12 and takes
+  4 ms; each motor's slot inside it is ~333 µs.
+- All 12 drivers share one 1 Mbit/s bus. A `0xA4` command and its reply are
+  one 8-byte frame each, ~130 bits with worst-case stuffing, so a
+  command+reply pair costs ~260 µs and a full sweep ~3.1 ms. That puts the
+  ceiling at **~320 Hz per motor**; 250 Hz is **78% bus load**.
 - Encoders are read and the stage machine / gates / trips run **once per
-  sweep of 12**, i.e. at ~20.8 Hz. This is the real rate at which the
-  robot "knows" its own state. Any behavior that needs faster feedback than
-  ~21 Hz will not transfer — this is the single most important fidelity
-  constraint.
+  sweep**, i.e. at 250 Hz — the same rate as the commands.
+- **The binding constraint is compute, not bandwidth or feedback rate.**
+  Every motor must hear from the host inside 10 ms or its driver latches
+  *input lost*, so any host-side block longer than ~2.5 sweeps trips it.
+  Budget host work against the 4 ms sweep, not against the bus.
+
+> **Corrected 2026-08-10.** This section previously said each tick services
+> one motor, making the state rate 250/12 = 20.8 Hz, and called that "the
+> single most important fidelity constraint". That was wrong: on hardware
+> every motor runs at 250 Hz — at 20.8 Hz per motor the 10 ms watchdog would
+> latch on every sweep and the robot could not stand. The 20.8 Hz figure was
+> an artifact of the simulator's slot loop, not a property of the robot, and
+> it under-ran the real feedback rate by 12×.
 
 ### 2.3 The encoder
 
@@ -85,7 +99,7 @@ The control process is not 500 Hz and not parallel. Mirror
 - Quantize sim `qpos` to 0.0005 rad before anything sees it
   (~0.03°, conservative for a 16-bit multi-turn encoder).
 - Controller-side velocity only ever comes from `EncoderVelocity` on the
-  quantized, 20.8 Hz samples; the "driver-reported" speed used by the hard
+  quantized, 250 Hz samples; the "driver-reported" speed used by the hard
   overspeed trip is the servo emulation's own encoder-difference estimate.
   `data.qvel` is never read on the control side.
 
@@ -197,8 +211,8 @@ the singular calibration pose.)
   slow `0xA4` move (log `mb.speeds_dps()` vs encoder FD; ratio ≈ 10 →
   motor-side → divide by `GEAR` in `_joint_state`); (2) give the hard tier
   the same encoder confirmation (or a 2-sample streak) as the 7.0 tier —
-  the extra sweep costs 48 ms, in which a real 8 rad/s runaway travels
-  0.38 rad, still far inside the 2.6 rad soft range; (3) stick-slip snap
+  the extra sweep costs 4 ms, in which a real 8 rad/s runaway travels
+  0.03 rad, negligible against the 2.6 rad soft range; (3) stick-slip snap
   release of a pinned foot can cause *real* millisecond spikes — the §7
   pre-lift fix removes that source too. The sim cannot reproduce these
   trips: its reported speed is the servo's own filtered encoder FD
@@ -211,7 +225,7 @@ Run after the first hardware attempt at CoM-shift leg-unloading failed
 ("body shifts and is stable, but the leg will not move"):
 
 - **A — friction demand of the shift.** During SHIFT the feet ride the
-  friction cone (tangential/normal up to 0.96 at μ = 1.0), i.e. they
+  friction cone (tangential/normal up to 0.86 at μ = 1.0), i.e. they
   micro-slip even in sim — and it does not matter. Static stability
   depends only on the CoM-vs-feet geometry in the trunk frame, which is
   the same whether the body slides over the feet or the feet creep under
@@ -220,18 +234,24 @@ Run after the first hardware attempt at CoM-shift leg-unloading failed
 - **B — swing while loaded** (unload gate bypassed, 30 mm horizontal
   move). The shift leaves ~8–9 N on the swing foot. Commanding a
   horizontal move at that point is resisted by μ·N of grip: at μ = 2.0
-  (rubber) with no pre-lift the foot travels only 12.6 of 30 mm and
-  shoves the body 4 mm sideways — the observed "leg won't shift"
+  (rubber) with no pre-lift the foot travels only 13.0 of 30 mm and
+  shoves the body 4.4 mm sideways — the observed "leg won't shift"
   failure, reproduced. Pre-lift fixes it: 10 mm suffices at μ = 1.0,
   **15–20 mm at μ = 2.0**. Friction never resists the vertical pre-lift
   itself.
 - **C — calibration zero error** (±2° on all 12 joints). Mis-zeroing
   scrambles the statically indeterminate 4-leg load sharing — one run
-  measured FL = 4.8 N / FR = 25.1 N / RL = 22.4 N / RR = 5.1 N where the
+  measured FL = 5.2 N / FR = 25.2 N / RL = 25.2 N / RR = 4.2 N where the
   ideal is 14.3 N each. This is why "wait for the shift to unload the
   leg" can never be a reliable gate. The full 3-leg sequence still
   passes at every tested pre-lift (10/15/20 mm) because the pre-lift
   unloads kinematically regardless of the skewed distribution.
+
+  *(All three re-run 2026-08-10 at the corrected 250 Hz per-motor rate;
+  every conclusion and the 15–20 mm pre-lift recommendation held. Only
+  the quoted figures moved slightly — A's peak ratio 0.96 → 0.86, B's
+  worst-case travel 12.6 → 13.0 mm, and C's per-leg loads — because the
+  tighter loop tracks the streamed IK a little better.)*
 
 **Hardware procedure that follows:** shift (margin from encoder FK) →
 pre-lift 15–20 mm → confirm clearance with the encoder-FK stance-plane
