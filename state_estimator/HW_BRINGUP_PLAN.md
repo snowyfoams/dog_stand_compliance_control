@@ -105,12 +105,14 @@ roll/pitch bias in the EKF, so fix it now (via zeros / measured link lengths)
 before trusting the filter. (Mirrors the sim M2 closure test.)
 
 **B4. Telemetry rate & unwrap robustness.** Confirm whole-body encoder refresh
-(~21 Hz on one bus, 250 Hz/motor round-robin) and that the multi-turn unwrap has
-no jumps across the working joint range. This ~21 Hz is the EKF **update** rate
-(predict still runs at IMU rate).
+(250 Hz: `MotorBus.slot()` is `1/(rate_hz·n_motors)`, so `rate_hz` is *per
+motor* — every motor is visited at 250 Hz and a full 12-motor sweep also
+completes at 250 Hz, 3000 frames/s on the bus) and that the multi-turn unwrap
+has no jumps across the working joint range. This 250 Hz is the EKF **update**
+rate (predict still runs at IMU rate).
 
 **Pass B:** signs correct; zeros set; four-foot closure < few mm; encoder→alpha
-stream clean at ~21 Hz.
+stream clean at 250 Hz.
 
 ---
 

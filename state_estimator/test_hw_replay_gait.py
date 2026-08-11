@@ -29,7 +29,9 @@ import hw_replay                                     # noqa: E402
 from dog5_sim import SimConfig, scenario_static, scenario_trot  # noqa: E402
 from ekf_runtime import EkfShared, ekf_worker        # noqa: E402
 
-ENC_DECIM = 20        # 400 Hz sim -> 20 Hz encoder frames (hardware-like)
+# 400 Hz sim -> 20 Hz encoder frames. Hardware actually sweeps all 12 encoders
+# at 250 Hz, so this is a deliberately pessimistic (12x sparse) update rate.
+ENC_DECIM = 20
 
 
 def build_trot_npz(path):
