@@ -183,6 +183,43 @@ Keep the robot mechanically supported or tethered. This encoder-only motion
 cannot measure trunk attitude or verify foot contact, and the unequal diagonal
 targets intentionally change the load distribution.
 
+## Closed-loop in-place trot (CONTROL_ROADMAP Gate D1) — PASS
+
+`vmc/trot_mujoco.py` trots DOG5 in place in MuJoCo under whole-body VMC with the
+proprioceptive EKF in the feedback path — Phase 4's **Gate D1**, "trot in MuJoCo
+on the hardware-fidelity model (EKF in loop, not sim truth)". Full writeup and
+the D2 bring-up plan: [`vmc/TROT_D1.md`](vmc/TROT_D1.md).
+
+Measured over 25 cycles (period 0.40 s, duty 0.67, control 250 Hz, EKF 100 Hz):
+all four legs clear 18.9–20.3 mm at **0.00 N**, drift **3.9 mm** net
+(0.17 mm/cycle), peak trunk tilt **0.18°**, EKF healthy **1.0000**, peak joint
+torque **2.40 N·m** — under the 6.0 N·m hardware trip.
+
+This is the same 2-foot diagonal support pattern that fails as a *static* stand
+(`twostand_dog5.py --sweep`: 0/9, one leg lifts and the other never leaves the
+ground). It works here because the support is transient and alternating, with a
+double-support window that restores full 4-foot rank in between.
+
+Two results worth knowing before touching hardware:
+
+- **Torque saturation, not tipping, sets the gait parameters.** Below
+  `ds_frac ≈ 0.30` peak torque pins at exactly the 8 N·m clamp and the controller
+  stops delivering the wrench it computed — tilt 4.64° vs 0.18°, drift 3.04 vs
+  0.17 mm/cycle. The predicted `T_ss²` tip relation is why a trot is *possible*
+  where a static 2-leg stand is not, but it is not what sets the parameters.
+- **The reason torque mode was abandoned rests on a 12× rate error.**
+  `vmc_stand_hw.py:148` computes the per-joint period as `N_JOINTS/CONTROL_HZ`
+  = 48 ms, but the loop paces `mb.slot(250)` = 333 µs/slot = a full sweep every
+  4 ms — every motor at 250 Hz. Same error `main` fixed in c97f1f1. See
+  `TROT_D1.md` §7.1; it does not by itself prove torque VMC works on hardware.
+
+```bash
+python vmc/test_trot.py --self-test   # 15 scheduler gates, no MuJoCo needed
+python vmc/test_trot.py               # D1-1 .. D1-8
+python vmc/test_trot.py --sweep       # period x ds_frac x CoM-bias envelope
+python vmc/trot_mujoco.py             # interactive viewer
+```
+
 ## Modelling notes (hard-won)
 
 - **Collision**: leg meshes are visual-only (`contype=0`); MuJoCo collides

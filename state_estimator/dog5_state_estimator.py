@@ -265,7 +265,14 @@ class EstimatorParams:
     # Foothold process noise (body frame, in contact).
     sigma_p_xy: float = 1.0e-3     # tangential slip (m / sqrt(s))
     sigma_p_z: float = 5.0e-4      # normal slip
-    swing_p: float = 1.0e4         # swing-foot process noise (paper Sec. III-B)
+    # Swing-foot process noise (paper Sec. III-B): inflates the airborne foothold
+    # block so it is effectively released.  1e4 released it far harder than
+    # necessary -- over an 8 s crawl swing it drove max(diag P) to ~7e8 m^2
+    # (sigma_foot ~ 28 km for a foot that moves 2 cm) and wrecked the
+    # conditioning of P.  1e2 still reaches sigma_foot ~ 45 m over a 0.2 s trot
+    # swing, i.e. "unknown" by any measure, while keeping P conditioned -- which
+    # matters more, not less, for a trot that re-anchors ~5 footholds/second.
+    swing_p: float = 1.0e2
 
     # Contact transition / init.
     sigma_reset: float = 0.05      # fresh landmark uncertainty at touchdown (m)
@@ -311,6 +318,63 @@ class EstimatorParams:
 
     def Qp_swing(self):
         return self.swing_p ** 2 * np.eye(3)
+
+
+# =====================================================================
+# Health flag (M11)
+# =====================================================================
+
+# The min-eigenvalue tolerance is RELATIVE, not absolute.  `swing_p` inflates an
+# airborne foothold block without bound, so max(diag P) can reach ~7e8 m^2 over a
+# long swing; `eigvalsh` then carries jitter of order eps*||P|| ~ 1e-7, which
+# swamps any fixed floor.  Replaying walk_0729_1748.npz, all 316 unhealthy frames
+# failed on exactly this term and ZERO failed on sigma_v -- a numerical artefact,
+# not a filter fault (CONTROL_ROADMAP.md Sec. 1b).  Scaling with the matrix norm
+# leaves ~4 orders of margin over the observed jitter while still catching
+# genuine indefiniteness, which in an EKF covariance is many orders larger.
+#
+# This was proven out-of-tree first, as `ekf_closeout.estimator_health`; it lives
+# here now because a trot gates on `healthy` mid-swing several times a second and
+# cannot use a flag that goes false for numerical reasons.
+SIGMA_V_LIMIT = 0.15        # m/s, velocity-uncertainty ceiling
+MIN_EIG_REL_TOL = 1.0e-12   # times max(1, max diag P)
+
+
+def health_terms(state, out):
+    """Evaluate the three health terms; returns (healthy, detail dict).
+
+    Shared by `DOG5StateEstimator.outputs()` and the close-out `--health-detail`
+    report, so the printed diagnosis is literally the gate that was applied.
+    """
+    P = state.P
+    max_diag = float(np.max(np.diag(P)))
+    scale = max(1.0, max_diag)
+    tol = -MIN_EIG_REL_TOL * scale
+    sigma_v = float(np.max(out["sigma"][ErrorIndex.V]))
+    min_eig = float(out["min_eig_P"])
+    finite = bool(np.all(np.isfinite(state.x)) and np.all(np.isfinite(P)))
+    detail = {
+        "sigma_v": sigma_v,
+        "min_eig": min_eig,
+        "min_eig_tol": tol,
+        "max_diag_P": max_diag,
+        "finite": finite,
+        "sigma_v_ok": sigma_v < SIGMA_V_LIMIT,
+        "min_eig_ok": min_eig > tol,
+    }
+    healthy = bool(detail["sigma_v_ok"] and finite and detail["min_eig_ok"])
+    return healthy, detail
+
+
+def failing_term(detail):
+    """Which term rejected this frame ('sigma_v' / 'min_eig' / 'nonfinite')."""
+    if not detail["finite"]:
+        return "nonfinite"
+    if not detail["sigma_v_ok"]:
+        return "sigma_v"
+    if not detail["min_eig_ok"]:
+        return "min_eig"
+    return "healthy"
 
 
 # =====================================================================
@@ -632,11 +696,8 @@ class DOG5StateEstimator:
         if last_w_meas is not None:
             w_hat = np.asarray(last_w_meas) - st.bw
         C = st.C
-        sigma_v = sigma[ErrorIndex.V]
-        finite = bool(np.all(np.isfinite(st.x)) and np.all(np.isfinite(st.P)))
         min_eig = float(np.min(np.linalg.eigvalsh(0.5 * (st.P + st.P.T))))
-        healthy = bool(np.all(sigma_v < 0.15) and finite and min_eig > -1.0e-9)
-        return {
+        out = {
             "r": st.r.copy(),
             "v": st.v.copy(),
             "q": st.q.copy(),
@@ -644,5 +705,9 @@ class DOG5StateEstimator:
             "v_body": C @ st.v,
             "sigma": sigma,
             "min_eig_P": min_eig,
-            "healthy": healthy,
         }
+        healthy, detail = health_terms(st, out)
+        out["healthy"] = healthy
+        out["health_detail"] = detail
+        out["max_diag_P"] = detail["max_diag_P"]
+        return out
