@@ -19,6 +19,14 @@ all the joint-level work; the EKF only ever moves the *targets* we hand them.
     low level
         0xA4 native position loops, motor-side speed caps
 
+HEIGHT REFERENCE -- every height this script targets, measures or prints is
+the floor-to-TRUNK-BOTTOM distance, i.e. to the IMU board.  That is the point
+the EKF's `r` actually tracks and the only trunk point a ruler reaches.  The
+kinematics are natural at the abd-axis plane (the FK trunk origin, dog5.xml
+puts the four hip bodies at z = 0), IMU_BELOW_TRUNK_ORIGIN_M higher; the leg
+tables work there and the status line shows it as `abd=` for cross-checking,
+but no target or error is ever expressed in it.
+
 Why an INTEGRATOR and nothing else: the plant is a position servo, so the gap
 between commanded and achieved height is a near-constant sag under load (stage
 1 measured 13 mm).  An integrator drives that to zero without needing to know
@@ -256,13 +264,15 @@ class HeightController:
 
 
 def height_inputs(shared, q, z0_fk_imu, now_mono, xcheck_m=HEIGHT_XCHECK_M):
-    """(h_meas_hip, h_fk_hip, active, reason) for HeightController.update.
+    """(h_meas, h_fk, active, reason) for HeightController.update.
 
-    Returns the measurement in HIP-AXIS floor height -- the physical,
-    tape-checkable quantity the target is expressed in.  The EKF gives the
-    IMU's displacement from init, so:
+    Heights are of the IMU BOARD / TRUNK BOTTOM above the floor -- the point
+    the EKF physically tracks and the only trunk point a ruler can reach.  The
+    abd (hip) axis is IMU_BELOW_TRUNK_ORIGIN_M higher; it is the FK trunk
+    origin, so it is what the kinematics are natural in, but nothing outside
+    the leg tables needs it.  Reporting at the IMU keeps `r_z` untouched:
 
-        h_meas_hip = z0_fk_imu + r_z + IMU_BELOW * C[2,2]
+        h_meas = z0_fk_imu + r_z          (r_z IS the IMU's rise since init)
 
     FK is computed independently from the same encoders and used only to VETO,
     never as the feedback.  It cannot drift, so a large disagreement means the
@@ -279,9 +289,8 @@ def height_inputs(shared, q, z0_fk_imu, now_mono, xcheck_m=HEIGHT_XCHECK_M):
         return float("nan"), float("nan"), False, "EKF unhealthy"
 
     C = out["C"]
-    cz = float(C[2, 2])
-    h_ekf = z0_fk_imu + float(out["r"][2]) + IMU_BELOW_TRUNK_ORIGIN_M * cz
-    h_fk = fk_floor_height(q, C, ref="hip")
+    h_ekf = z0_fk_imu + float(out["r"][2])
+    h_fk = fk_floor_height(q, C, ref="imu")
     if abs(h_ekf - h_fk) > xcheck_m:
         return h_ekf, h_fk, False, f"EKF-FK disagree {abs(h_ekf-h_fk)*1e3:.0f}mm"
     return h_ekf, h_fk, True, None
@@ -415,7 +424,11 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, gain,
                       for leg in LEGS))
 
     if target_height is None:
-        target_height = stand_height + FOOT_RADIUS_M   # hip-axis floor height
+        # IMU-board floor height of the open-loop stand pose.  Feet sit
+        # stand_height below the abd axis, the floor is one foot radius below
+        # the foot site, and the board is IMU_BELOW under the abd axis.
+        target_height = (stand_height + FOOT_RADIUS_M
+                         - IMU_BELOW_TRUNK_ORIGIN_M)
     unwrap = [base.CalibratedEncoderUnwrap() for _ in MOTOR_IDS]
     key = base.KeyPoller()
     gate = base.SafetyGate(tau_cap=base.STAGED_TAU_MAX)
@@ -425,8 +438,11 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, gain,
 
     print("=" * 78)
     print("DOG5 CLOSED-LOOP HEIGHT STAND  (stage 2: EKF height in the loop)")
-    print(f"  target hip-axis height = {target_height*1e3:.0f} mm above floor"
-          f"   (open-loop pose = {(stand_height+FOOT_RADIUS_M)*1e3:.0f} mm)")
+    print(f"  target = {target_height*1e3:.0f} mm above floor at the TRUNK "
+          f"BOTTOM / IMU BOARD -- the point the ruler and the EKF both see")
+    print(f"  open-loop pose = {(stand_height+FOOT_RADIUS_M-IMU_BELOW_TRUNK_ORIGIN_M)*1e3:.0f}"
+          f" mm there, = {(stand_height+FOOT_RADIUS_M)*1e3:.0f} mm at the abd "
+          f"axis ({IMU_BELOW_TRUNK_ORIGIN_M*1e3:.0f} mm higher)")
     print(f"  integral gain {gain:.2f}/s, clamp +/-{clamp*1e3:.0f} mm, "
           f"slew {HEIGHT_SLEW_M_S*1e3:.0f} mm/s, EKF-FK veto {xcheck*1e3:.0f} mm")
     print("  NO torque commanded; drivers hold position. Contacts ON throughout.")
@@ -616,7 +632,13 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, gain,
                         if shared.est_ready and out is not None:
                             flag = ("LOOP" if engaged else
                                     ("hold" if seq.loop_engaged else "----"))
-                            extra = (f" h={h_ekf*1e3:6.1f}(fk{h_fk*1e3:6.1f}) "
+                            # h/fk are TRUNK-BOTTOM (IMU board) heights, what a
+                            # ruler reads.  abd is the same pose at the FK
+                            # trunk origin, for comparison with the kinematics.
+                            h_abd = (h_ekf + IMU_BELOW_TRUNK_ORIGIN_M
+                                     * float(out["C"][2, 2]))
+                            extra = (f" h={h_ekf*1e3:6.1f}(fk{h_fk*1e3:6.1f}"
+                                     f"|abd{h_abd*1e3:6.1f}) "
                                      f"err={(target_height-h_ekf)*1e3:+5.1f} "
                                      f"off={offset*1e3:+5.1f}mm [{flag}] "
                                      f"roll={math.degrees(re_):+5.1f} "
@@ -809,10 +831,15 @@ def _test_vetoes(stand_height):
 
     h, hfk, active, why = height_inputs(_FakeShared(rise), q_stand, z0, now)
     _check("healthy EKF at the stand pose is accepted", active, str(why))
-    _check("measurement lands on the FK hip height",
+    _check("measurement lands on the FK trunk-bottom height",
            abs(h - hfk) < 1e-9, f"EKF {h*1e3:.1f} vs FK {hfk*1e3:.1f} mm")
-    _check("measured height matches the commanded stand",
-           abs(h - (stand_height + FOOT_RADIUS_M)) < 1e-9, f"{h*1e3:.1f} mm")
+    _check("measured height is the commanded stand at the TRUNK BOTTOM",
+           abs(h - (stand_height + FOOT_RADIUS_M
+                    - IMU_BELOW_TRUNK_ORIGIN_M)) < 1e-9, f"{h*1e3:.1f} mm")
+    _check("... which is the abd axis minus the IMU lever",
+           abs((h + IMU_BELOW_TRUNK_ORIGIN_M)
+               - fk_floor_height(q_stand, np.eye(3), ref="hip")) < 1e-9,
+           f"abd {(h+IMU_BELOW_TRUNK_ORIGIN_M)*1e3:.1f} mm")
 
     _, _, active, why = height_inputs(_FakeShared(rise, healthy=False),
                                       q_stand, z0, now)
@@ -894,8 +921,13 @@ def _test_sequence(tables, stand_height):
 
 
 def _test_closed_loop(tables, stand_height):
-    """End to end: sagging plant + EKF + veto + tables -> holds the target."""
-    target = stand_height + FOOT_RADIUS_M
+    """End to end: sagging plant + EKF + veto + tables -> holds the target.
+
+    The plant is simulated at the abd axis (that is where the leg tables and
+    FK live); the loop only ever sees trunk-bottom heights, so the conversion
+    happens once, here, exactly as the lever does on hardware.
+    """
+    target = stand_height + FOOT_RADIUS_M - IMU_BELOW_TRUNK_ORIGIN_M
     SAG = 0.013
     seq = HeightStandSequence(tables, stand_height)
     seq.stage, seq.stage_t0 = "HOLD4", 0.0
@@ -903,7 +935,7 @@ def _test_closed_loop(tables, stand_height):
     # EKF origin: the IMU height at init, i.e. at the crouch, level trunk
     z0 = fk_floor_height(Q_CROUCH, np.eye(3), ref="imu")
     dt = 1.0 / CONTROL_HZ
-    h = fk_floor_height(seq.q_cmd(0.0), ref="hip") - SAG
+    h = fk_floor_height(seq.q_cmd(0.0), ref="hip") - SAG      # abd axis
     for k in range(int(25 / dt)):
         t = k * dt
         # encoders report the ACTUAL pose, so FK sees the sag too
@@ -916,8 +948,13 @@ def _test_closed_loop(tables, stand_height):
         seq.update(t, q_meas, np.zeros(N_JOINTS), offset=off)
         # plant: the legs reach the commanded pose minus a constant sag
         h = fk_floor_height(seq.q_cmd(t), ref="hip") - SAG
-    _check("closed loop holds the commanded height on a sagging plant",
-           abs(h - target) <= HEIGHT_DEADBAND_M + 1e-9, f"{(h-target)*1e3:+.2f} mm")
+    h_bot = h - IMU_BELOW_TRUNK_ORIGIN_M           # what the loop regulates
+    _check("closed loop holds the commanded trunk-bottom height (sagging plant)",
+           abs(h_bot - target) <= HEIGHT_DEADBAND_M + 1e-9,
+           f"{(h_bot-target)*1e3:+.2f} mm")
+    _check("the abd axis lands one IMU lever above it",
+           abs(h - (target + IMU_BELOW_TRUNK_ORIGIN_M))
+           <= HEIGHT_DEADBAND_M + 1e-9, f"abd {h*1e3:.1f} mm")
     _check("recovered offset equals the sag",
            abs(ctrl.offset - SAG) <= HEIGHT_DEADBAND_M + 1e-9,
            f"{ctrl.offset*1e3:.1f} mm vs {SAG*1e3:.0f} mm")
@@ -959,8 +996,10 @@ def main():
     ap.add_argument("--stand-height", type=float, default=recorded.DEFAULT_STAND_HEIGHT,
                     help="open-loop pose height (foot site below trunk origin)")
     ap.add_argument("--target-height", type=float, default=None,
-                    help="closed-loop target, HIP-AXIS metres above the floor "
-                         "(default: the open-loop pose, i.e. remove the sag)")
+                    help="closed-loop target, metres from the floor to the "
+                         "TRUNK BOTTOM / IMU BOARD (NOT the abd axis, which is "
+                         f"{IMU_BELOW_TRUNK_ORIGIN_M*1e3:.0f} mm higher). "
+                         "Default: the open-loop pose, i.e. remove the sag")
     ap.add_argument("--crouch-max-speed-dps", type=float,
                     default=recorded.DEFAULT_CROUCH_MAX_MOTOR_DPS)
     ap.add_argument("--height-gain", type=float, default=HEIGHT_GAIN_PER_S,
