@@ -93,12 +93,21 @@ WHAT TO WATCH
     z_corr  what the HEIGHT loop has wound in; converges on the sag.
     rp:     roll/pitch, degrees.  No yaw -- gravity does not constrain it.
       ekf     EKF attitude, referenced to GRAVITY.
+      imu     the DETA10's OWN AHRS attitude, straight off the board, also
+              referenced to gravity.  It is the leveling watchdog
+              (--agree-veto freezes the loop when ekf and imu split), but
+              note it is NOT independent evidence about the EKF: same
+              accelerometer, same gyro, different filter.  Agreement checks
+              the filter maths, not the sensor.
       fk      plane-through-the-feet attitude from encoders alone, referenced
               to the FLOOR.  No IMU anywhere in it.
       d       ekf minus fk = floor slope + mount tilt + zero errors.  Its
               CHANGE across a shim is pure floor slope (see WHEN FK IS
               ENOUGH); its absolute value mixes three unknowns.
-    err     attitude minus the latched setpoint; hidden under --level-gain 0.
+    err     attitude minus the setpoint.  Default setpoint is (0,0) --
+            ABSOLUTE level, valid because the IMU offset was calibrated with
+            the robot lying flat.  --setpoint-latch restores the old
+            hold-what-it-rests-at behaviour.  Hidden under --level-gain 0.
     lvl     the LEVELING loop's per-foot output, FL/FR/RL/RR mm.  Hidden
             under --level-gain 0 (it can only be zeros).  If it stays at
             zeros with the gain on, leveling has found nothing to do -- see
@@ -569,6 +578,9 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, args):
           f"FK veto {args.xcheck*1e3:.0f} mm (planted feet only)")
     print(f"  tilt-stop {args.tilt_stop:.0f} deg.  All four feet stay planted "
           "(lift experiment: lift_ekf_contact_hw.py).")
+    print(f"  CAN: {args.control_hz:.0f} Hz/motor "
+          f"({1e3/args.control_hz:.0f} ms between commands, 50 ms driver "
+          "watchdog)")
     print("  NO torque commanded; drivers hold position.")
     print("  Keys: ENTER stand, P park, X stop.")
     print("  [hw] STAGE[flag]  h: ekf / fk cross-check / d=ekf-fk / "
@@ -603,7 +615,7 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, args):
         from imu_ekf_feed import ImuEkfFeed
         with motorbus.MotorBus(MOTOR_IDS, dirs=base.MOTOR_DIRECTIONS) as mb, \
                 ImuEkfFeed(port) as feed:
-            if not mb.arm(rate_hz=CONTROL_HZ):
+            if not mb.arm(rate_hz=args.control_hz):
                 raise RuntimeError("arm failed (bus / power / terminators)")
             if not feed.wait_for_raw(timeout=3.0):
                 raise RuntimeError("no raw IMU (0x40) packets -- enable DETA10 raw mode")
@@ -664,7 +676,7 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, args):
 
             seq = LevelStandSequence(tables, stand_height)
             miss_monitor = base.CanMissMonitor(mb)
-            slot = mb.slot(CONTROL_HZ)
+            slot = mb.slot(args.control_hz)
             deadline = time.perf_counter() + slot
             status_period = 1.0 / base.FAULT_STATUS_HZ
             next_fault_status = np.array(
@@ -933,6 +945,7 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, args):
                                   f"d={(h_ekf-h_fk)*1e3:+4.1f} "
                                   f"corr={offset*1e3:+5.1f}mm  "
                                   f"rp:ekf={_deg(re_)}/{_deg(pe)} "
+                                  f"imu={_deg(r_a)}/{_deg(p_a)} "
                                   f"fk={_deg(r_fk)}/{_deg(p_fk)} "
                                   f"d={_deg(re_-r_fk)}/{_deg(pe-p_fk)}deg"
                                   f"{err_s}{lvl_s}{hot}{warn}",
@@ -1550,10 +1563,21 @@ def main():
                     help="leveling max |offset| per foot (m)")
     ap.add_argument("--agree-veto", type=float, default=AGREE_VETO_DEG,
                     help="|EKF-AHRS| attitude split that freezes leveling (deg)")
-    ap.add_argument("--setpoint-roll", type=float, default=None,
-                    help="fixed leveling setpoint roll (deg; default: latch)")
-    ap.add_argument("--setpoint-pitch", type=float, default=None,
-                    help="fixed leveling setpoint pitch (deg; default: latch)")
+    # Default setpoint is ABSOLUTE LEVEL (0,0): the IMU offset was calibrated
+    # with the robot lying flat, so IMU zero IS level -- mount tilt is inside
+    # the calibration, not something to preserve.  --setpoint-latch restores
+    # the old behaviour (hold whatever attitude the stand settles at).
+    ap.add_argument("--setpoint-roll", type=float, default=0.0,
+                    help="leveling setpoint roll (deg; default 0 = level)")
+    ap.add_argument("--setpoint-pitch", type=float, default=0.0,
+                    help="leveling setpoint pitch (deg; default 0 = level)")
+    ap.add_argument("--setpoint-latch", action="store_true",
+                    help="latch the setpoint from the settled HOLD4 attitude "
+                         "instead of using the fixed values above")
+    ap.add_argument("--control-hz", type=float, default=CONTROL_HZ,
+                    help="per-motor command rate (Hz); lower = more CAN "
+                         f"margin under the 50 ms driver watchdog "
+                         f"(default {CONTROL_HZ:.0f})")
     ap.add_argument("--tilt-stop", type=float, default=TILT_STOP_DEG,
                     help="absolute attitude that soft-stops the run (deg)")
     ap.add_argument("--no-limit-check", action="store_true",
@@ -1566,8 +1590,10 @@ def main():
     ap.add_argument("--raw-log", default=None)
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
-    if (args.setpoint_roll is None) != (args.setpoint_pitch is None):
-        ap.error("--setpoint-roll and --setpoint-pitch go together")
+    if args.setpoint_latch:
+        args.setpoint_roll = args.setpoint_pitch = None    # auto-latch mode
+    if not 20.0 <= args.control_hz <= 300.0:
+        ap.error("--control-hz outside [20, 300] (bus ceiling is 300)")
     if args.self_test:
         sys.exit(self_test(args.stand_height))
     run(args.port, args.stand_height, args.target_height,
