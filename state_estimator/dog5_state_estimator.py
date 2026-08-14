@@ -635,7 +635,14 @@ class DOG5StateEstimator:
         sigma_v = sigma[ErrorIndex.V]
         finite = bool(np.all(np.isfinite(st.x)) and np.all(np.isfinite(st.P)))
         min_eig = float(np.min(np.linalg.eigvalsh(0.5 * (st.P + st.P.T))))
-        healthy = bool(np.all(sigma_v < 0.15) and finite and min_eig > -1.0e-9)
+        # min_eig tolerance is RELATIVE to the covariance scale: eigvalsh on a
+        # PSD matrix jitters by ~eps*||P||, and swing_p inflates an airborne
+        # foothold block to ~1e8-1e9 m^2 over a long swing, swamping any fixed
+        # floor (the walk_0729 "unhealthy" frames, all min_eig, zero sigma_v).
+        # 1e-12 relative keeps ~4 orders of margin over that jitter while still
+        # rejecting genuine indefiniteness.  See ekf_closeout/estimator_health.py.
+        min_eig_tol = -1.0e-12 * max(1.0, float(np.max(np.diag(st.P))))
+        healthy = bool(np.all(sigma_v < 0.15) and finite and min_eig > min_eig_tol)
         return {
             "r": st.r.copy(),
             "v": st.v.copy(),
