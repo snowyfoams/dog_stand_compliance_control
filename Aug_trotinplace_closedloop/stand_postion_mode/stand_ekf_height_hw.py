@@ -85,6 +85,15 @@ import dog5_kinematics                                   # noqa: E402
 from ekf_runtime import EkfShared, ekf_worker, _rp       # noqa: E402
 from imu_dog import DEFAULT_PORT                         # noqa: E402
 
+# Every tunable this script has is in stand_params.py -- the HEIGHT_* block
+# there is this loop's, and the slew/clamp/deadband are the ones to reach for.
+from stand_params import (FOOT_RADIUS_M,                 # noqa: E402
+                          IMU_BELOW_TRUNK_ORIGIN_M,
+                          T_STAND, EKF_WORKER_HZ, QUIET_STAGES, SETTLE_S,
+                          HEIGHT_GAIN_PER_S, HEIGHT_CLAMP_M, HEIGHT_SLEW_M_S,
+                          HEIGHT_DEADBAND_M, HEIGHT_STALE_S, HEIGHT_XCHECK_M,
+                          TABLE_STEP_M, TABLE_MARGIN_M)
+
 MOTOR_IDS = base.MOTOR_IDS
 N_JOINTS = base.N_JOINTS
 CONTROL_HZ = base.CONTROL_HZ
@@ -92,25 +101,10 @@ LEGS = base.LEGS
 Q_CROUCH = recorded.Q_RECORDED_CROUCH
 POSITION_TARGET_DEG = recorded.POSITION_TARGET_DEG
 
-FOOT_RADIUS_M = s1.FOOT_RADIUS_M
-IMU_BELOW_TRUNK_ORIGIN_M = s1.IMU_BELOW_TRUNK_ORIGIN_M
+# stage 1 owns the FK height reference and the ramp shape (see the function
+# map in stand_params' docstring); these are aliases, not second copies
 fk_floor_height = s1.fk_floor_height
 _smoothstep = s1._smoothstep
-
-T_STAND = 5.0
-EKF_WORKER_HZ = 100.0
-QUIET_STAGES = ("WAIT_CROUCH",)
-SETTLE_S = 1.5
-
-# ---- height loop tuning ----------------------------------------------------
-HEIGHT_GAIN_PER_S = 0.5      # integral gain: offset += K * err * dt  (~2 s tau)
-HEIGHT_CLAMP_M = 0.030       # max |offset| the loop may wind in
-HEIGHT_SLEW_M_S = 0.005      # max offset rate -- caps the response to a step
-HEIGHT_DEADBAND_M = 0.001    # below this error the integrator holds still
-HEIGHT_STALE_S = 0.2         # EKF worker stall -> freeze
-HEIGHT_XCHECK_M = 0.030      # |EKF - FK| beyond this -> freeze (FK is truth)
-TABLE_STEP_M = 0.0005        # z resolution of the per-leg IK tables
-TABLE_MARGIN_M = 0.010       # extra table range beyond the clamp
 
 
 # ===========================================================================
@@ -142,7 +136,17 @@ class LegHeightTable:
     250 Hz sweep entirely.
     """
 
-    def __init__(self, leg, q_ref, z_lo, z_hi, step=TABLE_STEP_M):
+    def __init__(self, leg, q_ref, z_lo, z_hi, step=TABLE_STEP_M,
+                 xy_offset=(0.0, 0.0)):
+        """`xy_offset` moves this leg's pinned foot x/y in the TRUNK frame.
+
+        Zero for every stage before the trot, which is why x/y being "pinned
+        at the crouch values" held.  Stage 3 needs it: shifting all four feet
+        by the same amount slides the TRUNK the opposite way, which is how the
+        CoM is brought onto the support diagonal.  Doing it here rather than
+        at run time keeps IK out of the CAN sweep -- the offset is a constant
+        for a run, so it costs one table build and nothing per sweep.
+        """
         self.leg = leg
         lo_lim, hi_lim = base.soft_limits()
         i = LEGS.index(leg)
@@ -151,7 +155,7 @@ class LegHeightTable:
 
         q_ref = np.asarray(q_ref, dtype=float)
         f_ref = dog5_kinematics.foot_position(leg, q_ref)
-        self.xy = f_ref[:2].copy()
+        self.xy = f_ref[:2] + np.asarray(xy_offset, dtype=float)
         z_ref = float(f_ref[2])
         if not (z_lo <= z_ref <= z_hi):
             raise ValueError(f"{leg}: reference z {z_ref:.4f} outside "
@@ -162,6 +166,17 @@ class LegHeightTable:
         zs = [z_ref + k * step for k in range(-n_dn, n_up + 1)]
         qs = [None] * len(zs)
         i_ref = n_dn
+        # The march warm-starts from the table's midpoint, so that entry has to
+        # sit at the SHIFTED x/y -- keeping the unshifted q_ref there would
+        # leave one row of the table on the old anchor and bend every
+        # interpolation near the stand pose.
+        if np.any(self.xy != f_ref[:2]):
+            q_ref, err = _ik_leg(leg, q_ref,
+                                 np.array([self.xy[0], self.xy[1], z_ref]))
+            if err > 1e-6:
+                raise RuntimeError(
+                    f"{leg}: foot x/y offset {xy_offset} is unreachable at the "
+                    f"reference pose (residual {err*1e3:.2f} mm)")
         qs[i_ref] = q_ref.copy()
 
         # march outward in both directions, each step warm-started by the last
@@ -193,15 +208,22 @@ class LegHeightTable:
         return float(np.clip(z, self.z_min, self.z_max))
 
 
-def build_tables(stand_height, clamp_m=HEIGHT_CLAMP_M, margin=TABLE_MARGIN_M):
-    """One table per leg, spanning crouch .. (stand + clamp + margin)."""
+def build_tables(stand_height, clamp_m=HEIGHT_CLAMP_M, margin=TABLE_MARGIN_M,
+                 xy_offset=(0.0, 0.0)):
+    """One table per leg, spanning crouch .. (stand + clamp + margin).
+
+    `xy_offset` shifts every foot's pinned x/y by the same amount in the trunk
+    frame, which slides the trunk the OPPOSITE way over the same footprint.
+    Default (0, 0) is every stage before the trot, unchanged.
+    """
     tables = {}
     for i, leg in enumerate(LEGS):
         sl = slice(3 * i, 3 * i + 3)
         z_crouch = float(dog5_kinematics.foot_position(leg, Q_CROUCH[sl])[2])
         z_hi = z_crouch + margin
         z_lo = -(stand_height + clamp_m + margin)
-        tables[leg] = LegHeightTable(leg, Q_CROUCH[sl], z_lo, z_hi)
+        tables[leg] = LegHeightTable(leg, Q_CROUCH[sl], z_lo, z_hi,
+                                     xy_offset=xy_offset)
     return tables
 
 
@@ -693,300 +715,24 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, gain,
     print(f"[loop] final offset {ctrl.offset*1e3:+.1f} mm"
           + (f" (SATURATED at the {clamp*1e3:.0f} mm clamp)" if ctrl.saturated else ""))
     print(f"[stop] {stop_reason}")
-
-
 # ===========================================================================
-# offline self-test
+# offline self-test -> test_stand_ekf_height.py
 # ===========================================================================
-
-_FAIL = []
-
-
-def _check(name, ok, detail=""):
-    print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({detail})" if detail else ""))
-    if not ok:
-        _FAIL.append(name)
-
-
-def _test_tables(tables, stand_height):
-    for leg in LEGS:
-        t = tables[leg]
-        i = LEGS.index(leg)
-        q_crouch = Q_CROUCH[3 * i:3 * i + 3]
-        z_crouch = float(dog5_kinematics.foot_position(leg, q_crouch)[2])
-        _check(f"{leg}: table reproduces the recorded crouch",
-               float(np.max(np.abs(t.q_at(z_crouch) - q_crouch))) < 1e-6,
-               f"max {np.max(np.abs(t.q_at(z_crouch)-q_crouch)):.2e} rad")
-        _check(f"{leg}: table spans the stand height",
-               t.z_min <= -stand_height <= t.z_max,
-               f"[{t.z_min*1e3:.0f}, {t.z_max*1e3:.0f}] mm")
-
-    # interpolation must reproduce a direct IK solve away from the grid points
-    worst = 0.0
-    for leg in LEGS:
-        t = tables[leg]
-        for z in np.linspace(-stand_height - 0.02, -stand_height + 0.02, 9):
-            q = t.q_at(z)
-            f = dog5_kinematics.foot_position(leg, q)
-            worst = max(worst, abs(f[2] - z), float(np.linalg.norm(f[:2] - t.xy)))
-    _check("interpolated poses hit the commanded foot position",
-           worst < 5e-5, f"worst {worst*1e6:.1f} um")
-
-    lo, hi = base.soft_limits()
-    ok = True
-    for i, leg in enumerate(LEGS):
-        t = tables[leg]
-        for z in np.linspace(t.z_min, t.z_max, 41):
-            q = t.q_at(z)
-            ok &= bool(np.all(q >= lo[3*i:3*i+3]) and np.all(q <= hi[3*i:3*i+3]))
-    _check("every reachable table pose is inside the soft limits", ok)
-
-    # a table lookup must be cheap enough for the 333 us slot
-    t0 = time.perf_counter()
-    for _ in range(200):
-        for leg in LEGS:
-            tables[leg].q_at(-stand_height)
-    per = (time.perf_counter() - t0) / 200
-    _check("full 4-leg lookup fits the CAN slot", per < 250e-6,
-           f"{per*1e6:.0f} us per sweep")
-
-
-def _test_controller():
-    """Integral loop against a position-servo plant with a constant sag."""
-    SAG = 0.013
-    target = 0.220
-    ctrl = HeightController(gain_per_s=0.5)
-    h = target - SAG
-    dt = 1.0 / CONTROL_HZ
-    t = 0.0
-    for _ in range(int(30 / dt)):
-        off = ctrl.update(t, h, target, True)
-        h = (target + off) - SAG              # plant: commanded minus sag
-        t += dt
-    # the deadband is a DESIGN limit, not slop: the integrator deliberately
-    # stops inside it so EKF noise cannot make the pose chatter.  So the loop
-    # converges to within the deadband, never exactly onto the target.
-    _check("loop converges to within its deadband",
-           abs(h - target) <= HEIGHT_DEADBAND_M + 1e-9,
-           f"{(h-target)*1e3:+.2f} mm vs {HEIGHT_DEADBAND_M*1e3:.1f} mm deadband")
-    _check("loop recovers the sag to within the deadband",
-           abs(ctrl.offset - SAG) <= HEIGHT_DEADBAND_M + 1e-9,
-           f"offset {ctrl.offset*1e3:.1f} mm vs {SAG*1e3:.0f} mm sag")
-    _check("loop removes most of the sag",
-           abs(h - target) < 0.1 * SAG, f"{(h-target)*1e3:+.2f} mm left of "
-           f"{SAG*1e3:.0f} mm")
-
-    # gain 0 must be a true no-op (the open-loop A/B)
-    z = HeightController(gain_per_s=0.0)
-    for k in range(1000):
-        z.update(k * dt, 0.1, target, True)
-    _check("gain 0 is open loop", z.offset == 0.0)
-
-    # clamp and slew
-    c = HeightController(gain_per_s=5.0, clamp_m=0.010, slew_m_s=0.004)
-    prev, worst_rate = 0.0, 0.0
-    for k in range(int(20 / dt)):
-        o = c.update(k * dt, 0.0, 1.0, True)          # huge, permanent error
-        worst_rate = max(worst_rate, abs(o - prev) / dt)
-        prev = o
-    _check("offset respects the clamp", abs(c.offset - 0.010) < 1e-9,
-           f"{c.offset*1e3:.2f} mm")
-    _check("offset respects the slew limit", worst_rate <= 0.004 + 1e-9,
-           f"{worst_rate*1e3:.2f} mm/s")
-
-    # freeze must HOLD, never unwind
-    f = HeightController(gain_per_s=0.5)
-    for k in range(int(5 / dt)):
-        f.update(k * dt, 0.200, target, True)
-    held = f.offset
-    _check("integrator wound in before the freeze", held > 1e-3,
-           f"{held*1e3:.1f} mm")
-    for k in range(int(5 / dt)):
-        o = f.update(5 + k * dt, 0.0, target, False, "EKF stale")
-    _check("frozen loop holds its offset, does not unwind",
-           abs(o - held) < 1e-12 and f.frozen_reason == "EKF stale")
-
-    # deadband
-    d = HeightController(gain_per_s=0.5, deadband_m=0.002)
-    for k in range(int(5 / dt)):
-        d.update(k * dt, target - 0.001, target, True)
-    _check("errors inside the deadband do not wind the integrator",
-           d.offset == 0.0)
-
-
-class _FakeShared:
-    def __init__(self, rz=0.0, healthy=True, ready=True, C=None):
-        self.est_ready = ready
-        self.out = None if not ready else {
-            "r": np.array([0.0, 0.0, rz]), "healthy": healthy,
-            "C": np.eye(3) if C is None else C}
-        self.tau_stamp = time.monotonic()
-
-
-def _test_vetoes(stand_height):
-    q_stand = s1.compute_q_stand(stand_height)
-    z0 = fk_floor_height(Q_CROUCH, np.eye(3), ref="imu")
-    rise = (fk_floor_height(q_stand, np.eye(3), ref="imu") - z0)
-    now = time.monotonic()
-
-    h, hfk, active, why = height_inputs(_FakeShared(rise), q_stand, z0, now)
-    _check("healthy EKF at the stand pose is accepted", active, str(why))
-    _check("measurement lands on the FK trunk-bottom height",
-           abs(h - hfk) < 1e-9, f"EKF {h*1e3:.1f} vs FK {hfk*1e3:.1f} mm")
-    _check("measured height is the commanded stand at the TRUNK BOTTOM",
-           abs(h - (stand_height + FOOT_RADIUS_M
-                    - IMU_BELOW_TRUNK_ORIGIN_M)) < 1e-9, f"{h*1e3:.1f} mm")
-    _check("... which is the abd axis minus the IMU lever",
-           abs((h + IMU_BELOW_TRUNK_ORIGIN_M)
-               - fk_floor_height(q_stand, np.eye(3), ref="hip")) < 1e-9,
-           f"abd {(h+IMU_BELOW_TRUNK_ORIGIN_M)*1e3:.1f} mm")
-
-    _, _, active, why = height_inputs(_FakeShared(rise, healthy=False),
-                                      q_stand, z0, now)
-    _check("unhealthy EKF is vetoed", not active and why == "EKF unhealthy")
-
-    _, _, active, why = height_inputs(_FakeShared(rise, ready=False),
-                                      q_stand, z0, now)
-    _check("un-initialised EKF is vetoed", not active)
-
-    stale = _FakeShared(rise)
-    stale.tau_stamp = now - 10 * HEIGHT_STALE_S
-    _, _, active, why = height_inputs(stale, q_stand, z0, now)
-    _check("stale EKF is vetoed", not active and why == "EKF stale")
-
-    _, _, active, why = height_inputs(_FakeShared(rise), q_stand, None, now)
-    _check("missing height origin is vetoed", not active)
-
-    # the headline safety net: EKF drifting away from FK must stop the loop
-    drifted = _FakeShared(rise + 0.050)
-    _, _, active, why = height_inputs(drifted, q_stand, z0, now)
-    _check("EKF-vs-FK divergence vetoes the loop",
-           not active and "disagree" in (why or ""), str(why))
-    _, _, active, _ = height_inputs(_FakeShared(rise + 0.010), q_stand, z0, now)
-    _check("small EKF-FK disagreement is tolerated", active)
-
-
-def _test_sequence(tables, stand_height):
-    seq = HeightStandSequence(tables, stand_height)
-    dt = 1.0 / CONTROL_HZ
-    t, q, qd = 0.0, Q_CROUCH.copy(), np.zeros(N_JOINTS)
-    seen = []
-    OFF = 0.012
-    while t < recorded.CROUCH_TIMEOUT_S + 3 * T_STAND and seq.stage != "PARKED":
-        cmd, contacts, _ = seq.update(
-            t, q, qd,
-            enter_pressed=seq.stage == "WAIT_CROUCH",
-            park_pressed=(seq.stage == "HOLD4" and t - seq.stage_t0 > 2.0),
-            offset=OFF)
-        q = cmd
-        if seq.stage not in seen:
-            seen.append(seq.stage)
-        t += dt
-    _check("stage order incl. park",
-           seen == ["CROUCH", "WAIT_CROUCH", "STAND", "HOLD4", "PARK", "PARKED"],
-           " -> ".join(seen))
-    _check("contacts stay ON in every stage", bool(np.all(contacts)))
-
-    # the offset must actually raise the trunk in HOLD4
-    s2 = HeightStandSequence(tables, stand_height)
-    s2.stage, s2.stage_t0 = "HOLD4", 0.0
-    q0 = s2.q_cmd(0.0)
-    s2.offset = OFF
-    q1 = s2.q_cmd(0.0)
-    h0 = fk_floor_height(q0, ref="hip")
-    h1 = fk_floor_height(q1, ref="hip")
-    _check("positive offset raises the commanded trunk height",
-           abs((h1 - h0) - OFF) < 2e-4, f"{(h1-h0)*1e3:+.2f} mm for {OFF*1e3:.0f} mm")
-
-    # PARK must unwind whatever the loop wound in, landing on the crouch
-    cmd_parked = seq.q_cmd(t)
-    _check("PARKED lands on the recorded crouch despite the offset",
-           float(np.max(np.abs(cmd_parked - Q_CROUCH))) < 1e-5,
-           f"max {np.max(np.abs(cmd_parked-Q_CROUCH))*1e3:.3f} mrad")
-
-    # park ramp must START from the held (offset) pose, not the nominal one
-    s3 = HeightStandSequence(tables, stand_height)
-    s3.stage, s3.stage_t0, s3.offset = "HOLD4", 0.0, OFF
-    held = s3.q_cmd(0.0)
-    s3.update(1.0, Q_CROUCH, np.zeros(N_JOINTS), park_pressed=True, offset=OFF)
-    _check("PARK starts from the pose actually being held",
-           float(np.max(np.abs(s3.q_cmd(1.0) - held))) < 1e-9)
-
-    # offset is ignored outside HOLD4
-    s4 = HeightStandSequence(tables, stand_height)
-    s4.stage, s4.stage_t0 = "WAIT_CROUCH", 0.0
-    s4.update(0.0, Q_CROUCH, np.zeros(N_JOINTS), offset=0.05)
-    _check("offset is ignored outside HOLD4",
-           float(np.max(np.abs(s4.q_cmd(0.0) - Q_CROUCH))) < 1e-6)
-
-
-def _test_closed_loop(tables, stand_height):
-    """End to end: sagging plant + EKF + veto + tables -> holds the target.
-
-    The plant is simulated at the abd axis (that is where the leg tables and
-    FK live); the loop only ever sees trunk-bottom heights, so the conversion
-    happens once, here, exactly as the lever does on hardware.
-    """
-    target = stand_height + FOOT_RADIUS_M - IMU_BELOW_TRUNK_ORIGIN_M
-    SAG = 0.013
-    seq = HeightStandSequence(tables, stand_height)
-    seq.stage, seq.stage_t0 = "HOLD4", 0.0
-    ctrl = HeightController(gain_per_s=0.5)
-    # EKF origin: the IMU height at init, i.e. at the crouch, level trunk
-    z0 = fk_floor_height(Q_CROUCH, np.eye(3), ref="imu")
-    dt = 1.0 / CONTROL_HZ
-    h = fk_floor_height(seq.q_cmd(0.0), ref="hip") - SAG      # abd axis
-    for k in range(int(25 / dt)):
-        t = k * dt
-        # encoders report the ACTUAL pose, so FK sees the sag too
-        q_meas = _sagged_pose(tables, h)
-        # the EKF reports the IMU's displacement from init: (h - lever) - z0
-        r_z = (h - IMU_BELOW_TRUNK_ORIGIN_M) - z0
-        h_ekf, h_fk, active, why = height_inputs(_FakeShared(r_z), q_meas, z0,
-                                                 time.monotonic())
-        off = ctrl.update(t, h_ekf, target, active and seq.loop_engaged, why)
-        seq.update(t, q_meas, np.zeros(N_JOINTS), offset=off)
-        # plant: the legs reach the commanded pose minus a constant sag
-        h = fk_floor_height(seq.q_cmd(t), ref="hip") - SAG
-    h_bot = h - IMU_BELOW_TRUNK_ORIGIN_M           # what the loop regulates
-    _check("closed loop holds the commanded trunk-bottom height (sagging plant)",
-           abs(h_bot - target) <= HEIGHT_DEADBAND_M + 1e-9,
-           f"{(h_bot-target)*1e3:+.2f} mm")
-    _check("the abd axis lands one IMU lever above it",
-           abs(h - (target + IMU_BELOW_TRUNK_ORIGIN_M))
-           <= HEIGHT_DEADBAND_M + 1e-9, f"abd {h*1e3:.1f} mm")
-    _check("recovered offset equals the sag",
-           abs(ctrl.offset - SAG) <= HEIGHT_DEADBAND_M + 1e-9,
-           f"{ctrl.offset*1e3:.1f} mm vs {SAG*1e3:.0f} mm")
-    _check("EKF and FK agree throughout the run (watchdog never fired)",
-           abs(h_ekf - h_fk) < 1e-5, f"{abs(h_ekf-h_fk)*1e6:.1f} um")
-
-
-def _sagged_pose(tables, h_hip):
-    """Joint angles whose FK hip height is h_hip (the 'measured' encoders)."""
-    q = np.zeros(N_JOINTS)
-    for i, leg in enumerate(LEGS):
-        q[3 * i:3 * i + 3] = tables[leg].q_at(-(h_hip - FOOT_RADIUS_M))
-    return q
+# The gates moved out of this file.  They were 296 lines of simulation that no
+# hardware run ever executes, and several of them shared a plane plant, a fake
+# EKF and a PASS/FAIL harness with the other runners -- all of which now live
+# in selftest_common.py.  `--self-test` still runs exactly those gates.
+#
+#     $V self-test/test_stand_ekf_height.py     # the same thing, run directly
 
 
 def self_test(stand_height):
-    print("stand_ekf_height_hw self-test (no hardware)")
-    print("[1] height tables")
-    t0 = time.perf_counter()
-    tables = build_tables(stand_height)
-    print(f"  (built in {time.perf_counter()-t0:.2f}s)")
-    _test_tables(tables, stand_height)
-    print("[2] integral height controller")
-    _test_controller()
-    print("[3] EKF vetoes / FK watchdog")
-    _test_vetoes(stand_height)
-    print("[4] stage machine + park")
-    _test_sequence(tables, stand_height)
-    print("[5] closed loop end to end")
-    _test_closed_loop(tables, stand_height)
-    print("self-test " + ("FAIL: " + ", ".join(_FAIL) if _FAIL else "PASS"))
-    return 1 if _FAIL else 0
+    """Delegate to the suite in self-test/.  Lazy: a hardware run never loads it."""
+    _sd = s1.selftest_dir()
+    if _sd not in sys.path:
+        sys.path.insert(0, _sd)
+    from test_stand_ekf_height import self_test as gates
+    return gates(stand_height)
 
 
 def main():

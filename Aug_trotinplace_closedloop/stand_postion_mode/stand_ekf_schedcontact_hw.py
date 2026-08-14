@@ -67,21 +67,19 @@ import stand_dog5_recorded_hw as recorded                # noqa: E402
 from ekf_runtime import EkfShared, ekf_worker, _rp       # noqa: E402
 from imu_dog import DEFAULT_PORT                         # noqa: E402
 
+# Every tunable this script has is in stand_params.py.  This runner owns no
+# control law -- the loops it drives are stage 2's and 2b's, so their gains
+# are the HEIGHT_* / LEVEL_* blocks there.
+from stand_params import (FOOT_RADIUS_M,                 # noqa: E402
+                          IMU_BELOW_TRUNK_ORIGIN_M,
+                          T_STAND, EKF_WORKER_HZ, QUIET_STAGES, SETTLE_S,
+                          TEMP_NOTICE_C,
+                          TOUCH_FRAC_DEFAULT, CROUCH_PLANTED_DEFAULT)
+
 MOTOR_IDS = base.MOTOR_IDS
 N_JOINTS = base.N_JOINTS
 CONTROL_HZ = base.CONTROL_HZ
 LEGS = base.LEGS
-
-FOOT_RADIUS_M = s1.FOOT_RADIUS_M
-IMU_BELOW_TRUNK_ORIGIN_M = s1.IMU_BELOW_TRUNK_ORIGIN_M
-T_STAND = lv.T_STAND
-EKF_WORKER_HZ = lv.EKF_WORKER_HZ
-QUIET_STAGES = lv.QUIET_STAGES
-SETTLE_S = lv.SETTLE_S
-TEMP_NOTICE_C = lv.TEMP_NOTICE_C
-
-TOUCH_FRAC_DEFAULT = 0.3     # rear feet flip ON this far into the STAND ramp
-CROUCH_PLANTED_DEFAULT = ("FL", "FR")
 
 
 class ContactSchedule:
@@ -546,127 +544,24 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, args):
           + "  ".join(f"{leg}{lvl.offsets[leg]*1e3:+.1f}" for leg in LEGS)
           + " mm" + (" (SATURATED)" if lvl.saturated else ""))
     print(f"[stop] {stop_reason}")
-
-
 # ===========================================================================
-# offline self-test
+# offline self-test -> test_stand_ekf_schedcontact.py
 # ===========================================================================
-
-_FAIL = []
-
-
-def _check(name, ok, detail=""):
-    print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
-          + (f"  ({detail})" if detail else ""))
-    if not ok:
-        _FAIL.append(name)
-
-
-def _test_schedule():
-    s = ContactSchedule(("FL", "FR"), touch_frac=0.3)
-    m = s.mask("CROUCH", 0.0)
-    _check("crouch mask plants only FL,FR",
-           list(m) == [True, True, False, False], str(m.astype(int)))
-    _check("WAIT_CROUCH (EKF init) uses the same honest mask",
-           np.array_equal(s.mask("WAIT_CROUCH", 0.0), m))
-    _check("early STAND keeps the rear feet up",
-           np.array_equal(s.mask("STAND", 0.29), m))
-    _check("STAND flips the rear feet ON at touch-frac",
-           bool(np.all(s.mask("STAND", 0.30))))
-    _check("HOLD4 is all planted", bool(np.all(s.mask("HOLD4", 0.0))))
-    _check("early PARK keeps all planted",
-           bool(np.all(s.mask("PARK", 0.69))))
-    _check("late PARK lifts the rear feet (mirror of the touchdown)",
-           np.array_equal(s.mask("PARK", 0.71), m))
-    _check("PARKED returns to the crouch set",
-           np.array_equal(s.mask("PARKED", 0.0), m))
-
-    # exactly ONE rising edge per stand: walk a full stage sequence
-    edges = 0
-    prev = s.mask("WAIT_CROUCH", 0.0)
-    for stage, steps in (("STAND", 50), ("HOLD4", 20), ("PARK", 50),
-                         ("PARKED", 5)):
-        for k in range(steps):
-            cur = s.mask(stage, (k + 1) / steps)
-            if np.any(cur & ~prev):
-                edges += 1
-            prev = cur
-    _check("exactly one touchdown edge per stand cycle", edges == 1,
-           f"{edges} rising edges")
-
-    try:
-        ContactSchedule(("FL",))
-        _check("fewer than 2 planted feet is refused", False)
-    except ValueError:
-        _check("fewer than 2 planted feet is refused", True)
-    try:
-        ContactSchedule(("FL", "XX"))
-        _check("unknown leg names are refused", False)
-    except ValueError:
-        _check("unknown leg names are refused", True)
-
-
-def _test_masked_height(stand_height):
-    """The height veto must average only the schedule's planted feet."""
-    tables = s2.build_tables(stand_height, clamp_m=lv.LEVEL_CLAMP_M)
-    q = np.zeros(N_JOINTS)
-    for i, leg in enumerate(LEGS):
-        q[3 * i:3 * i + 3] = tables[leg].q_at(-stand_height)
-    # rear feet 20 mm short of the floor (the crouch situation, exaggerated)
-    for i, leg in enumerate(LEGS):
-        if leg in ("RL", "RR"):
-            q[3 * i:3 * i + 3] = tables[leg].q_at(-stand_height + 0.020)
-    mask = ContactSchedule(("FL", "FR")).crouch_mask
-    h_masked = lv.fk_floor_height_planted(q, None, mask, ref="imu")
-    h_all = lv.fk_floor_height_planted(q, None, None, ref="imu")
-    # a foot raised TOWARD the trunk pulls the all-four average DOWN by
-    # lift * n_air / 4; the masked height must not move
-    _check("masked FK height ignores the airborne rear feet",
-           abs((h_masked - h_all) - 0.020 / 2) < 1e-4,
-           f"all-four biased {(h_all-h_masked)*1e3:+.1f} mm (20 mm x 2/4 legs)")
-    r_fk, p_fk = lv.fk_attitude(q, mask)
-    _check("2-foot plane fit refuses an attitude (dashes, not garbage)",
-           math.isnan(r_fk) and math.isnan(p_fk))
-    return tables
-
-
-def _test_sequence_wiring(tables, stand_height):
-    """The mask follows the stage machine through a full stand cycle."""
-    sched = ContactSchedule(("FL", "FR"), touch_frac=0.3)
-    seq = lv.LevelStandSequence(tables, stand_height)
-    dt = 1.0 / CONTROL_HZ
-    t, q, qd = 0.0, recorded.Q_RECORDED_CROUCH.copy(), np.zeros(N_JOINTS)
-    seen = {}
-    while t < recorded.CROUCH_TIMEOUT_S + 3 * T_STAND and seq.stage != "PARKED":
-        cmd, _, _ = seq.update(
-            t, q, qd,
-            enter_pressed=seq.stage == "WAIT_CROUCH",
-            park_pressed=(seq.stage == "HOLD4" and t - seq.stage_t0 > 2.0),
-            offset=0.0)
-        q = cmd
-        m = sched.mask(seq.stage, _progress(seq, t))
-        seen.setdefault(seq.stage, []).append(int(m.sum()))
-        t += dt
-    _check("WAIT_CROUCH never reports 4 planted",
-           max(seen.get("WAIT_CROUCH", [0])) == 2, str(set(seen["WAIT_CROUCH"])))
-    _check("STAND transitions 2 -> 4 planted",
-           seen["STAND"][0] == 2 and seen["STAND"][-1] == 4)
-    _check("HOLD4 is 4 planted throughout",
-           set(seen["HOLD4"]) == {4})
-    _check("PARK transitions 4 -> 2 planted",
-           seen["PARK"][0] == 4 and seen["PARK"][-1] == 2)
+# The gates moved out of this file.  They were 123 lines of simulation that no
+# hardware run ever executes, and several of them shared a plane plant, a fake
+# EKF and a PASS/FAIL harness with the other runners -- all of which now live
+# in selftest_common.py.  `--self-test` still runs exactly those gates.
+#
+#     $V self-test/test_stand_ekf_schedcontact.py     # the same thing, run directly
 
 
 def self_test(stand_height):
-    print("stand_ekf_schedcontact_hw self-test (no hardware)")
-    print("[1] contact schedule")
-    _test_schedule()
-    print("[2] schedule-masked FK height / attitude")
-    tables = _test_masked_height(stand_height)
-    print("[3] schedule follows the stage machine")
-    _test_sequence_wiring(tables, stand_height)
-    print("self-test " + ("FAIL: " + ", ".join(_FAIL) if _FAIL else "PASS"))
-    return 1 if _FAIL else 0
+    """Delegate to the suite in self-test/.  Lazy: a hardware run never loads it."""
+    _sd = s1.selftest_dir()
+    if _sd not in sys.path:
+        sys.path.insert(0, _sd)
+    from test_stand_ekf_schedcontact import self_test as gates
+    return gates(stand_height)
 
 
 def main():

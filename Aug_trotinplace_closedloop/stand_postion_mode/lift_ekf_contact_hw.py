@@ -70,30 +70,27 @@ import stand_ekf_level_hw as lv                          # noqa: E402
 import motorbus                                          # noqa: E402
 import stand_dog5_hw as base                             # noqa: E402
 import stand_dog5_recorded_hw as recorded                # noqa: E402
-import dog5_kinematics                                   # noqa: E402
 from ekf_runtime import EkfShared, ekf_worker, _rp       # noqa: E402
 from imu_dog import DEFAULT_PORT                         # noqa: E402
+
+# Every tunable this script has is in stand_params.py -- the LIFT_* block
+# there is this experiment's; the loops it drives are tuned by LEVEL_* and
+# HEIGHT_*, which is the point (this runner owns no control law).
+from stand_params import (FOOT_RADIUS_M,                 # noqa: E402
+                          IMU_BELOW_TRUNK_ORIGIN_M,
+                          T_STAND, EKF_WORKER_HZ, QUIET_STAGES, SETTLE_S,
+                          STAND_HEIGHT_DEFAULT,
+                          LEVEL_GAIN_PER_S, LEVEL_CLAMP_M, LEVEL_SLEW_M_S,
+                          LATCH_S, AGREE_VETO_DEG,
+                          LIFT_M, LIFT_SLEW_M_S, CONTACT_OFF_M,
+                          LIFT_SETTLE_S, LEAN_ABORT_DEG, LIFT_KEYS,
+                          TILT_STOP_DEG)
 
 MOTOR_IDS = base.MOTOR_IDS
 N_JOINTS = base.N_JOINTS
 CONTROL_HZ = base.CONTROL_HZ
 LEGS = base.LEGS
 Q_CROUCH = recorded.Q_RECORDED_CROUCH
-
-FOOT_RADIUS_M = s1.FOOT_RADIUS_M
-IMU_BELOW_TRUNK_ORIGIN_M = s1.IMU_BELOW_TRUNK_ORIGIN_M
-
-T_STAND = s2.T_STAND
-EKF_WORKER_HZ = s2.EKF_WORKER_HZ
-QUIET_STAGES = s2.QUIET_STAGES
-SETTLE_S = s2.SETTLE_S
-
-# Stage-2 stood at the recorded default (0.20 m), but the legs' reach caps the
-# commanded foot z at ~-221 mm -- at 0.20 that leaves ~21 mm of extension
-# authority, less than height sag (~13 mm) + a leveling clamp (12 mm).  This
-# script therefore defaults LOWER: 0.19 m keeps ~31 mm of extension authority
-# and drops the CoM for the lift demo (the crawl track's reach-ceiling number).
-STAND_HEIGHT_DEFAULT = 0.19
 
 # ---- the leveling controller, imported whole -------------------------------
 # This runner owns no control law.  Everything below is stand_ekf_level_hw's,
@@ -104,21 +101,6 @@ LevelingLoop = lv.LevelingLoop
 level_inputs = lv.level_inputs
 SetpointLatch = lv.SetpointLatch
 LevelStandSequence = lv.LevelStandSequence
-LEVEL_GAIN_PER_S = lv.LEVEL_GAIN_PER_S
-LEVEL_CLAMP_M = lv.LEVEL_CLAMP_M
-LEVEL_SLEW_M_S = lv.LEVEL_SLEW_M_S
-LATCH_S = lv.LATCH_S
-AGREE_VETO_DEG = lv.AGREE_VETO_DEG
-
-# ---- lift experiment -------------------------------------------------------
-LIFT_M = 0.020               # default commanded foot lift (visible clearance)
-LIFT_SLEW_M_S = 0.008        # lift/lower ramp rate (~2 s for 15 mm)
-CONTACT_OFF_M = 0.003        # commanded lift beyond this -> contact False
-LIFT_SETTLE_S = 1.0          # settle time at full lift before scoring zEKF/zFK
-LEAN_ABORT_DEG = 6.0         # attitude error that auto-lowers the lift
-TILT_STOP_DEG = 12.0         # absolute attitude that soft-stops the run
-
-LIFT_KEYS = {"1": "FL", "2": "FR", "3": "RL", "4": "RR"}
 
 
 
@@ -814,255 +796,24 @@ def run(port, stand_height, target_height, crouch_max_speed_dps, args):
           + "  ".join(f"{leg}{lvl.offsets[leg]*1e3:+.1f}" for leg in LEGS)
           + " mm" + (" (SATURATED)" if lvl.saturated else ""))
     print(f"[stop] {stop_reason}")
-
-
 # ===========================================================================
-# offline self-test
+# offline self-test -> test_lift_ekf_contact.py
 # ===========================================================================
-
-_FAIL = []
-
-# the plane plant, rotation helper and fake EKF all belong to the controller's
-# test harness -- reuse them rather than keeping a second copy in sync
-_C_from_rp = lv._C_from_rp
-_PlanePlant = lv._PlanePlant
-_FakeShared = lv._FakeShared
-
-
-def _check(name, ok, detail=""):
-    print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
-          + (f"  ({detail})" if detail else ""))
-    if not ok:
-        _FAIL.append(name)
-
-
-def _test_lift():
-    dt = 1.0 / CONTROL_HZ
-    lm = LiftManager(lift_m=0.015)
-    _check("lift starts inactive, all planted",
-           not lm.active and all(lm.planted().values()))
-    msg = lm.request("FL")
-    _check("lift request starts a ramp", lm.active and "lifting FL" in msg)
-    t, worst_rate, prev = 0.0, 0.0, 0.0
-    flipped_at = None
-    while t < 5.0:
-        lm.advance(t)
-        worst_rate = max(worst_rate, abs(lm.cur - prev) / dt)
-        prev = lm.cur
-        if flipped_at is None and not lm.planted()["FL"]:
-            flipped_at = lm.cur
-        t += dt
-    _check("ramp reaches the commanded lift", abs(lm.cur - 0.015) < 1e-9)
-    _check("ramp respects the lift slew", worst_rate <= LIFT_SLEW_M_S + 1e-9,
-           f"{worst_rate*1e3:.2f} mm/s")
-    _check("contact flips OFF just past the threshold",
-           flipped_at is not None
-           and CONTACT_OFF_M < flipped_at < CONTACT_OFF_M + 2 * LIFT_SLEW_M_S * dt,
-           f"at {flipped_at*1e3:.2f} mm")
-    _check("only the lifted leg is airborne",
-           lm.planted() == {"FL": False, "FR": True, "RL": True, "RR": True})
-    msg = lm.request("RR")
-    _check("a second leg is refused while one is lifted",
-           "refused" in msg and lm.leg == "FL")
-    msg = lm.request("FL")
-    _check("the same key lowers", "lowering" in msg and lm.goal == 0.0)
-    while t < 10.0:
-        lm.advance(t)
-        t += dt
-    _check("lowered leg re-plants and clears",
-           not lm.active and all(lm.planted().values()))
-    lm2 = LiftManager()
-    lm2.request("RL")
-    for k in range(100):
-        lm2.advance(k * dt)
-    msg = lm2.lower("EKF stale")
-    _check("auto-lower reports its reason",
-           msg is not None and "EKF stale" in msg and lm2.goal == 0.0)
-
-
-def _test_closed_loop_3leg(tables, stand_height, anchors):
-    """End to end: stand, latch, lift FL under a load-shift disturbance;
-    leveling + height hold on the 3 planted legs; lower; re-plant."""
-    dt = 1.0 / CONTROL_HZ
-    mount = (math.radians(1.5), math.radians(-0.5))
-    plant = _PlanePlant(anchors, mount=mount)
-    lvl = LevelingLoop(anchors)
-    hctrl = s2.HeightController()
-    latch = SetpointLatch()
-    lift = LiftManager(lift_m=0.015)
-    # _PlanePlant.solve returns the abd axis above the FOOT SITES; the loop
-    # works in floor-to-trunk-bottom, so convert once (see stage 2b).
-    PLANT_TO_BOTTOM = FOOT_RADIUS_M - IMU_BELOW_TRUNK_ORIGIN_M
-    target_h = stand_height + PLANT_TO_BOTTOM
-    SAG = 0.010
-    base_z = {leg: -stand_height for leg in LEGS}
-
-    def measure(fz, planted):
-        h, roll, pitch = plant.solve(fz, planted)
-        return h + PLANT_TO_BOTTOM - SAG, roll + mount[0], pitch + mount[1]
-
-    t = 0.0
-    events = []
-    max_err_during_lift = 0.0
-    settled_err = float("nan")
-    while t < 90.0:
-        lift.advance(t)
-        planted = lift.planted()
-        fz = {leg: base_z[leg] - hctrl.offset + lvl.offsets[leg]
-              + (lift.cur if leg == lift.leg else 0.0) for leg in LEGS}
-        h, r, p = measure(fz, planted)
-        # setpoint latch on the settled stand
-        if not latch.ready and t > SETTLE_S:
-            if latch.add(t, r, p):
-                events.append("latched")
-        engaged = latch.ready
-        lvl.update(t, r, p, latch.sp_roll if engaged else 0.0,
-                   latch.sp_pitch if engaged else 0.0, planted, engaged)
-        hctrl.update(t, h, target_h, True)
-        if engaged and lift.active:
-            max_err_during_lift = max(
-                max_err_during_lift,
-                abs(r - latch.sp_roll), abs(p - latch.sp_pitch))
-            if lift.goal != 0.0:        # settled reading just before lowering
-                settled_err = max(abs(r - latch.sp_roll),
-                                  abs(p - latch.sp_pitch))
-        # script: lift FL at t=10 with a 1.5 deg load-shift disturbance,
-        # lower at t=55, disturbance gone once planted again
-        if "latched" in events and lift.leg is None and t < 40.0 \
-                and "lifted" not in events:
-            lift.request("FL")
-            plant.disturb = (math.radians(1.0), math.radians(-1.1))
-            events.append("lifted")
-        if "lifted" in events and t > 55.0 and lift.goal != 0.0:
-            lift.request("FL")          # toggle -> lower
-        if "lifted" in events and not lift.active \
-                and "replanted" not in events:
-            plant.disturb = (0.0, 0.0)
-            events.append("replanted")
-        t += dt
-
-    fz = {leg: base_z[leg] - hctrl.offset + lvl.offsets[leg] for leg in LEGS}
-    h, r, p = measure(fz, {leg: True for leg in LEGS})
-    _check("sequence ran: latch -> lift -> lower -> re-plant",
-           events == ["latched", "lifted", "replanted"], str(events))
-    # the step disturbance transits through in full before the integrator
-    # winds it out -- the claim is bounded transient + settled recovery
-    _check("3-leg transient stays bounded (no runaway)",
-           max_err_during_lift < math.radians(2.5),
-           f"max err {math.degrees(max_err_during_lift):.2f} deg")
-    _check("leveling settles the 3-leg stance back to the setpoint",
-           settled_err < math.radians(0.35),
-           f"settled err {math.degrees(settled_err):.2f} deg")
-    _check("attitude back at the setpoint after re-plant",
-           abs(r - latch.sp_roll) < math.radians(0.3)
-           and abs(p - latch.sp_pitch) < math.radians(0.3),
-           f"{math.degrees(r-latch.sp_roll):+.3f}/"
-           f"{math.degrees(p-latch.sp_pitch):+.3f} deg")
-    _check("height loop recovered the sag through it all",
-           abs(h - target_h) <= s2.HEIGHT_DEADBAND_M + 1e-6,
-           f"{(h-target_h)*1e3:+.2f} mm")
-    _check("leveling stayed inside its clamp (no saturation)",
-           not lvl.saturated,
-           f"max |off| {max(abs(v) for v in lvl.offsets.values())*1e3:.1f} mm")
-
-
-def _test_compare_block():
-    """The printed comparison is the deliverable -- check what it asserts."""
-    base = (0.2103, 0.2098)
-    lines = height_compare_block("x", 0.2111, 0.2099, 3, base)
-    _check("compare block reports both heights and their gap",
-           "zEKF(bottom)" in lines[1] and "zFK(bottom, 3 planted)" in lines[1]
-           and "+1.2 mm" in lines[1], lines[1].strip())
-    _check("compare block reports the change vs the all-4 baseline",
-           "+0.7 mm" in lines[2], lines[2].strip())
-    _check("compare block omits the baseline row when there is none",
-           len(height_compare_block("x", 0.21, 0.21, 4)) == 2)
-    nan = float("nan")
-    _check("a non-finite baseline does not crash the block",
-           len(height_compare_block("x", 0.21, 0.21, 3, (nan, nan))) == 2)
-
-
-def _test_fake_contacts_semantics():
-    """--fake-contacts must change ONLY what the EKF is told."""
-    lm = LiftManager(lift_m=0.020)
-    lm.request("FL")
-    for k in range(int(4.0 * CONTROL_HZ)):
-        lm.advance(k / CONTROL_HZ)
-    honest = np.array([lm.planted()[leg] for leg in LEGS])
-    faked = np.ones(4, dtype=bool)
-    _check("honest schedule marks the lifted leg airborne",
-           not honest[LEGS.index("FL")] and honest.sum() == 3)
-    _check("faked schedule claims all four planted", bool(faked.all()))
-    # zFK must follow the HONEST set either way -- that is what keeps the
-    # comparison a real measurement rather than a self-fulfilling one
-    q = np.zeros(N_JOINTS)
-    tables = _shared_tables()
-    for i, leg in enumerate(LEGS):
-        q[3*i:3*i+3] = tables[leg].q_at(-0.19)
-    q[0:3] = tables["FL"].q_at(-0.19 + lm.cur)
-    h_honest = fk_floor_height_planted(q, None, honest, ref="hip")
-    h_faked = fk_floor_height_planted(q, None, faked, ref="hip")
-    _check("zFK on the honest set ignores the raised foot",
-           abs(h_honest - fk_floor_height_planted(
-               np.concatenate([tables[l].q_at(-0.19) for l in LEGS]),
-               None, honest, ref="hip")) < 1e-9)
-    _check("zFK would be biased by lift/4 if it used the faked set",
-           abs((h_honest - h_faked) - lm.cur / 4) < 2e-4,
-           f"{(h_honest-h_faked)*1e3:+.2f} mm vs {lm.cur/4*1e3:.2f} mm")
-
-
-_TABLES = None
-
-
-def _shared_tables(stand_height=STAND_HEIGHT_DEFAULT):
-    global _TABLES
-    if _TABLES is None:
-        _TABLES = s2.build_tables(stand_height,
-                                  clamp_m=s2.HEIGHT_CLAMP_M + LEVEL_CLAMP_M)
-    return _TABLES
+# The gates moved out of this file.  They were 251 lines of simulation that no
+# hardware run ever executes, and several of them shared a plane plant, a fake
+# EKF and a PASS/FAIL harness with the other runners -- all of which now live
+# in selftest_common.py.  `--self-test` still runs exactly those gates.
+#
+#     $V self-test/test_lift_ekf_contact.py     # the same thing, run directly
 
 
 def self_test(stand_height):
-    print("lift_ekf_contact_hw self-test (no hardware)")
-    print("  (control laws are stand_ekf_level_hw's and are gated there)")
-    print("[1] height tables -- room for the lift above the stand")
-    t0 = time.perf_counter()
-    tables = _shared_tables(stand_height)
-    print(f"  (built in {time.perf_counter()-t0:.2f}s)")
-    anchors = {leg: tables[leg].xy for leg in LEGS}
-    _check("table span covers the full lift above the stand",
-           all(tables[leg].z_max >= -stand_height + LIFT_M for leg in LEGS),
-           "  ".join(f"{leg}[{tables[leg].z_min*1e3:.0f},"
-                     f"{tables[leg].z_max*1e3:.0f}]" for leg in LEGS))
-    print("[2] lift manager (ramp, contact threshold, one leg at a time)")
-    _test_lift()
-    print("[3] the zEKF/zFK comparison block")
-    _test_compare_block()
-    print("[4] --fake-contacts changes only what the EKF is told")
-    _test_fake_contacts_semantics()
-    print("[5] closed loop end to end, 3-leg stance")
-    _test_closed_loop_3leg(tables, stand_height, anchors)
-    print("[6] timing (leveling + lift + 4-leg lookup)")
-    _test_timing(tables, anchors)
-    print("self-test " + ("FAIL: " + ", ".join(_FAIL) if _FAIL else "PASS"))
-    return 1 if _FAIL else 0
-
-
-def _test_timing(tables, anchors):
-    lvl = LevelingLoop(anchors)
-    planted = {leg: True for leg in LEGS}
-    lm = LiftManager()
-    t0 = time.perf_counter()
-    N = 200
-    for k in range(N):
-        lm.advance(k * 0.004)
-        lvl.update(k * 0.004, 0.01, -0.01, 0.0, 0.0, planted, True)
-        lz = lm.lift_z()
-        for leg in LEGS:
-            tables[leg].q_at(-0.19 + lvl.offsets[leg] + lz[leg])
-    per = (time.perf_counter() - t0) / N
-    _check("leveling + lift + 4-leg lookup fit the CAN slot", per < 250e-6,
-           f"{per*1e6:.0f} us per sweep")
+    """Delegate to the suite in self-test/.  Lazy: a hardware run never loads it."""
+    _sd = s1.selftest_dir()
+    if _sd not in sys.path:
+        sys.path.insert(0, _sd)
+    from test_lift_ekf_contact import self_test as gates
+    return gates(stand_height)
 
 
 def main():
