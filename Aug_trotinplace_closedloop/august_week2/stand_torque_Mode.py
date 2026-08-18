@@ -129,6 +129,8 @@ Keys: ENTER = rise / re-engage from limp, SPACE = LIMP, P = park, X = stop.
 from __future__ import annotations
 
 import argparse
+import collections
+import math
 import os
 import sys
 import time
@@ -206,8 +208,10 @@ class JointImpedance:
     same foot trajectory the wrench is trying to realise, so in nominal stance
     this term is ~0.  A model-mismatch term, not a stiffness.
 
-    The gains are bounded by the sampled-PD limit at the TRUE 4 ms sweep --
-    see params.py's header for why that number was wrong for a year.
+    The gains are bounded by the sampled-PD limit at the MEASURED 16 ms loop
+    delay, NOT at the 4 ms command interval: see params.LOOP_DELAY_S.  Using
+    the command interval is what made kp=15/kd=0.6 look like 19% of the bound
+    when it was 68% of it, and shook the robot at 9-12 Hz.
     """
 
     def __init__(self, kp=P.KP_IMP, kd=P.KD_IMP):
@@ -218,7 +222,10 @@ class JointImpedance:
         if not 0.0 <= kd <= P.KD_IMP_MAX:
             raise ValueError(f"kd={kd} outside [0, {P.KD_IMP_MAX}]; the "
                              f"sampled-damper bound is 2J/dt = "
-                             f"{2*P.J_MIN/P.SWEEP_S:.1f} Nms/rad")
+                             f"{2*P.J_MIN/P.LOOP_DELAY_S:.1f} Nms/rad at the "
+                             f"MEASURED {P.LOOP_DELAY_S*1e3:.0f} ms loop "
+                             f"delay, not {2*P.J_MIN/P.SWEEP_S:.1f} at the "
+                             f"{P.SWEEP_S*1e3:.0f} ms command interval")
         self.kp, self.kd = float(kp), float(kd)
         self.dq = np.zeros(N_JOINTS)
 
@@ -235,9 +242,11 @@ class TorqueGate(base.SafetyGate):
 
     base.apply() reads module-level TORQUE_RAMP_S (1.0 s) and TAU_SLEW_NM_S
     (5.0 Nm/s), which are position-track numbers and are wrong here in both
-    directions: at 5 Nm/s a kp=15 impedance at 0.1 rad of error would take
-    0.3 s to reach the 1.5 Nm it wants, by which time the leg has folded; and
-    a 1.0 s ramp on top means no leg can take weight for a full second.
+    directions: 5 Nm/s is slow enough that a leg folds while the impedance is
+    still ramping towards the torque it asked for, and a 1.0 s ramp on top
+    means no leg can take weight for a full second.  See params.TAU_SLEW_NM_S
+    for why the sizing argument is now the joint-speed one and not the old
+    kp = 15 one.
 
     Subclassed rather than edited, because the position track, the crawl and
     the EKF harness all import stand_dog5_hw.
@@ -337,6 +346,49 @@ def q_ref_for_height(q_ref, z_des, foot_xy):
     return q_ref
 
 
+def _zero_rp_streamer(imu, args, window_s=5.0):
+    """The ZERO-TORQUE stage streams the AHRS, not the twelve joint angles.
+
+    The joint line that used to print here was the wrong thing to look at:
+    the encoders are calibrated, the preflight's own soft-limit check already
+    REFUSES ENTER on a bad pose, and there is nothing an operator does with
+    twelve numbers at 2 Hz.  The one number that has to be read off this robot
+    by hand is the IMU mount tilt -- and this is the stage to read it in, with
+    no torque anywhere and the trunk wherever the operator puts it.
+
+    So this prints raw roll/pitch, a mean over the last `window_s`, and the
+    --setpoint-* line that cancels the mean.  The SPREAD is printed with it
+    because it is the part that says whether the mean is trustworthy: held by
+    hand it runs a degree or more, and a mean that moves by a degree is not a
+    mount tilt.
+
+    THIS IS THE MOUNT TILT ONLY IF THE TRUNK IS ACTUALLY LEVEL -- put a spirit
+    level on it, or the reading is whatever the hands are doing.  The reading
+    that needs no level is rp:d in the crouch (ahrs minus the foot plane),
+    which cancels the floor as well; see _print_attitude_report.
+    """
+    hist = collections.deque(maxlen=max(2, int(window_s * 2.0)))  # 2 Hz prints
+
+    def line(q, qd):
+        sample = imu.sample()
+        if sample is None:
+            return "[zero] rp: no AHRS sample"
+        r, p_ = float(sample.roll_deg), float(sample.pitch_deg)
+        hist.append((r, p_))
+        rs = [h[0] for h in hist]
+        ps = [h[1] for h in hist]
+        rm, pm = sum(rs) / len(rs), sum(ps) / len(ps)
+        spread = max(max(rs) - min(rs), max(ps) - min(ps))
+        # The flags already include whatever setpoint THIS run subtracts, so
+        # the printed pair is absolute: paste it, do not add it to the old one.
+        return (f"[zero] rp {r:+6.2f} / {p_:+6.2f} deg   "
+                f"mean({len(hist)/2:.1f}s) {rm:+6.2f} / {pm:+6.2f} "
+                f"+/-{spread:.2f}   "
+                f"--setpoint-roll {rm:.2f} --setpoint-pitch {pm:.2f}")
+
+    return line
+
+
 def _print_attitude_report(est, args):
     """The one place an operator can read the mount tilt off the robot.
 
@@ -388,6 +440,12 @@ def run(args):
         gains.kd_roll = gains.kd_pitch = args.kd_att
     if args.kp_z is not None:
         gains.kp_z = args.kp_z
+    if args.kd_z is not None:
+        gains.kd_z = args.kd_z
+    if args.kd_xy is not None:
+        gains.kd_x = gains.kd_y = args.kd_xy
+    if args.kd_yaw is not None:
+        gains.kd_yaw = args.kd_yaw
     if args.open_loop:
         # ALL outer feedback off: W = [0, 0, m*g, 0, 0, 0], split evenly by
         # the grasp map, + leg gravity + the joint impedance tracking the
@@ -471,7 +529,8 @@ def run(args):
             unwrap = [base.CalibratedEncoderUnwrap() for _ in MOTOR_IDS]
             if not imu.wait_for_data(3.0):
                 raise RuntimeError("no AHRS data")
-            base._zero_torque_preflight(mb, key, unwrap)
+            base._zero_torque_preflight(
+                mb, key, unwrap, status=_zero_rp_streamer(imu, args))
 
             # ---- CROUCH: position mode, week-2 bookend -------------------
             q = cap.crouch(mb, unwrap, key, max_speed_dps=args.crouch_dps)
@@ -488,6 +547,7 @@ def run(args):
             z_crouch = None
             q_ref = q.copy()
             tau_ff = np.zeros(N_JOINTS)
+            W = np.zeros(6)
             tau_cmd = np.zeros(N_JOINTS)
             diag = {"fz": [0.0] * 4, "stance": [], "singular": []}
             state, act, why = None, False, "starting"
@@ -662,13 +722,23 @@ def run(args):
                                   f"force loop is not doing what it says")
 
                     if args.log:
+                        # w, v and W are the OUTER LOOP'S OWN SIGNALS: the two
+                        # it feeds back on and the one it produces.  Without
+                        # them a log of an outer-loop shake shows the result
+                        # and neither the cause nor the command -- roll is an
+                        # ANGLE, and kd_att acts on the RATE, which nothing
+                        # else in this file records.  Held between model
+                        # steps, like tau_ff.
                         log.append((now, q.copy(), qd.copy(), qd_drv.copy(),
                                     tau_cmd.copy(), tau_meas.copy(),
                                     np.array(diag["fz"]),
                                     est.roll, est.pitch, est.z, load_sum,
                                     stage, est.roll_fk, est.pitch_fk,
                                     est.z_hip, est.roll_raw, est.pitch_raw,
-                                    q_ref.copy()))
+                                    q_ref.copy(),
+                                    np.zeros(3) if state is None
+                                    else np.asarray(state["w"]).copy(),
+                                    est.v.copy(), W.copy()))
 
                     if now - last_print >= 1.0 / base.STATUS_HZ:
                         last_print = now
@@ -767,8 +837,18 @@ def run(args):
                 # the impedance error |q_ref - q| used to be streamed as |dq|;
                 # it is recoverable only if q_ref is here, so it is
                 q_ref=np.array([r[17] for r in log]),
+                # the outer loop's inputs (w = AHRS gyro, UNFILTERED; v = the
+                # low-passed leg odometry) and its output (W, the 6D wrench)
+                w=np.array([r[18] for r in log]),
+                v=np.array([r[19] for r in log]),
+                W=np.array([r[20] for r in log]),
                 glitches=glitches,
+                # every OUTER gain, not just the attitude pair: a --kd-z or
+                # --kd-xy A/B is unreadable afterwards if the npz cannot say
+                # which half of it this file is.
                 kp_att=gains.kp_roll, kd_att=gains.kd_roll,
+                kp_z=gains.kp_z, kd_z=gains.kd_z,
+                kd_xy=gains.kd_x, kd_yaw=gains.kd_yaw,
                 force_frac=args.force_frac, mass=args.mass,
                 setpoint_roll_deg=args.setpoint_roll,
                 setpoint_pitch_deg=args.setpoint_pitch,
@@ -793,14 +873,33 @@ def self_test():
           and abs(t[0] - P.KP_IMP * 0.1) < 1e-12)
     t = imp.tau(np.zeros(12), np.full(12, 1.0), np.zeros(12))
     check("...and opposes velocity", abs(t[0] + P.KD_IMP) < 1e-12)
-    check("the damper is far inside the 4 ms sampled bound 2J/dt",
-          P.KD_IMP < 0.25 * (2 * P.J_MIN / P.SWEEP_S),
-          f"kd={P.KD_IMP} vs bound {2*P.J_MIN/P.SWEEP_S:.2f} Nms/rad")
+    # THE DAMPER IS CHECKED AT THE MEASURED DELAY, NOT THE COMMAND INTERVAL.
+    # The old pair of checks used SWEEP_S and passed at kd=0.6, which is the
+    # exact reason the offline gate was green while the robot shook: the
+    # inequality had no delay term in it.  kd_joint is in the sum because it
+    # damps the same joint through the same delay.
+    bound = 2 * P.J_MIN / P.LOOP_DELAY_S
+    check("the damper is inside the bound at the MEASURED loop delay",
+          P.KD_IMP + P.KD_JOINT < 0.5 * bound,
+          f"kd+kd_joint={P.KD_IMP+P.KD_JOINT:.2f} vs bound {bound:.2f} "
+          f"Nms/rad at {P.LOOP_DELAY_S*1e3:.0f} ms "
+          f"({100*(P.KD_IMP+P.KD_JOINT)/bound:.0f}%)")
     # the whole reason this file can exist -- recompute, do not trust
-    check("at the WRONG 48 ms sweep the same kd would be past the bound",
-          P.KD_IMP > 2 * P.J_MIN / (P.N_JOINTS / P.CONTROL_HZ),
-          f"bound at 48 ms is {2*P.J_MIN/(P.N_JOINTS/P.CONTROL_HZ):.2f}, "
-          f"kd={P.KD_IMP} -- this is the 12x error that killed the track")
+    check("...and the OLD default would not have been (it shook, 9-12 Hz)",
+          P.KD_IMP_MAX + P.KD_JOINT > 0.5 * bound,
+          f"the old kd={P.KD_IMP_MAX}+{P.KD_JOINT} is "
+          f"{100*(P.KD_IMP_MAX+P.KD_JOINT)/bound:.0f}% of the same bound, and "
+          f"{100*(P.KD_IMP_MAX+P.KD_JOINT)/(2*P.J_MIN/P.SWEEP_S):.0f}% of the "
+          f"4 ms one this file used to check -- same gain, both answers")
+    # the stiffness half: what a delay does is set by WHERE the loop crosses
+    f_c = math.sqrt(P.KP_IMP / P.J_MIN) / (2 * math.pi)
+    check("the stiffness puts the crossover where 16 ms is a small phase",
+          360.0 * f_c * P.LOOP_DELAY_S < 25.0,
+          f"kp={P.KP_IMP} -> {f_c:.1f} Hz -> "
+          f"{360*f_c*P.LOOP_DELAY_S:.0f} deg of delay phase; kp="
+          f"{P.KP_IMP_MAX} gives "
+          f"{360*math.sqrt(P.KP_IMP_MAX/P.J_MIN)/(2*math.pi)*P.LOOP_DELAY_S:.0f}"
+          f" deg, which is the shake")
 
     # -- the torque gate ---------------------------------------------------
     g = TorqueGate(tau_cap=1.0)
@@ -974,9 +1073,20 @@ def self_test():
                                         ALL4)
     F_bad = abs(P.KD_Z * v_bad[2]) + abs(P.KD_X * v_bad[0]) \
         + abs(P.KD_Y * v_bad[1])
-    check("the measured 8.1 rad/s glitch WOULD have been a huge phantom force",
-          F_bad > 0.2 * P.WEIGHT_N,
-          f"{F_bad:.1f} N on a {P.WEIGHT_N:.0f} N robot, from one bad reading")
+    # THE THRESHOLD IS THE GAIN'S, NOT A FIXED FRACTION OF THE WEIGHT.  This
+    # asserted F_bad > 20% of the weight, which was written when kd_z was 120
+    # and the glitch was worth 33 N.  At the verified kd_z = 40 the same
+    # glitch is 4.3 N and the check failed -- not because the argument for
+    # encoder differencing got weaker, but because it was pinned to a gain
+    # that has since moved.  What matters is that ONE bad reading is worth
+    # more than the height loop's own resolution, so compare it to what a
+    # millimetre of real height error commands.
+    F_mm = P.KP_Z * 0.001
+    check("the measured 8.1 rad/s glitch is worth more than a mm of real error",
+          F_bad > 3.0 * F_mm,
+          f"{F_bad:.1f} N from one bad reading, against {F_mm:.2f} N for a "
+          f"whole millimetre of height -- {F_bad/F_mm:.0f} mm of phantom "
+          f"height, on a {P.WEIGHT_N:.0f} N robot")
 
     # the encoder path, driven by a joint that is NOT moving
     qd_enc = np.zeros(12)
@@ -1071,6 +1181,20 @@ def main():
                     help="0 with --kd-att 0 is the ablation half of the A/B")
     ap.add_argument("--kd-att", type=float, default=None)
     ap.add_argument("--kp-z", type=float, default=None)
+    ap.add_argument("--kd-z", type=float, default=None,
+                    help="the height loop's DAMPING half, separately from "
+                         "--kp-z.  kd_z acts on leg-odometry velocity, which "
+                         "is the one outer signal carrying the whole lag "
+                         "budget (5 Hz LPF + 12 ms hold), so a shake that "
+                         "--kp-z alone cannot clear usually lives here")
+    ap.add_argument("--kd-xy", type=float, default=None,
+                    help="kd_x = kd_y together: the damping-only translation "
+                         "axes, on the same lagged odometry velocity as kd_z")
+    ap.add_argument("--kd-yaw", type=float, default=None,
+                    help="the yaw damper.  Its own flag because it is the "
+                         "gain --open-loop zeroes that no other flag could: "
+                         "zeroing kp-z/kd-z/kd-xy/kp-att/kd-att left it live "
+                         "at 4.0 and the banner did not show it")
     ap.add_argument("--setpoint-roll", type=float, default=P.SETPOINT_ROLL_DEG,
                     help="resting attitude of THIS rig in deg, subtracted from "
                          "every AHRS reading.  Read the pair the WAIT stage "

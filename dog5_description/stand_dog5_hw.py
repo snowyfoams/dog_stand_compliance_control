@@ -640,11 +640,19 @@ def _recover_input_lost(mb, targets, elapsed, last_recover,
             next_fault_status[joint_index] = elapsed + 1.0 / FAULT_STATUS_HZ
 
 
-def _zero_torque_preflight(mb, key, unwrap):
+def _zero_torque_preflight(mb, key, unwrap, status=None):
     """Verify a safe, stationary start while every command remains iq=0.
 
     Return the measured pose used as the start of the REST trajectory.  This
     does not capture or alter the calibrated hardware zero.
+
+    `status` replaces the 2 Hz twelve-joint-angle line with a caller-supplied
+    one: it is called as status(q, qd) and whatever string it returns is
+    printed instead (return "" to print nothing).  Callers that have a live
+    AHRS here use it to stream the trunk attitude, which is the one number an
+    operator has to read off the robot by hand at this stage; the twelve
+    angles are already covered by the soft-limit refusal below.  None keeps
+    the joint line, so every existing caller is unchanged.
     """
     print(
         "[hardware] ZERO-TORQUE CHECK: mechanically support the robot and "
@@ -680,13 +688,19 @@ def _zero_torque_preflight(mb, key, unwrap):
             mb.keepalive(mid)
         q, qd = _joint_state(mb, unwrap)
         if now - last_print >= 1.0 / STATUS_HZ:
-            groups = []
-            for leg_index, leg in enumerate(LEGS):
-                values = q[3 * leg_index:3 * leg_index + 3]
-                groups.append(
-                    f"{leg}({values[0]:+.2f},{values[1]:+.2f},{values[2]:+.2f})"
-                )
-            print("[zero] " + "  ".join(groups), flush=True)
+            if status is None:
+                groups = []
+                for leg_index, leg in enumerate(LEGS):
+                    values = q[3 * leg_index:3 * leg_index + 3]
+                    groups.append(
+                        f"{leg}({values[0]:+.2f},{values[1]:+.2f},"
+                        f"{values[2]:+.2f})"
+                    )
+                print("[zero] " + "  ".join(groups), flush=True)
+            else:
+                line = status(q, qd)
+                if line:
+                    print(line, flush=True)
             last_print = now
 
         pressed = key.get()

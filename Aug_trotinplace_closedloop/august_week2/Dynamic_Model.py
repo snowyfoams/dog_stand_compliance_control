@@ -115,9 +115,13 @@ class _Gains:
         self.kd_joint = P.KD_JOINT
 
     def __repr__(self):
+        # kd_yaw IS PRINTED even though it is the least interesting gain: it
+        # used to be the one omitted, so a runner that zeroed everything the
+        # banner showed still had 4.0 Nms/rad live on the yaw axis and the
+        # banner read as all-off.  Every gain the wrench uses, or none.
         return (f"Gains(kp_z={self.kp_z:.0f} kd_z={self.kd_z:.0f} "
                 f"kp_att={self.kp_roll:.0f} kd_att={self.kd_roll:.0f} "
-                f"kd_xy={self.kd_x:.0f})")
+                f"kd_xy={self.kd_x:.0f} kd_yaw={self.kd_yaw:.0f})")
 
 
 def default_gains():

@@ -105,10 +105,19 @@ TAU_START_MAX = 1.0          # --tau-max default: first runs, supported robot
 TAU_STAGED_MAX = 3.0         # the ceiling --tau-max may be raised to
 TAU_HARD_NM = 9.0            # absolute; iq saturates at 2048/206.04 = 9.94 Nm
 
-# base's 5.0 Nm/s is a POSITION-track number and it strangles a balance loop:
-# a kp=15 impedance at 0.1 rad of error wants 1.5 Nm and would take 0.3 s to
-# get there, by which time the leg has folded.  Size it by how much joint
-# SPEED one sweep can add instead:
+# base's 5.0 Nm/s is a POSITION-track number.  The justification here used to
+# be "a kp=15 impedance at 0.1 rad wants 1.5 Nm and 5 Nm/s takes 0.3 s to get
+# there" -- that argument DIED WITH kp = 15: at KP_IMP = 3 the same error
+# wants 0.3 Nm, which 5 Nm/s reaches in 60 ms.  The number is kept at 60 on
+# the second argument alone, which never depended on a gain.
+#
+# NOTE WHAT 60 COSTS.  A rate limiter does not prevent a limit cycle, it sets
+# the AMPLITUDE: on the 2026-08-17 shake the describing function predicts
+# 5.8 deg of joint motion at 60 Nm/s against 0.49 deg at 5, and 2.7-5.5 deg
+# was measured.  With the impedance now stable that amplitude has nothing to
+# set, which is why this stays -- but if a shake ever returns, 60 is what
+# makes it visible rather than what causes it.  Size it by how much joint
+# SPEED one sweep can add:
 #     dqd = TAU_SLEW * SWEEP_S^2 / J = 60*0.004^2/0.0088 = 0.11 rad/s per sweep
 # an order of magnitude under the 7.0 rad/s e-stop, and fast enough to answer
 # a push inside 30 ms.
@@ -125,17 +134,55 @@ TORQUE_RAMP_S = 0.3          # ease-in when torque arms; the window in which
 # the terminal speed qd = tau/kd -- the joint coasts, it does not stop.  That
 # is how RR_abd failed on 2026-07-30 (settled at 1.87 rad/s, overspeed e-stop).
 # kp*(q_ref - q) makes it POSITION-level with a fixed point: the same fault
-# becomes a bounded offset dq = tau/kp, ~13 mrad.  Nothing left to run away.
+# becomes a bounded offset dq = tau/kp -- 67 mrad at the KP_IMP below, five
+# times the 13 mrad this line used to quote at kp = 15.  Still bounded, which
+# is the whole property; a softer floor is a wider offset, not a runaway.
 #
 # q_ref is the SAME pose the force law is trying to hold, so in nominal stance
 # this term is ~0 and the force law does the work.  It is a MODEL-MISMATCH
 # term, not a stiffness fighting the balance loop.
-KP_IMP = 15.0                # Nm/rad.  Bound at 4 ms is ~40-80; this is ~19%.
-KD_IMP = 0.6                 # Nms/rad.  Bound is 2*J_MIN/SWEEP_S = 4.4; ~14%.
-KP_IMP_MAX = 40.0            # refuse anything above these from the CLI --
-KD_IMP_MAX = 1.5             # the measured stable envelope, not a preference
-IMP_DQ_NOTICE_RAD = 0.02     # |q_ref - q| above this means the impedance is
-                             # carrying load the force law thinks is grounded
+
+# THE BOUND IS SET BY THE LOOP DELAY, NOT THE COMMAND INTERVAL.
+# ---------------------------------------------------------------------------
+# This file used to derive every impedance bound from SWEEP_S alone, and that
+# is the interval at which a command is SENT -- not the time from computing a
+# torque to feeling it.  Cross-correlating tau_cmd against tau_meas in the
+# 2026-08-17 logs gives +3 sweeps of pure delay on all twelve joints
+# (correlation 0.86-0.96, actuator gain 0.76).  Three sweeps of transport plus
+# the 4 ms command interval is 16 ms, 4x what the bounds assumed:
+LOOP_DELAY_S = 0.016         # MEASURED, not budgeted.  Re-measure it if the
+                             # bus rate, the driver firmware or CONTROL_HZ
+                             # changes -- every number below is 2J/dt on it.
+#
+#     sampled-damper bound 2*J_MIN/dt      4.40 Nms/rad at 4 ms   (assumed)
+#                                          1.10 Nms/rad at 16 ms  (real)
+#
+# At the old KD_IMP = 0.6 the damper plus kd_joint = 0.75 is 68% of the real
+# bound rather than the 17% this file used to claim, and the kp = 15 loop
+# crosses -180 deg at 9.1 Hz with |L| = 1.24.  That is unstable, and it is
+# what shook the robot at 9-12 Hz on 2026-08-17 -- identically with
+# --open-loop, which is what proved the fault was below the model.
+#
+# THE VALUES BELOW ARE THE ONES THAT STAND ON HARDWARE.  Verified 2026-08-18:
+# --kp 3 --kd 0.1 holds open-loop steady where the old defaults shook.  The
+# arithmetic agrees -- kp = 3 puts the joint loop at sqrt(kp/J)/2pi = 2.9 Hz,
+# where 16 ms of delay is only 17 deg of phase, against 38 deg at the 6.6 Hz
+# that kp = 15 gives.
+KP_IMP = 3.0                 # Nm/rad.  2.9 Hz crossover; 17 deg of delay phase
+KD_IMP = 0.1                 # Nms/rad.  With kd_joint, 23% of the 16 ms bound
+#
+# The CEILINGS ARE THE OLD DEFAULTS, deliberately.  They are the largest gains
+# ever run on this hardware and they are KNOWN TO SHAKE, so the CLI may still
+# reach them -- reproducing the 9-12 Hz limit cycle is a legitimate A/B -- and
+# may not go past them.  40/1.5 was never a "measured stable envelope"; it was
+# the 4 ms bound with a margin, and the margin was against the wrong number.
+KP_IMP_MAX = 15.0            # = the old KP_IMP: A/B only, expect the shake
+KD_IMP_MAX = 0.6             # = the old KD_IMP: 68% of the 16 ms bound
+IMP_DQ_NOTICE_RAD = 0.1      # |q_ref - q| above this means the impedance is
+                             # carrying load the force law thinks is grounded.
+                             # WAS 0.02, which was 0.3 Nm at kp = 15; at kp = 3
+                             # the same torque is 0.1 rad, so the threshold
+                             # moved with the gain to keep meaning one thing
 
 # ===========================================================================
 # body wrench -- the virtual spring/damper on the trunk (Dynamic_Model)
@@ -145,15 +192,39 @@ IMP_DQ_NOTICE_RAD = 0.02     # |q_ref - q| above this means the impedance is
 # stiff to.  Height stiffness is below the sim default of 1200 because kp_z is
 # what a slew-limited actuator cannot honour -- 1200 N/m at 10 mm of error
 # asks for 12 N of extra support, and the gate can add 0.24 Nm per sweep.
-KP_Z = 800.0                 # N/m
-KD_Z = 120.0                 # Ns/m
-KP_ROLL = 120.0              # Nm/rad
-KD_ROLL = 8.0                # Nms/rad
-KP_PITCH = 120.0
-KD_PITCH = 8.0
-KD_X = 60.0                  # Ns/m   damping-only axes
-KD_Y = 60.0
-KD_YAW = 4.0                 # Nms/rad
+# THESE ARE NOW THE VALUES THE ROBOT HELD, NOT THE VALUES IT SHOOK AT.
+# ---------------------------------------------------------------------------
+# The 2026-08-18 bring-up walked the outer loop up one gain at a time and every
+# step is a log.  Those numbers only ever existed as command-line flags, so any
+# run that did not type all six of them got the old defaults back -- which is
+# how a runner built on this file shook again after the ladder had finished.
+#
+#   gain      was    now   verified by      why the old value failed
+#   kp_z      800    300   s2_kpz300.npz    800/120 has 7.4 deg of phase margin
+#   kd_z      120     40   s1_kdz40.npz     against the measured 20 ms outer
+#                                           delay; 300/40 has 27
+#   kp_roll   120     10   s3c_att20.npz    120 saturates this stance's 6.42 Nm
+#   kp_pitch  120     10   s3c_att20.npz    roll capacity at 3.06 deg of tilt
+#   kd_roll     8    0.5   s3c_att20.npz    kd_att 2 alone gave zero HOLD
+#   kd_pitch    8    0.5   s3c_att20.npz    sweeps in 4.6 s (s3b_kdatt2.npz)
+#   kd_x/y     60      0   never run > 0    same lagged odometry velocity as
+#   kd_yaw      4      0   never run > 0    kd_z, and yaw authority is 100%
+#                                           friction; neither was ever tested
+#
+# WHAT THE LOWER ATTITUDE GAINS COST, stated so it is not a surprise: at
+# kp_roll = 10 a standing roll residual of ~1.2 deg does not get corrected --
+# the loop commands 0.21 Nm of the 6.42 available.  That is the trade the
+# hardware chose.  Raising it is a --kp-att experiment, not an edit here, until
+# a run completes at the higher value and this table can name it.
+KP_Z = 300.0                 # N/m
+KD_Z = 40.0                  # Ns/m
+KP_ROLL = 10.0               # Nm/rad
+KD_ROLL = 0.5                # Nms/rad
+KP_PITCH = 10.0
+KD_PITCH = 0.5
+KD_X = 0.0                   # Ns/m   damping-only axes, and never yet damped
+KD_Y = 0.0
+KD_YAW = 0.0                 # Nms/rad
 KD_JOINT = 0.15              # Nms/rad, stance joint damping inside the law
 
 # ===========================================================================
@@ -236,14 +307,33 @@ IMU_BELOW_TRUNK_ORIGIN_M = 0.038
 # With kp_roll = 120 a 0.5 deg offset is a 1.05 Nm standing roll moment, 16% of
 # this stance's 6.4 Nm roll capacity, spent holding the robot off true level.
 #
-# LEFT AT ZERO ON PURPOSE.  Those five numbers are (mount tilt + floor slope)
-# and one measurement cannot separate them -- baking in the sum would tilt the
-# robot by the floor's share on every other floor.  Read the pair the runner
-# prints in WAIT, then pass --setpoint-roll/--setpoint-pitch.  To split them:
-# re-read after rotating the robot 180 deg on the same spot; half the sum is
-# the mount, half the difference is the floor.
-SETPOINT_ROLL_DEG = 0.0
-SETPOINT_PITCH_DEG = 0.0
+# THEY ARE NOW SPLIT, so the mount's share is a default rather than a flag.
+# The five numbers above are (mount tilt + floor slope + encoder zeros + real
+# lean) and no crouch reading can separate them.  On 2026-08-18 the trunk was
+# set on the floor and LEVELLED against a spirit level -- with the trunk known
+# level every other term is zero by construction, so what the AHRS still reads
+# is the mount alone:
+#
+#     roll  -0.29 deg     pitch  +0.12 deg          <- mount tilt, measured
+#
+# That is 0.61 Nm of standing roll moment at kp_roll = 120, 9% of the 6.4 Nm
+# roll capacity.  Small -- and the point of baking it in is not the 9%, it is
+# that everything LEFT in a crouch reading is now a real, physical tilt the
+# attitude loop is supposed to remove, instead of an unknown mixture.
+#
+# WHAT REMAINS IS NOT SMALL, AND IS NOT A SETPOINT'S JOB.  The 2026-08-17 HOLD
+# logs (attitude gains zeroed, full force) sat at roll -0.99 and -2.04 deg in
+# two runs of the same rig.  Take the mount out and that is 0.7-1.75 deg of
+# real lean under load, varying run to run -- so it cannot be calibrated away,
+# and a setpoint that hid it would be hiding the loop's actual job.  At
+# kp_roll = 120 a 1.75 deg lean is 3.67 Nm, 57% of capacity, leaving 1.3 deg
+# before the grasp map clamps; see KP_ROLL.
+#
+# The floor's own share is still unmeasured and still does not belong here:
+# re-read in the crouch on each floor, and rp:d (ahrs minus the foot plane)
+# is the part a setpoint must never absorb.
+SETPOINT_ROLL_DEG = -0.29
+SETPOINT_PITCH_DEG = 0.12
 
 # WHERE qd COMES FROM.  Not the driver's speed field -- the ENCODER, finite
 # differenced, exactly as stand_dog5_recorded_hw.EncoderVelocity does it.
