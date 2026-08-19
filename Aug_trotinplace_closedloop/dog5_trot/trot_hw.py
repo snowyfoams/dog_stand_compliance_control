@@ -39,8 +39,9 @@ THE FIVE FILES, AND WHY THE SPLIT IS WHERE IT IS
                         place a gain touches the trunk.
     force_totorque      wrench -> per-foot GRF -> 12 joint torques.  Pure
                         transmission; no trunk feedback at all.
-    stand_torque_Mode   this file: when to do which, at what rate, and every
-                        way to stop.
+    stand_torque_Mode   when to do which, at what rate, and every way to
+                        stop.  THIS FILE is that runner plus the TROT stage,
+                        plus dog5_trot.gait and the body-frame swing arc.
 
 ONE THREAD, WITH THE MODEL SUB-SAMPLED
     MEASURED on this Pi, not assumed: the per-sweep work (impedance + gate) is
@@ -127,26 +128,50 @@ RUN -- supported robot, hand on SPACE
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
     cd /home/robot01/Documents/can_motor_control/dog_stand_compliance_control/Aug_trotinplace_closedloop
 
-    $V august_week2/stand_torque_Mode.py --self-test     # offline, no hardware
+    $V dog5_trot/trot_hw.py --self-test      # offline, no hardware
+    $V dog5_trot/gait.py    --self-test      # the contact clock on its own
+    $V dog5_trot/swing.py   --self-test      # the swing arc on its own
+    THIS FILE'S OWN --self-test IS THE WEEK-2 STAND SET, unchanged: it covers
+    CROUCH/WAIT/RISE/HOLD and asserts nothing about TROT.  The trot is tested
+    a module at a time, by the two above.
+
+    THE STAND COMES FIRST, and its procedure is week 2's because the code is:
+    do these on THIS runner, not on stand_torque_Mode.py, so that what you
+    tuned is what then trots.  Do not press T until HOLD is quiet.
 
     # first run: low cap, full force.  Do NOT start at --force-frac 0 with the
     # feet on the floor -- that removes the only term holding the trunk up.
-    sudo HOME=$HOME chrt -f 50 $V august_week2/stand_torque_Mode.py --tau-max 1.0
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py --tau-max 1.0
 
     # measure the rig's resting attitude: crouch, read the rp: block, X out.
     # Then feed it back.  Do this BEFORE any run with attitude gains live.
-    sudo HOME=$HOME chrt -f 50 $V august_week2/stand_torque_Mode.py --open-loop
-    sudo HOME=$HOME chrt -f 50 $V august_week2/stand_torque_Mode.py \
-        --setpoint-roll -0.50 --setpoint-pitch 0.45 --log live.npz
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py --open-loop
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py \
+        --setpoint-roll -0.50 --setpoint-pitch 0.45 --log hold.npz
 
-    # the A/B that makes it a measurement rather than a demo.  Push the trunk
-    # the SAME way in each; the difference between the logs is the loop.
+    # the A/B that makes the STAND a measurement rather than a demo.  Push the
+    # trunk the SAME way in each; the difference between the logs is the loop.
     # Pass the SAME setpoint to both halves or the ablation is confounded.
-    sudo HOME=$HOME chrt -f 50 $V august_week2/stand_torque_Mode.py --log live.npz
-    sudo HOME=$HOME chrt -f 50 $V august_week2/stand_torque_Mode.py \
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py --log live.npz
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py \
         --kp-att 0 --kd-att 0 --log ablate.npz
 
-Keys: ENTER = rise / re-engage from limp, SPACE = LIMP, P = park, X = stop.
+    # only then the trot: ENTER, wait for HOLD, T.  The three gait numbers
+    # default to dog5_trot/config.py (0.40 s, 0.60 duty, 40 mm apex); the
+    # flags exist to move ONE of them at a time, and duty 0.5 removes the
+    # double support the contact ramp hands the load over in.
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py \
+        --setpoint-roll -0.50 --setpoint-pitch 0.45 --log trot.npz
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py \
+        --period 0.50 --swing-height 0.02 --log trot_slow.npz
+
+Keys: ENTER = rise / re-engage from limp, T = trot (FROM HOLD ONLY),
+      SPACE = LIMP, P = park (FROM HOLD ONLY), X = stop.
+      P IS DELIBERATELY DEAD ONCE TROTTING, and SPACE does not re-open it --
+      LIMP does not leave the TROT stage.  0xA4 mid-swing is a lurch onto a
+      diagonal, so the way out of a trot is X, and X alone cuts torque at
+      height.  RUN THE TROT WITH --park-on-stop if you want X to put it down
+      in position mode instead of handing you the weight.
 """
 from __future__ import annotations
 
@@ -653,8 +678,13 @@ def run(args):
             foot_xy = [st.leg_frames(LEGS[i], Q_CROUCH[3*i:3*i+3])[0][:2]
                        for i in range(4)]
 
-            gait = gait_mod.TrotGait(args.period, args.duty,
-                                     tcfg.PHASE_OFFSET)
+            # HALF A CYCLE IS THE WHOLE SWAP.  Derived from PHASE_OFFSET
+            # rather than written out, so retuning that array cannot leave the
+            # two choices disagreeing about which legs are a diagonal.
+            offsets = np.mod(tcfg.PHASE_OFFSET
+                             + (0.5 if args.lead_diagonal == "fl-rr" else 0.0),
+                             1.0)
+            gait = gait_mod.TrotGait(args.period, args.duty, offsets)
             planted = ALL4
             stage, t0 = "WAIT", time.perf_counter()
             z_crouch = None
@@ -732,7 +762,8 @@ def run(args):
                         stage, t0 = "TROT", now
                         gait.reset(now)
                         print(f"[trot] TROT: {gait}.  Feet are leaving the "
-                              f"ground.  SPACE limps, P parks.")
+                              f"ground.  SPACE limps, X stops.  P is dead "
+                              f"until you are back in HOLD.")
 
                     if stage == "RISE" and now - t0 >= P.T_RISE:
                         stage, t0 = "HOLD", now
@@ -849,7 +880,7 @@ def run(args):
                     if state is not None and act:
                         tilt = max(abs(np.degrees(est.roll)),
                                    abs(np.degrees(est.pitch)))
-                        if tilt > P.TILT_STOP_DEG:
+                        if args.tilt_stop > 0 and tilt > args.tilt_stop:
                             stop = f"tilt {tilt:.1f} deg"
                             break
 
@@ -1373,6 +1404,29 @@ def main():
                          "nowhere to hand the load over")
     ap.add_argument("--swing-height", type=float, default=tcfg.SWING_HEIGHT,
                     help="swing apex above the resting foot site (m)")
+    ap.add_argument("--lead-diagonal", choices=("fr-rl", "fl-rr"),
+                    default="fr-rl",
+                    help="which diagonal leaves the ground FIRST after T.  "
+                         "fr-rl is config.PHASE_OFFSET as written and is what "
+                         "every t*.npz was logged with; fl-rr adds half a "
+                         "cycle to every offset, which swaps the pair without "
+                         "touching period, duty or the ramp.  THIS IS THE A/B "
+                         "FOR THE ROLL: t1/t2/t5 all rolled the SAME way "
+                         "(-6 -> -12 deg), so if the sign follows the lead "
+                         "diagonal the roll is the handover, and if it does "
+                         "not it is a fixed bias -- CoM, mount or leg zeros.")
+    ap.add_argument("--tilt-stop", type=float, default=P.TILT_STOP_DEG,
+                    help="attitude that stops the run (deg).  0 DISABLES IT.  "
+                         "The default is params.TILT_STOP_DEG and belongs "
+                         "there; this flag is for a diagnostic run only.  "
+                         "MEASURED 2026-08-18 (t1/t3/t5.npz): every trip was "
+                         "a real roll -- 2.2-2.9 rad/s on the gyro, growing "
+                         "over two gait cycles -- not an unfiltered spike.  "
+                         "t2.npz is the run where it did NOT fire: the trunk "
+                         "went 149 -> -23 mm and lay on the floor at 2x "
+                         "weight for 7 s, because a robot on its belly reads "
+                         "level.  DISABLING THIS REMOVES THE ONLY TRIP THAT "
+                         "COVERS TROT -- the load check is gated to HOLD.")
     ap.add_argument("--crouch-dps", type=float, default=cap.MAX_DPS)
     ap.add_argument("--park-on-stop", action="store_true",
                     help="park in position mode after ANY stop, not just P")
