@@ -37,6 +37,54 @@ simulator:
 So the port of robot.py is this file's frame conversions and nothing else.
 
 =============================================================================
+THREE OF THE THIRTEEN STATES DO NOT EXIST ON THIS ROBOT
+=============================================================================
+The SRB state is [rpy, p, omega, v, g].  feedback_estimator publishes ten of
+those thirteen and REFUSES to invent the other three -- its own comment on the
+position it returns is "x/y stay at zero rather than pretending to an origin
+that nothing observes", and the C it builds is C_from_rp, which has no yaw in
+it at all because the only yaw available is a magnetometer's, sitting next to
+twelve motors and a steel frame.
+
+    roll, pitch   AHRS, this rig's measured mount tilt already subtracted
+    yaw           DOES NOT EXIST
+    x, y          DO NOT EXIST
+    z             FK over the planted feet; drift-free, ruler-checkable
+    omega (3)     the gyro, all three axes including yaw RATE
+    v (3)         leg odometry, all three axes
+    g             a constant
+
+WHAT RE-ANCHORING BUYS.  Setting x = y = yaw = 0 at every solve is not a
+placeholder for a number we wish we had; it redefines the frame so that the
+three are TRUE.  The reference then integrates the command away from that
+zero, so the cost contains the integral of (v - v_cmd) over the horizon --
+real position feedback, over 0.4 s, and it is what stops an in-place trot
+accelerating away.  It is also why this stack needs no port of the
+simulation's station-keeping outer loop.
+
+WHAT IT DOES NOT BUY, AND THIS IS THE HONEST LIMIT OF THE WHOLE TRACK.  The
+simulation integrates p_des and yaw_des in ABSOLUTE world coordinates and
+pushes back on drift that has already happened (KP_POS 1.0, capped at
+0.15 m/s).  Nothing here can: drift that has happened is invisible, by
+construction.  So
+
+    the robot wanders and slowly turns -- bounded within a gait cycle,
+    unbounded over minutes;
+    and leg odometry assumes planted feet do not slip, so a slipping foot
+    reads as real velocity and the robot drifts the way it slipped and never
+    finds out.
+
+Both are consequences of having no absolute pose, not of this implementation.
+CONTROL_ROADMAP Phase 5 says the same thing as a design constraint: "x/y and
+yaw enter only as horizon-relative references (drift-safe by construction)".
+
+AND THE PREMISE UNDER ALL OF IT: NO FLIGHT PHASE.  Leg odometry is an
+algebraic read off planted feet.  At duty 0.6 a trot always has two down and
+v is determined at every instant (the runner sets min_planted = 2 for exactly
+this).  A gait with a flight phase is where feedback_estimator's own header
+says an EKF stops being optional -- and it would take the yaw and x/y with it.
+
+=============================================================================
 THE FIVE FRAME CONVERSIONS, ALL OF THEM HERE, NAMED RATHER THAN INLINED
 =============================================================================
 `C` is the estimator's INERTIAL->BODY rotation, so C^T takes a body vector into
@@ -211,13 +259,20 @@ def mpc_state(state, kine, C_ib):
     # of the loop acts on, which a second copy read from a different attribute
     # would not be guaranteed to stay.
     roll, pitch = dm.attitude_rp(C_ib)
-    x = np.zeros(N_STATE)
     x[0] = roll
     x[1] = pitch
     x[2] = 0.0                                   # no yaw, by construction
     x[3] = x[4] = 0.0                            # no absolute x/y, likewise
     x[5] = com_height(state, kine, C_ib)
     x[6:9] = C_ib.T @ np.asarray(state["w"], dtype=float)   # body -> world
+    # v IS THE TRUNK ORIGIN'S, AND THE SRB WANTS THE CoM'S.  Leg odometry
+    # solves for the point the foot vectors are measured from, which is the FK
+    # trunk origin; the two differ by omega x (C^T com_body).  With the CoM
+    # 15 mm off the trunk origin and the 0.3 rad/s a trot in place turns, that
+    # is under 5 mm/s -- an order below what the estimator's own 5 Hz filter
+    # and 12 ms hold already cost this signal, so it is dropped rather than
+    # computed.  It is NOT negligible for a trot that turns hard, and it is
+    # the same term mpc_swing drops from the swing foot velocity.
     x[9:12] = np.asarray(state["v"], dtype=float)           # already world
     x[12] = C.GRAVITY
     return x
