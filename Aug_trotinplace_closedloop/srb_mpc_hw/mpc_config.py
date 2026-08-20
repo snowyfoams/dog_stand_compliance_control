@@ -378,6 +378,21 @@ WZ_CMD_MAX = 0.30                    # rad/s.  The abduction limit caps lateral
 # J^-T with each leg's own weight removed -- the same quantity that has to sum
 # to 57 N in the exit report.  A foot carrying more than CONTACT_FZ_ON of it
 # is standing on something.
+# AND IT IS OFF UNTIL SOMEBODY MEASURES THE DETECTOR ON THIS ROBOT.
+# The inversion that reads the foot load is the exact inverse of the map the
+# swing controller commands through, so on a swinging leg it reads back that
+# controller's own force: -12 N of downward swing command comes back as +9 N of
+# "ground reaction" with the foot in the air, and the sign is positive exactly
+# in the late-swing window promotion looks at.  mpc_gait subtracts the command,
+# which removes the dominant term and leaves the current loop's ~24% tracking
+# error -- better, and still not measured with legs in the air.
+#
+# A false promotion is worse than no promotion: the gait plants an airborne
+# foot, the MPC allocates it force, and that share of the weight is pushed into
+# nothing.  Off, the trot runs on the clock alone -- which is what
+# dog5_trot/trot_hw already does on this robot.
+# ContactAwareGait names the one measurement that earns --promote.
+PROMOTE_ENABLED = False
 PROMOTE_AFTER = 0.5          # only a LATE-swing contact promotes.  An early
                              # one is the foot still leaving the ground.
 CONTACT_FZ_ON = 8.0          # N.  0.55 of an even four-way share (14.3 N),

@@ -276,6 +276,15 @@ def run(args):
           f"(stance {args.period*args.duty*1e3:.0f} ms, swing "
           f"{args.period*(1-args.duty)*1e3:.0f} ms), swing height "
           f"{args.swing_height*1e3:.0f} mm")
+    # A multi-line expression INSIDE an f-string is 3.12+ only, and the venv
+    # this ships to is not this box's interpreter.  Built outside, then printed.
+    promo = ("ON (--promote)" if args.promote else
+             "OFF -- the clock alone, as dog5_trot/trot_hw trots today")
+    print(f"  measured-contact promotion: {promo}.")
+    print("  The detector runs and its fz is logged either way; see "
+          "mpc_gait for what")
+    print("  it reads off a foot in the AIR, and the one measurement that "
+          "earns --promote.")
     # The roll axis saturates first, and on this rig it saturates EARLY.
     Mx_max, My_max = ft.moment_capacity(
         [st.leg_frames(LEGS[i], Q_CROUCH[3*i:3*i+3])[0] for i in range(4)],
@@ -349,7 +358,8 @@ def run(args):
 
             stand_gait = mpc_gait.StandGait(args.period, args.duty)
             trot_gait = mpc_gait.ContactAwareGait(
-                mpc_gait.TrotGait(args.period, args.duty, C.PHASE_OFFSET))
+                mpc_gait.TrotGait(args.period, args.duty, C.PHASE_OFFSET),
+                enabled=args.promote)
             controller = ctl.MpcController(stand_gait,
                                            force_frac=args.force_frac)
             controller.swing.step_height = args.swing_height
@@ -852,6 +862,17 @@ def main():
                          "ZERO double support; the contact ramp then has "
                          "nowhere to hand the load over")
     ap.add_argument("--swing-height", type=float, default=C.SWING_HEIGHT)
+    ap.add_argument("--promote", action="store_true",
+                    help="act on the MEASURED contact: promote a late-swing "
+                         "touchdown to stance.  OFF by default because the "
+                         "detector reads back the swing controller's own "
+                         "command (+9 N of phantom ground reaction off a foot "
+                         "in the air, measured) and nobody has yet checked "
+                         "what is left after the command is subtracted, with "
+                         "this robot's legs actually swinging.  "
+                         "mpc_gait.ContactAwareGait names the one measurement "
+                         "that earns this flag; the detector's fz is in the "
+                         "--log npz either way")
     # -- the rig -------------------------------------------------------------
     ap.add_argument("--setpoint-roll", type=float, default=P.SETPOINT_ROLL_DEG,
                     help="resting attitude of THIS rig in deg, subtracted from "

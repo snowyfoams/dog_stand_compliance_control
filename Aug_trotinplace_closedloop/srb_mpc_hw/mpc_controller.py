@@ -326,6 +326,11 @@ class MpcController:
         self.foot_xy = None                    # pinned at the crouch
         self.q_ref = np.zeros(C.N_JOINTS)
         self._was_contact = np.ones(C.N_LEGS, dtype=bool)
+        # The SWING torque this object commanded last model tick, zero on
+        # stance legs.  It is subtracted from the next tick's measurement,
+        # because tau_meas reports what was sent 3 sweeps ago and 3 sweeps is
+        # exactly one MODEL_EVERY -- see mpc_gait.MeasuredFootContact.
+        self._tau_swing_prev = np.zeros(C.N_JOINTS)
         self._t_prev = None
         self.last = {}
 
@@ -337,6 +342,7 @@ class MpcController:
         self.touch.reset()
         self.vlp.reset(state["v"])
         self.q_ref = np.asarray(q, dtype=float).reshape(C.N_JOINTS).copy()
+        self._tau_swing_prev = np.zeros(C.N_JOINTS)
         self.foot_xy = np.asarray(foot_xy, dtype=float).reshape(C.N_LEGS, 2).copy()
         self.swing.reset(t, np.array([C_ib.T @ kine.foot_body[i]
                                       for i in range(C.N_LEGS)]))
@@ -396,7 +402,8 @@ class MpcController:
         self._t_prev = t
 
         # -- what the floor says, and what the clock says ------------------
-        meas, fz_meas = self.touch.measure(kine.J, tau_meas, kine.tau_grav, C_ib)
+        meas, fz_meas = self.touch.measure(kine.J, tau_meas, kine.tau_grav,
+                                           C_ib, self._tau_swing_prev)
         contact, replan = self.gait.update(t, meas)
         w_now = self.gait.contact_weight(t)
 
@@ -455,6 +462,7 @@ class MpcController:
         # was solidly under it, and the total commanded support fell to 33 N on
         # a 57 N robot.  See the table in the file header.
         f_plan = plan_force(plan, t)
+        tau_swing = np.zeros(C.N_JOINTS)
         f_now = clamp_feasible(f_plan, contact.astype(float))
         # ...and the load the clamp took off an airborne foot goes to
         # the feet that are down, rather than off the robot entirely.
@@ -472,6 +480,8 @@ class MpcController:
                 tau[sl] = mpc_swing.swing_torque(
                     kine.J[i], kine.foot_body[i], qd[sl],
                     p_des[i], v_des[i], C_ib)
+                tau_swing[sl] = tau[sl]        # remembered for the next tick's
+                                               # contact measurement
             # LEG GRAVITY GOES ON BOTH BRANCHES.  A stance leg needs it because
             # -J^T f models a massless leg and ours are 55% of the robot; a
             # swing leg needs it because nothing else is holding the limb up.
@@ -479,6 +489,7 @@ class MpcController:
             # its own links.
             tau[sl] += kine.tau_grav[sl]
 
+        self._tau_swing_prev = tau_swing
         self.last = {
             "contact": contact, "weight": w_now, "measured": meas,
             "fz_meas": fz_meas, "f_applied": f_now, "p_des": p_des,

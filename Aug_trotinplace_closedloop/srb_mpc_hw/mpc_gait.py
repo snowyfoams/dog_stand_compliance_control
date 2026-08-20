@@ -97,6 +97,70 @@ class MeasuredFootContact:
     time: CONTACT_FZ_ON to latch on, CONTACT_FZ_OFF to let go.  Every change
     of the contact set forces the MPC to replan, so a boundary that chatters
     is a solver that never warm starts.
+
+    =======================================================================
+    ON A SWING LEG THIS READS BACK THE SWING CONTROLLER'S OWN COMMAND
+    =======================================================================
+    The runner sends a swinging leg  tau = J^T f_swing + tau_grav.  Take
+    tau_grav off and invert through J^-T and you get -f_swing exactly: the two
+    operations are inverses, and there is no ground anywhere near the foot.
+    With the actuator gain params records (tau_meas/tau_cmd = 0.76), measured:
+
+        swing command       detector reads      contact at 8 N?
+        -5 N  (downward)        +3.80 N              no
+        -8 N                    +6.08 N              no
+        -12 N                   +9.12 N              YES, foot in the air
+
+    AND THE SIGN IS THE WRONG WAY ROUND FOR US.  Late in the swing the foot
+    must be driven DOWN -- leg gravity is already fed forward, so the impedance
+    does that work -- which makes the phantom force POSITIVE, i.e. it looks
+    like ground reaction, in exactly the window PROMOTE_AFTER opens.
+
+    A 12 N downward command is a ~45 mm tracking error at KP_SWING = 200 N/m,
+    and this arc produces errors of that order: following it exactly would need
+    482 rad/s^2 at the joint, which against the 10:1 reflected rotor is 4-7 Nm
+    -- past the 1-3 Nm the gate allows.  The leg CANNOT track the reference, so
+    the error is not an anomaly, it is the operating point.
+
+    SO tau_cmd IS SUBTRACTED, and it is the previous model tick's swing torque
+    because that is what tau_meas is reporting: params.LOOP_DELAY_S measures
+    +3 sweeps of transport, and 3 sweeps is exactly one MODEL_EVERY.  What that
+    leaves:
+
+        swing command   raw      minus cmd    minus cmd, at the 0.76 gain
+        -5 N            +5.00       0.00              -1.20
+        -8 N            +8.00       0.00              -1.92
+        -12 N          +12.00       0.00              -2.88
+        -20 N          +20.00       0.00              -4.80
+
+    and a real 14.26 N ground reaction under a stance foot still reads 14.26 N
+    and latches, because a stance leg's tau_cmd is zero in this vector.
+
+    THE RESIDUAL'S SIGN IS THE SAFE ONE, AND THAT IS WORTH SAYING.  The
+    actuator delivers LESS than it is asked for, so subtracting the whole
+    command over-subtracts and the leftover is NEGATIVE.  The detector
+    therefore under-reports contact rather than over-reporting it -- it can
+    miss a touchdown carrying under ~5 N, and it will not invent one.  For a
+    layer whose dangerous failure is the false positive, biasing late is the
+    right way to be wrong.  (It is also the direction a state estimator wants,
+    and the opposite of what promotion would prefer.)
+
+    WHAT IS STILL NOT IN IT: the leg's own inertia.  The inversion is
+    quasi-static, and the reflected rotor -- 0.0085 kgm^2 of the 0.0088-0.0147
+    params records per joint -- dominates M(q) on this robot, so the missing
+    term is about  J_diag * qdd  with qdd differenced from the encoder.  That
+    is cheap and it is the obvious next term; CONTROL_ROADMAP Phase 4 already
+    names swing-leg inertia compensation as work.  It is not written here
+    because nobody has yet measured how much of the residual it accounts for
+    with this robot's legs actually in the air.
+
+    AND THE SCALE IS ONLY AS GOOD AS iq -> tau.  Every number above is a
+    newton derived from a current.  CONTROL_ROADMAP calls torque fidelity "the
+    big unknown of Phase 2" and budgets a per-joint calibration that week 2
+    then dropped; a threshold in newtons inherits all of that.  The exit
+    report's foot-load sum against 57 N is the only end-to-end check there is.
+
+    WHICH IS WHY PROMOTION IS OFF BY DEFAULT.  See ContactAwareGait.
     """
 
     def __init__(self, fz_on=C.CONTACT_FZ_ON, fz_off=C.CONTACT_FZ_OFF):
@@ -109,18 +173,25 @@ class MeasuredFootContact:
         self.state = np.zeros(4, dtype=bool)
         self.fz = np.zeros(4)
 
-    def measure(self, J, tau_meas, tau_grav, C_ib):
+    def measure(self, J, tau_meas, tau_grav, C_ib, tau_cmd=None):
+        """See the class docstring.  `tau_cmd` is the SWING command to
+        subtract, zero on stance legs; without it this reads back the swing
+        controller's own force."""
         tau_meas = np.asarray(tau_meas, dtype=float).reshape(C.N_JOINTS)
         tau_grav = np.asarray(tau_grav, dtype=float).reshape(C.N_JOINTS)
         C_ib = np.asarray(C_ib, dtype=float).reshape(3, 3)
+        tau_cmd = (np.zeros(C.N_JOINTS) if tau_cmd is None
+                   else np.asarray(tau_cmd, dtype=float).reshape(C.N_JOINTS))
         for i in range(C.N_LEGS):
             sl = C.JOINT_INDEX[i]
             # The foot pushes DOWN on the ground with -f, so tau = -J^T f and
             # the GRF is the solution of J^T f = -(tau_meas - tau_grav).  Same
             # sign convention as dog5_statics.stance_torque, which is where
-            # the commanded direction comes from.
+            # the commanded direction comes from.  tau_cmd comes off first --
+            # see the class docstring for the 6 N of phantom contact it is.
             try:
-                f_body = np.linalg.solve(J[i].T, -(tau_meas[sl] - tau_grav[sl]))
+                f_body = np.linalg.solve(
+                    J[i].T, -(tau_meas[sl] - tau_grav[sl] - tau_cmd[sl]))
             except np.linalg.LinAlgError:
                 self.fz[i] = np.nan
                 self.state[i] = False           # fail-safe: no promotion
@@ -154,6 +225,25 @@ class ContactAwareGait:
     Mixing the two inside the schedule would make the plan depend on the thing
     the plan is supposed to drive.
 
+    PROMOTION IS OFF BY DEFAULT ON THIS ROBOT, AND THAT IS NOT TIMIDITY.
+    MeasuredFootContact's own docstring shows the detector reading +9 N of
+    phantom ground reaction off a foot in the air, in exactly this window.
+    Subtracting the swing command removes the dominant term but leaves the
+    current loop's ~24% tracking error, and nobody has yet measured what that
+    is worth with this robot's legs actually swinging.  A FALSE promotion is
+    not a missed optimisation: the gait plants a foot that is airborne, the MPC
+    allocates it force, and that share of the weight is pushed into nothing
+    while the other legs carry less.
+
+    THE MEASUREMENT THAT TURNS IT ON, and it needs no new code:
+        run to HOLD, lift one foot clear of the floor BY HAND, and watch the
+        detector's fz for that leg in the --log npz across a full swing arc.
+        If it stays under CONTACT_FZ_OFF for the whole arc, the detector is
+        clean and --promote is earned.  If it does not, the threshold or the
+        swing-inertia term is what needs work -- not the gait.
+    Without it, this stack trots on the clock alone, which is what
+    dog5_trot/trot_hw already does.
+
     A leg is promoted when all three hold:
         the schedule says swing
         the swing is LATE           (phase > promote_after)
@@ -173,8 +263,9 @@ class ContactAwareGait:
     """
 
     def __init__(self, gait, promote_after=C.PROMOTE_AFTER,
-                 ramp=None):
+                 ramp=None, enabled=C.PROMOTE_ENABLED):
         self.gait = gait
+        self.enabled = bool(enabled)
         self.promote_after = float(promote_after)
         # the ramp duration in SECONDS, taken from the schedule's own fraction
         # of stance so the two cannot drift apart
@@ -200,6 +291,11 @@ class ContactAwareGait:
         old set is wrong about which foot may push.
         """
         measured = np.asarray(measured, dtype=bool).reshape(4)
+        if not self.enabled:
+            # OFF is the same schedule dog5_trot/trot_hw already trots on: the
+            # clock, unmodified.  The measurement is still taken and still
+            # logged; it is simply not acted on.
+            return self.gait.contact(t), False
         sched = self.gait.contact(t)
         sp = self.gait.swing_phase(t)
         prev = self.early.copy()
