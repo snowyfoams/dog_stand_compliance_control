@@ -11,7 +11,7 @@ THIS FILE IS august_week2/stand_torque_Mode.py WITH ONE STAGE ADDED.
     works is how the last attempt ended up unable to rise at all.
 
     What is new is TROT, and only TROT:
-        dog5_trot.gait   the contact clock: which diagonal is down, and the
+        dog5_trot_quasi_static_model.gait   the contact clock: which diagonal is down, and the
                          weight ramp that hands the load over
         a swing arc      in the BODY frame, because this trots IN PLACE: the
                          foot's x/y target is its own crouch value, exactly
@@ -41,7 +41,7 @@ THE FIVE FILES, AND WHY THE SPLIT IS WHERE IT IS
                         transmission; no trunk feedback at all.
     stand_torque_Mode   when to do which, at what rate, and every way to
                         stop.  THIS FILE is that runner plus the TROT stage,
-                        plus dog5_trot.gait and the body-frame swing arc.
+                        plus dog5_trot_quasi_static_model.gait and the body-frame swing arc.
 
 ONE THREAD, WITH THE MODEL SUB-SAMPLED
     MEASURED on this Pi, not assumed: the per-sweep work (impedance + gate) is
@@ -128,12 +128,14 @@ RUN -- supported robot, hand on SPACE
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
     cd /home/robot01/Documents/can_motor_control/dog_stand_compliance_control/Aug_trotinplace_closedloop
 
-    $V dog5_trot/trot_hw.py --self-test      # offline, no hardware
-    $V dog5_trot/gait.py    --self-test      # the contact clock on its own
-    $V dog5_trot/swing.py   --self-test      # the swing arc on its own
-    THIS FILE'S OWN --self-test IS THE WEEK-2 STAND SET, unchanged: it covers
-    CROUCH/WAIT/RISE/HOLD and asserts nothing about TROT.  The trot is tested
-    a module at a time, by the two above.
+    $V dog5_trot_quasi_static_model/trot_hw.py --self-test      # offline, no hardware
+    $V dog5_trot_quasi_static_model/gait.py    --self-test      # the contact clock on its own
+    $V dog5_trot_quasi_static_model/swing.py   --self-test      # the swing arc on its own
+    THIS FILE'S OWN --self-test IS THE WEEK-2 STAND SET, PLUS THE THREE
+    THINGS THIS FILE OWNS RATHER THAN dog5_trot_quasi_static_model/: the sweep-rate torque map
+    (held to force_totorque's own answer, exactly), the swing arc's horizontal
+    half, and the Raibert step that plans it.  The gait clock and the
+    world-frame swing are still tested a module at a time, by the two above.
 
     THE STAND COMES FIRST, and its procedure is week 2's because the code is:
     do these on THIS runner, not on stand_torque_Mode.py, so that what you
@@ -141,29 +143,47 @@ RUN -- supported robot, hand on SPACE
 
     # first run: low cap, full force.  Do NOT start at --force-frac 0 with the
     # feet on the floor -- that removes the only term holding the trunk up.
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py --tau-max 1.0
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py --tau-max 1.0
 
     # measure the rig's resting attitude: crouch, read the rp: block, X out.
     # Then feed it back.  Do this BEFORE any run with attitude gains live.
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py --open-loop
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py \
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py --open-loop
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
         --setpoint-roll -0.50 --setpoint-pitch 0.45 --log hold.npz
 
     # the A/B that makes the STAND a measurement rather than a demo.  Push the
     # trunk the SAME way in each; the difference between the logs is the loop.
     # Pass the SAME setpoint to both halves or the ablation is confounded.
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py --log live.npz
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py \
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py --log live.npz
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
         --kp-att 0 --kd-att 0 --log ablate.npz
 
     # only then the trot: ENTER, wait for HOLD, T.  The three gait numbers
-    # default to dog5_trot/config.py (0.40 s, 0.60 duty, 40 mm apex); the
+    # default to dog5_trot_quasi_static_model/config.py (0.40 s, 0.60 duty, 40 mm apex); the
     # flags exist to move ONE of them at a time, and duty 0.5 removes the
     # double support the contact ramp hands the load over in.
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py \
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
         --setpoint-roll -0.50 --setpoint-pitch 0.45 --log trot.npz
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot/trot_hw.py \
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
         --period 0.50 --swing-height 0.02 --log trot_slow.npz
+
+    # FOOT PLACEMENT: the only horizontal feedback this runner has, and it is
+    # OFF unless --raibert is passed.  t1..t8 all drifted because nothing was
+    # acting on x/y at all -- the wrench has no kp there (no EKF, so no origin
+    # for a spring), and every one of them logged kd_xy = 0, i.e. W[0], W[1]
+    # and W[5] identically zero.  Three runs, same floor, same session, or the
+    # comparison is between two carpets:
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py --log p_off.npz
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
+        --raibert 0 --log p_sym.npz          # symmetry term only, kv = 0
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
+        --raibert 0.03 --log p_kv03.npz
+    # then read step_xy against v in the CSV.  IF step_xy SITS ON THE CLAMP
+    # the banner prints, the height is the limit and not the gain: at the
+    # default 152 mm there are 10.2 mm of reach room, which corrects 0.068 m/s
+    # of drift and no more.  --height 0.140 buys 23.6 mm and 0.157 m/s.
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
+        --raibert 0.03 --height 0.140 --log p_low.npz
 
 Keys: ENTER = rise / re-engage from limp, T = trot (FROM HOLD ONLY),
       SPACE = LIMP, P = park (FROM HOLD ONLY), X = stop.
@@ -186,7 +206,7 @@ import numpy as np
 
 sys.setswitchinterval(0.0005)
 
-_HERE = os.path.dirname(os.path.abspath(__file__))          # dog5_trot/
+_HERE = os.path.dirname(os.path.abspath(__file__))          # dog5_trot_quasi_static_model/
 _AUG = os.path.dirname(_HERE)                               # Aug_trotinplace_...
 _WEEK2 = os.path.join(_AUG, "august_week2")
 _ROOT = os.path.dirname(_AUG)
@@ -194,7 +214,7 @@ _REPO = os.path.dirname(_ROOT)
 # _HERE IS DELIBERATELY NOT ON THE PATH.  This directory holds a config.py and
 # motorbus.py imports the repo's top-level one; putting ours in front breaks
 # the CAN layer with `module 'config' has no attribute 'encoder_gain'`.  The
-# week-2 modules this file is built on live in _WEEK2, and dog5_trot is
+# week-2 modules this file is built on live in _WEEK2, and dog5_trot_quasi_static_model is
 # reached as a PACKAGE from _AUG.
 for _p in (_WEEK2, _AUG, os.path.join(_AUG, "torque_mode_control"),
            os.path.join(_ROOT, "dog5_description"), _REPO,
@@ -232,17 +252,20 @@ _add_fdilink_root()
 import motorbus                                            # noqa: E402
 import stand_dog5_hw as base                               # noqa: E402
 import dog5_statics as st                                  # noqa: E402
-import params as P                                         # noqa: E402
+# params.py IS NO LONGER THIS RUNNER'S TABLE.  dog5_trot_quasi_static_model/config.py is.
+# It is imported only so cfg.assert_shared() can hold it to the constants
+# the week-2 modules read INTERNALLY and no argument can override.
+import params as _week2_params                             # noqa: E402
 import crouch_and_park as cap                              # noqa: E402
 
-from dog5_trot import gait as gait_mod                     # noqa: E402
-from dog5_trot import config as tcfg                       # noqa: E402
+from dog5_trot_quasi_static_model import gait as gait_mod                     # noqa: E402
+from dog5_trot_quasi_static_model import config as cfg                        # noqa: E402
 import feedback_estimator as fe                            # noqa: E402
 import Dynamic_Model as dm                                 # noqa: E402
 import force_totorque as ft                                # noqa: E402
 
 MOTOR_IDS = base.MOTOR_IDS
-N_JOINTS = P.N_JOINTS
+N_JOINTS = cfg.N_JOINTS
 LEGS = ft.LEGS
 Q_CROUCH = cap.Q_CROUCH
 ALL4 = np.ones(4, dtype=bool)
@@ -273,18 +296,18 @@ class JointImpedance:
     when it was 68% of it, and shook the robot at 9-12 Hz.
     """
 
-    def __init__(self, kp=P.KP_IMP, kd=P.KD_IMP):
-        if not 0.0 <= kp <= P.KP_IMP_MAX:
+    def __init__(self, kp=cfg.KP_IMP, kd=cfg.KD_IMP):
+        if not 0.0 <= kp <= cfg.KP_IMP_MAX:
             raise ValueError(f"kp={kp} outside the measured stable envelope "
-                             f"[0, {P.KP_IMP_MAX}] at a "
-                             f"{P.SWEEP_S*1e3:.0f} ms sweep")
-        if not 0.0 <= kd <= P.KD_IMP_MAX:
-            raise ValueError(f"kd={kd} outside [0, {P.KD_IMP_MAX}]; the "
+                             f"[0, {cfg.KP_IMP_MAX}] at a "
+                             f"{cfg.SWEEP_S*1e3:.0f} ms sweep")
+        if not 0.0 <= kd <= cfg.KD_IMP_MAX:
+            raise ValueError(f"kd={kd} outside [0, {cfg.KD_IMP_MAX}]; the "
                              f"sampled-damper bound is 2J/dt = "
-                             f"{2*P.J_MIN/P.LOOP_DELAY_S:.1f} Nms/rad at the "
-                             f"MEASURED {P.LOOP_DELAY_S*1e3:.0f} ms loop "
-                             f"delay, not {2*P.J_MIN/P.SWEEP_S:.1f} at the "
-                             f"{P.SWEEP_S*1e3:.0f} ms command interval")
+                             f"{2*cfg.J_MIN/cfg.LOOP_DELAY_S:.1f} Nms/rad at the "
+                             f"MEASURED {cfg.LOOP_DELAY_S*1e3:.0f} ms loop "
+                             f"delay, not {2*cfg.J_MIN/cfg.SWEEP_S:.1f} at the "
+                             f"{cfg.SWEEP_S*1e3:.0f} ms command interval")
         self.kp, self.kd = float(kp), float(kd)
         self.dq = np.zeros(N_JOINTS)
 
@@ -343,15 +366,15 @@ class TorqueGate(base.SafetyGate):
         return None
 
     def cap_now(self, now):
-        f = np.clip((now - self.started_at) / P.TORQUE_RAMP_S, 0.0, 1.0)
+        f = np.clip((now - self.started_at) / cfg.TORQUE_RAMP_S, 0.0, 1.0)
         return self.tau_cap * f
 
     def apply(self, tau, q, now):
         cap = self.cap_now(now)
         out = np.clip(np.asarray(tau, dtype=float), -cap, cap)
-        out = np.clip(out, -P.TAU_HARD_NM, P.TAU_HARD_NM)
+        out = np.clip(out, -cfg.TAU_HARD_NM, cfg.TAU_HARD_NM)
         dt = np.clip(now - self.last_time, 1e-4, 0.05)
-        step = P.TAU_SLEW_NM_S * dt
+        step = cfg.TAU_SLEW_NM_S * dt
         out = self.previous_tau + np.clip(out - self.previous_tau, -step, step)
         self.previous_tau = out
         self.last_time = now
@@ -364,15 +387,118 @@ def _smoothstep(u):
     return u * u * (3.0 - 2.0 * u)
 
 
-def swing_foot_body(i, s, z_des, foot_xy, height=tcfg.SWING_HEIGHT):
+def raibert_step_body(i, v_world, C, t_stance, kv, z_des, foot_xy,
+                      v_cmd=(0.0, 0.0)):
+    """Trunk-frame x/y offset from a foot's resting site to where it should
+    LAND, clamped to the leg's reach.  (2,)
+
+    THIS IS THE ONLY THING IN THE RUNNER THAT ACTS ON HORIZONTAL DRIFT, and
+    until it existed nothing did.  The wrench cannot: Dynamic_Model.body_wrench
+    has no kp on x or y -- leg odometry measures VELOCITY and has no origin, so
+    there is no position for a spring to pull against -- and every t*.npz was
+    logged with kd_xy = 0, which makes W[0], W[1] and W[5] identically zero in
+    all of them.  A foot placed DOWNSTREAM of the drift is the standard answer
+    and needs no absolute position: it needs the velocity, which IS measured.
+
+        step = v * (t_stance / 2)  +  kv * (v - v_cmd)
+
+    The first term is Raibert's symmetry term and is NOT a gain: it is where
+    the foot has to land for the stance to be symmetric about the hip, so the
+    body decelerates over the second half by as much as it accelerated over the
+    first.  It follows from t_stance, which is DUTY * period and already known.
+    kv is the only tunable number here, and `kv = 0` -- symmetry term alone --
+    is therefore the honest A/B against `--raibert` left off entirely.
+
+    v IS ROTATED INTO THE TRUNK FRAME because the arc and `foot_xy` live there.
+    C is the estimator's roll/pitch-only rotation (I->B): the AHRS yaw is
+    magnetometer-derived next to twelve motors and C_from_rp discards it, so
+    this rotation carries NO YAW.  That is correct rather than a shortcut --
+    with no yaw measurement there is no yaw to rotate by -- and it is also the
+    reason this term cannot correct a yaw drift, only an x/y one.
+
+    THE CLAMP HOLDS z AND SHORTENS THE STEP, which swing.py's does not: that
+    one scales the whole hip-to-foot vector, and so lifts the landing point off
+    the floor by the same fraction it pulls it in.  On a flat floor the height
+    is not negotiable and the length is, so the reachable set is intersected at
+    the LANDING PLANE -- a horizontal disc of radius sqrt((0.95 R)^2 - dz^2)
+    about the hip.  At --height 0.190 that disc leaves ~6 mm
+    (config.MAX_FORWARD_V_AT_STAND_HEIGHT), which is why the honest way to buy
+    a longer step is to crouch and not to raise the clamp.
+    """
+    C = np.asarray(C, dtype=float).reshape(3, 3)
+    v_b = C @ np.asarray(v_world, dtype=float).reshape(3)
+    step = (v_b[:2] * (0.5 * float(t_stance))
+            + float(kv) * (v_b[:2] - np.asarray(v_cmd, dtype=float).reshape(2)))
+
+    z_site = -(fe.hip_from_imu(z_des) - cfg.FOOT_RADIUS_M)
+    hip = np.asarray(cfg.HIP_OFFSET[i], dtype=float)
+    dz = z_site - hip[2]
+    r_max_sq = (0.95 * cfg.LEG_REACH) ** 2 - dz * dz
+    if r_max_sq <= 0.0:
+        # The leg is already at full stretch straight down; there is no
+        # horizontal room at all.  Not reachable at any sane --height, but a
+        # negative sqrt here would be a NaN target fed to a torque.
+        return np.zeros(2)
+
+    land = np.asarray(foot_xy[i], dtype=float) + step
+    d = land - hip[:2]
+    r = float(np.linalg.norm(d))
+    r_max = math.sqrt(r_max_sq)
+    if r > r_max:
+        land = hip[:2] + d * (r_max / r)
+    return land - np.asarray(foot_xy[i], dtype=float)
+
+
+def _step_room(z_des, i=0, foot_xy=None):
+    """How far, in m, a foot at `z_des` can be placed from its resting site
+    before raibert_step_body's clamp truncates it.
+
+    DERIVED FROM THE HEIGHT ACTUALLY BEING FLOWN, not read from
+    config.MAX_FORWARD_V_AT_STAND_HEIGHT: that constant is computed once at the
+    nominal stand pose and --height is a flag, and the number more than doubles
+    over 12 mm of crouch.  A banner quoting the nominal figure during a lower
+    run would be worse than quoting nothing.
+
+    z_des IS THE TRUNK BOTTOM, as everywhere in this file.  config.py's step
+    table is in the OLD HIP-AXIS FRAME -- its 0.190 row is this frame's 0.152,
+    the same 38 mm that renamed STAND_HEIGHT -- so its heights must not be fed
+    here.  The room is computed from geometry rather than looked up in it.
+
+    THE FIGURE IS THE WORST CASE, radially outward from the hip: the clamp
+    admits any landing point inside the disc, so a step INWARD has more room
+    than this.  The banner should under-promise.
+    """
+    if foot_xy is None:
+        foot_xy = [st.leg_frames(LEGS[k], Q_CROUCH[3*k:3*k+3])[0][:2]
+                   for k in range(4)]
+    z_site = -(fe.hip_from_imu(z_des) - cfg.FOOT_RADIUS_M)
+    hip = np.asarray(cfg.HIP_OFFSET[i], dtype=float)
+    dz = z_site - hip[2]
+    r_max_sq = (0.95 * cfg.LEG_REACH) ** 2 - dz * dz
+    if r_max_sq <= 0.0:
+        return 0.0
+    rest = float(np.linalg.norm(np.asarray(foot_xy[i], dtype=float) - hip[:2]))
+    return max(0.0, math.sqrt(r_max_sq) - rest)
+
+
+def swing_foot_body(i, s, z_des, foot_xy, height=cfg.SWING_HEIGHT,
+                    step_xy=(0.0, 0.0)):
     """Where a swinging foot should be, in the TRUNK frame.  (p (3,), v (3,))
 
-    TROT IN PLACE, SO THE ARC IS PURELY VERTICAL AND THE FRAME IS THE BODY'S.
-    The foot's x/y target is its own crouch value -- the same `foot_xy`
-    q_ref_for_height already pins the stance feet at -- so the foot lifts and
-    lands on the spot it left.  Nothing here needs the world frame, the trunk
-    attitude or the CoM, so none of them can be got wrong; a travelling trot
-    is where those come back.
+    THE FRAME IS THE BODY'S, and the arc is vertical unless `step_xy` says
+    otherwise.  The foot's x/y target starts at its own crouch value -- the
+    same `foot_xy` q_ref_for_height pins the stance feet at -- and travels
+    `step_xy` over the swing, so a zero step is exactly the old behaviour:
+    the foot lifts and lands on the spot it left.  step_xy defaults to zero so
+    that a caller that does not plan a step gets the arc every t*.npz was
+    logged with, bit for bit, rather than a subtly different one.
+
+    THE HORIZONTAL IS A SMOOTHSTEP OVER THE WHOLE SWING, not a constant offset
+    applied from s = 0.  A constant offset steps p_des at liftoff, and p_des
+    goes straight into a 200 N/m impedance: a 6 mm jump is 1.2 N appearing in
+    one sweep, on the leg with the least authority to absorb it.  Ramping also
+    puts the horizontal speed at zero at BOTH ends, which is what keeps the
+    step from scuffing on touchdown.
 
     The bump is a smoothstep up over the first half and down over the second,
     so the vertical speed is ZERO at liftoff, at the apex and at TOUCHDOWN.
@@ -384,20 +510,31 @@ def swing_foot_body(i, s, z_des, foot_xy, height=tcfg.SWING_HEIGHT):
     two conversions q_ref_for_height makes, made once more here rather than
     assumed.
     """
-    z_site = -(fe.hip_from_imu(z_des) - P.FOOT_RADIUS_M)
+    z_site = -(fe.hip_from_imu(z_des) - cfg.FOOT_RADIUS_M)
     if s < 0.5:
         b, db = _smoothstep(2 * s), 6 * (2 * s) * (1 - 2 * s) * 2
     else:
         u = 2 - 2 * s
         b, db = _smoothstep(u), -6 * u * (1 - u) * 2
-    p = np.array([foot_xy[i][0], foot_xy[i][1], z_site + height * b])
-    v = np.array([0.0, 0.0, height * db])          # per unit swing phase
+    u = min(1.0, max(0.0, float(s)))
+    g, dg = _smoothstep(u), 6 * u * (1 - u)
+    dx, dy = float(step_xy[0]), float(step_xy[1])
+    p = np.array([foot_xy[i][0] + dx * g,
+                  foot_xy[i][1] + dy * g,
+                  z_site + height * b])
+    v = np.array([dx * dg, dy * dg, height * db])  # per unit swing phase
     return p, v
 
 
 def swing_torque(i, q_i, qd_i, p_des, v_des_phase, dsdt,
-                 kp=tcfg.KP_SWING[0, 0], kd=tcfg.KD_SWING[0, 0]):
+                 kp=cfg.KP_SWING[0, 0], kd=cfg.KD_SWING[0, 0]):
     """Cartesian impedance on one swinging foot, in the TRUNK frame.  (3,)
+
+    THE LOOP NO LONGER CALLS THIS -- leg_torque_block inlines it, so that one
+    leg_frames call serves the Jacobian, the impedance and leg gravity instead
+    of three.  It is kept because it is the REFERENCE the self-test holds that
+    inlining to: two expressions of the same law, checked against each other,
+    beat one expression checked against nothing.
 
         tau = J^T ( kp (p_des - p) + kd (v_des - J qd) )
 
@@ -412,6 +549,63 @@ def swing_torque(i, q_i, qd_i, p_des, v_des_phase, dsdt,
     v = J @ qd_i
     f = kp * (p_des - fr[0]) + kd * (v_des_phase * dsdt - v)
     return J.T @ f
+
+
+def leg_torque_block(q, qd, f_foot, planted, g_down, p_des=None,
+                     v_des_phase=None, dsdt=0.0, leg_gravity=True,
+                     kd_joint=cfg.KD_JOINT_STANCE,
+                     kp_sw=cfg.KP_SWING[0, 0], kd_sw=cfg.KD_SWING[0, 0]):
+    """Every leg's feedforward torque from THIS SWEEP'S q.  (12,)
+
+    THE FORCE IS WHAT THE MODEL BLOCK HOLDS, NOT THE TORQUE.  tau = -J(q)^T f
+    was being computed once per model block and reused for three sweeps, which
+    froze J(q) for 12 ms.  J is a function of the joint angles ALONE and costs
+    four leg_frames -- 606 us for all four legs, measured -- so there is no
+    reason for it to be stale when q is not.  The wrench, the QP-free
+    distribution and the friction clamp all still run at 83 Hz, because they
+    need the ESTIMATOR; the map from their answer onto the joints does not.
+
+    WHY THIS MATTERS MORE FOR A TROT THAN FOR A STAND: a stance leg on a stand
+    moves microns between model blocks and a stale J is worth nothing.  A trot
+    lands a foot and unloads another inside those same 12 ms, and the swing
+    leg -- whose Cartesian impedance is a DAMPER, and a damper fed a 12 ms old
+    velocity is a phase lag, not a damper -- moves a centimetre.
+
+    The three branches are exactly the three the 83 Hz code had, kept together
+    so a leg cannot fall through all of them:
+      planted   -J^T f  and the stance joint damper, as force_totorque does
+      swinging  the Cartesian impedance, as swing_torque does
+      always    its own links' weight, which neither branch may skip
+
+    `f_foot` is (4, 3) in the BODY frame and is ALREADY scaled by force_frac:
+    that scaling belongs to the force, and leg gravity must not inherit it --
+    an unloaded leg still has to hold itself up.  A swinging leg's row is
+    zero and is never read.
+
+    `g_down` None means UNTILTED gravity, which is what the estimator-refused
+    fallback wants: with f_foot zeroed as well this returns exactly
+    force_totorque.leg_gravity_only(q), and the self-test holds it to that.
+    """
+    q = np.asarray(q, dtype=float)
+    qd = np.asarray(qd, dtype=float)
+    f_foot = np.asarray(f_foot, dtype=float).reshape(4, 3)
+    tau = np.zeros(N_JOINTS)
+    for i in range(4):
+        sl = slice(3 * i, 3 * i + 3)
+        leg = LEGS[i]
+        fr = st.leg_frames(leg, q[sl])
+        if planted[i]:
+            J = st.foot_jacobian_from(fr[0], fr[1], fr[2])
+            tau[sl] = -J.T @ f_foot[i] - kd_joint * qd[sl]
+        elif p_des is not None:
+            J = st.foot_jacobian_from(fr[0], fr[1], fr[2])
+            v = J @ qd[sl]
+            f = kp_sw * (p_des[i] - fr[0]) + kd_sw * (v_des_phase[i] * dsdt - v)
+            tau[sl] = J.T @ f
+        if leg_gravity:
+            tau[sl] += st.leg_gravity_torque_tilted(leg, q[sl], g_down,
+                                                    frames=fr)
+    return tau
 
 
 def q_ref_for_height(q_ref, z_des, foot_xy):
@@ -445,7 +639,7 @@ def q_ref_for_height(q_ref, z_des, foot_xy):
     x and y stay pinned at their crouch values, so the feet rise straight up
     and the contact point never moves in the world.
     """
-    z_site = -(fe.hip_from_imu(z_des) - P.FOOT_RADIUS_M)
+    z_site = -(fe.hip_from_imu(z_des) - cfg.FOOT_RADIUS_M)
     for i, leg in enumerate(LEGS):
         sl = slice(3 * i, 3 * i + 3)
         qi = q_ref[sl].copy()
@@ -548,7 +742,7 @@ def _print_attitude_report(est, args):
 
 def run(args):
     base.validate_hardware_config()
-    gains = dm.default_gains()
+    gains = cfg.gains()
     if args.kp_att is not None:
         gains.kp_roll = gains.kp_pitch = args.kp_att
     if args.kd_att is not None:
@@ -578,14 +772,14 @@ def run(args):
 
     print("=" * 74)
     print("DOG5 CLOSED-LOOP TORQUE STAND  (week 2)")
-    print(f"  mass {args.mass:.4f} kg = {args.mass*P.GRAVITY:.1f} N, "
-          f"stand height {args.height*1e3:.0f} mm, rise {P.T_RISE:.0f} s")
+    print(f"  mass {args.mass:.4f} kg = {args.mass*cfg.GRAVITY:.1f} N, "
+          f"stand height {args.height*1e3:.0f} mm, rise {cfg.T_RISE:.0f} s")
     # Say the frame every run.  The 2026-08-17 gap between a printed 191 mm
     # and a measured 160 was this line not existing.
     print(f"  height is FLOOR to TRUNK BOTTOM (the IMU board) -- a ruler "
           f"reaches it.  That")
     print(f"  is {fe.hip_from_imu(args.height)*1e3:.0f} mm at the hip axis, "
-          f"{P.IMU_BELOW_TRUNK_ORIGIN_M*1e3:.0f} mm higher, which is the "
+          f"{cfg.IMU_BELOW_TRUNK_ORIGIN_M*1e3:.0f} mm higher, which is the "
           f"frame the leg IK uses.")
     if args.setpoint_roll or args.setpoint_pitch:
         print(f"  AHRS setpoint {args.setpoint_roll:+.2f} / "
@@ -597,12 +791,29 @@ def run(args):
               f"--setpoint-roll/--setpoint-pitch.")
     print(f"  {gains}, impedance kp={args.kp} kd={args.kd}, "
           f"tau cap {args.tau_max} Nm, force_frac {args.force_frac}")
-    print(f"  model at {P.CONTROL_HZ/P.MODEL_EVERY:.0f} Hz "
-          f"(every {P.MODEL_EVERY} sweeps), impedance at {P.CONTROL_HZ:.0f} Hz")
+    print(f"  model at {cfg.CONTROL_HZ/cfg.MODEL_EVERY:.0f} Hz "
+          f"(every {cfg.MODEL_EVERY} sweeps), impedance at {cfg.CONTROL_HZ:.0f} Hz")
+    # SAY WHICH SIDE OF THE HORIZONTAL A/B THIS RUN IS ON, every run.  The
+    # gains line above prints kd_xy, and a reader who sees kd_xy = 0 has been
+    # told that x/y is open loop -- which stopped being the whole story the
+    # moment placement existed.  Both halves or neither.
+    _room = _step_room(args.height)
+    if args.raibert is None:
+        print(f"  FOOT PLACEMENT OFF: the swing is purely vertical, so with "
+              f"kd_xy = {gains.kd_x:.0f} there is")
+        print(f"  NOTHING acting on x, y or yaw -- drift integrates. "
+              f"--raibert {cfg.RAIBERT_KV} turns it on.")
+    else:
+        _vmax = _room / (0.5 * args.duty * args.period + args.raibert)
+        print(f"  foot placement ON: kv={args.raibert} s, "
+              f"step = v*{0.5*args.duty*args.period*1e3:.0f}ms + "
+              f"kv*(v-v_cmd), clamped at {_room*1e3:.1f} mm")
+        print(f"  at this height -- i.e. it stops correcting above "
+              f"{_vmax:.2f} m/s of drift.  Crouch to buy more.")
     # The roll axis saturates first, and on this rig it saturates EARLY.
     Mx_max, My_max = ft.moment_capacity(
         [st.leg_frames(LEGS[i], Q_CROUCH[3*i:3*i+3])[0] for i in range(4)],
-        list(LEGS), args.mass * P.GRAVITY)
+        list(LEGS), args.mass * cfg.GRAVITY)
     print(f"  stance moment capacity: roll {Mx_max:.1f} Nm "
           f"(kp_roll saturates at {np.rad2deg(Mx_max/max(gains.kp_roll,1e-9)):.1f} deg), "
           f"pitch {My_max:.1f} Nm")
@@ -617,7 +828,7 @@ def run(args):
     if args.force_frac < 0.2:
         print(f"  WARNING: force_frac {args.force_frac} removes the term that "
               f"holds the TRUNK up.  Feet on the floor, the legs fold until "
-              f"kp*dq carries {args.mass*P.GRAVITY:.0f} N.")
+              f"kp*dq carries {args.mass*cfg.GRAVITY:.0f} N.")
     print(f"  trot: period {args.period:.2f} s, duty {args.duty:.2f} "
           f"(stance {args.period*args.duty*1e3:.0f} ms, swing "
           f"{args.period*(1-args.duty)*1e3:.0f} ms), swing height "
@@ -644,7 +855,7 @@ def run(args):
     try:
         imu.start()
         with motorbus.MotorBus(MOTOR_IDS, dirs=base.MOTOR_DIRECTIONS) as mb:
-            if not mb.arm(rate_hz=P.CONTROL_HZ):
+            if not mb.arm(rate_hz=cfg.CONTROL_HZ):
                 raise RuntimeError("arm failed (bus / power / terminators)")
             unwrap = [base.CalibratedEncoderUnwrap() for _ in MOTOR_IDS]
             if not imu.wait_for_data(3.0):
@@ -681,7 +892,7 @@ def run(args):
             # HALF A CYCLE IS THE WHOLE SWAP.  Derived from PHASE_OFFSET
             # rather than written out, so retuning that array cannot leave the
             # two choices disagreeing about which legs are a diagonal.
-            offsets = np.mod(tcfg.PHASE_OFFSET
+            offsets = np.mod(cfg.PHASE_OFFSET
                              + (0.5 if args.lead_diagonal == "fl-rr" else 0.0),
                              1.0)
             gait = gait_mod.TrotGait(args.period, args.duty, offsets)
@@ -692,13 +903,29 @@ def run(args):
             tau_ff = np.zeros(N_JOINTS)
             W = np.zeros(6)
             tau_cmd = np.zeros(N_JOINTS)
+            # The foot-placement latch.  step_xy is the trunk-frame offset
+            # THIS swing was planned with, held for the whole swing; was_swing
+            # is what turns a swinging leg into a liftoff EDGE.  Both are also
+            # logged, because a placement run whose log cannot say what step
+            # was asked for is only readable as "it drifted less, somehow".
+            step_xy = np.zeros((4, 2))
+            was_swing = np.zeros(4, dtype=bool)
+            # WHAT THE MODEL BLOCK HANDS THE SWEEP.  f_foot is the per-foot
+            # BODY-frame force the distributor produced, already scaled by
+            # force_frac; g_down is the tilt leg gravity is taken against;
+            # model_live says the estimator was answering when they were set.
+            # The torque itself is no longer held -- see leg_torque_block.
+            f_foot = np.zeros((4, 3))
+            g_down = None
+            model_live = False
+            z_des = None
             diag = {"fz": [0.0] * 4, "stance": [], "singular": []}
             state, act, why = None, False, "starting"
             limp = False
             armed = False
             load_sum = float("nan")
 
-            slot = mb.slot(P.CONTROL_HZ)
+            slot = mb.slot(cfg.CONTROL_HZ)
             deadline = time.perf_counter() + slot
             index = sweep = 0
             last_print = 0.0
@@ -727,17 +954,22 @@ def run(args):
                     if q_prev is not None:
                         dt_v = now - t_prev
                         if 1e-4 < dt_v < 0.05:
-                            qd += P.QD_ALPHA * ((q - q_prev) / dt_v - qd)
+                            qd += cfg.QD_ALPHA * ((q - q_prev) / dt_v - qd)
                     q_prev, t_prev = q.copy(), now
                     glitches += (np.abs(qd_drv - qd)
                                  > np.maximum(2.0 * np.abs(qd), 1.0))
 
                     pressed = key.get()
-                    if pressed in (P.KEY_STOP, P.KEY_STOP.upper()):
+                    if pressed in (cfg.KEY_STOP, cfg.KEY_STOP.upper()):
                         stop = "operator X"
                         break
-                    if pressed == P.KEY_LIMP and not limp:
-                        limp, tau_ff = True, np.zeros(N_JOINTS)
+                    if pressed == cfg.KEY_LIMP and not limp:
+                        # Zeroing a held tau_ff used to be what LIMP did.
+                        # The feedforward is rebuilt every sweep now, so the
+                        # flag alone is what stops it -- see the torque_stage
+                        # gate below.  Writing the zero as well would read as
+                        # load-bearing and is not.
+                        limp = True
                         print("[stand] LIMP")
                     elif pressed in ("\r", "\n"):
                         if limp:
@@ -751,8 +983,8 @@ def run(args):
                             q_ref = q.copy()
                             print(f"[stand] RISE: {z_crouch*1e3:.0f} -> "
                                   f"{args.height*1e3:.0f} mm over "
-                                  f"{P.T_RISE:.0f} s under torque")
-                    elif pressed in (P.KEY_PARK, P.KEY_PARK.upper()) \
+                                  f"{cfg.T_RISE:.0f} s under torque")
+                    elif pressed in (cfg.KEY_PARK, cfg.KEY_PARK.upper()) \
                             and stage == "HOLD":
                         stop = "park"
                         break
@@ -761,11 +993,17 @@ def run(args):
                             and not limp:
                         stage, t0 = "TROT", now
                         gait.reset(now)
+                        # gait.reset restarts the clock, so every leg is about
+                        # to produce a liftoff edge.  Clearing here rather than
+                        # relying on the stance branch means a second T after a
+                        # limp cannot re-apply a step planned before it.
+                        step_xy[:] = 0.0
+                        was_swing[:] = False
                         print(f"[trot] TROT: {gait}.  Feet are leaving the "
                               f"ground.  SPACE limps, X stops.  P is dead "
                               f"until you are back in HOLD.")
 
-                    if stage == "RISE" and now - t0 >= P.T_RISE:
+                    if stage == "RISE" and now - t0 >= cfg.T_RISE:
                         stage, t0 = "HOLD", now
                         print(f"[stand] HOLD: closed loop at "
                               f"{args.height*1e3:.0f} mm.  Push the trunk, "
@@ -785,7 +1023,7 @@ def run(args):
                     # ~1.5 ms, so it runs every MODEL_EVERY sweeps and that
                     # sweep's FL frames are late by that much.  Inside the
                     # 10 ms watchdog with margin; see params.MODEL_EVERY.
-                    if sweep % P.MODEL_EVERY == 0:
+                    if sweep % cfg.MODEL_EVERY == 0:
                         state, act, why = est.read(now, q, qd, planted)
                         if act:
                             if z_crouch is None:
@@ -798,7 +1036,7 @@ def run(args):
                                 _print_attitude_report(est, args)
                                 print("[stand] ENTER to rise.")
                             z_des = (dm.height_ramp(z_crouch, args.height,
-                                                    (now - t0) / P.T_RISE)
+                                                    (now - t0) / cfg.T_RISE)
                                      if stage == "RISE" else
                                      args.height
                                      if stage in ("HOLD", "TROT")
@@ -807,46 +1045,116 @@ def run(args):
                                 q_ref = q_ref_for_height(q_ref, z_des, foot_xy)
                                 W = dm.body_wrench(state, z_des, args.mass,
                                                    gains=gains)
-                                tau_ff, diag = ft.stance_torque(
+                                # stance_torque IS STILL CALLED, and its
+                                # torque IS thrown away.  What is wanted is
+                                # diag: the clamped per-foot force, the
+                                # singular-Jacobian watch and the fz readout.
+                                # Calling ft.distribute directly would save
+                                # ~1 ms here, and would fork a shared week-2
+                                # module that stand_torque_Mode.py also flies.
+                                # The 1 ms is affordable (measured 1066 us per
+                                # sweep total, 27% of the 4 ms budget); a
+                                # second copy of the clamp is not.
+                                _, diag = ft.stance_torque(
                                     q, qd, state, W, planted, gains,
                                     force_frac=args.force_frac,
                                     leg_gravity=args.leg_gravity)
+                                f_foot[:] = 0.0
+                                for _k, _leg in enumerate(LEGS):
+                                    if planted[_k] and _leg in diag["forces"]:
+                                        f_foot[_k] = (args.force_frac
+                                                      * diag["forces"][_leg])
+                                g_down = st.gravity_down_body(state["C"])
+                                model_live = True
                                 if stage == "TROT":
-                                    # A SWINGING LEG NEEDS TWO THINGS DOING
-                                    # DIFFERENTLY, and both are here:
-                                    #   its q_ref must follow the ARC, not the
-                                    #   stance pose q_ref_for_height just put
-                                    #   it at, or the joint floor fights the
-                                    #   swing the way a frozen q_ref fights a
-                                    #   rise;
-                                    #   and it needs the Cartesian impedance
-                                    #   that actually moves it, on top of the
-                                    #   leg gravity stance_torque already gave
-                                    #   it.
-                                    sph = gait.swing_phase(now)
-                                    dsdt = 1.0 / gait.swing_duration
+                                    # ONLY THE LATCH IS LEFT HERE.  The arc and
+                                    # the impedance moved to the sweep, where
+                                    # q is current; what stays is the once-per-
+                                    # swing decision that needs the ESTIMATOR
+                                    # -- est.v and state["C"] -- and so cannot
+                                    # run faster than the estimator does.
                                     for i in range(4):
                                         if planted[i]:
+                                            # BACK ON THE FLOOR: forget the
+                                            # step, or the next swing reuses an
+                                            # offset planned for a velocity the
+                                            # robot no longer has.
+                                            step_xy[i] = 0.0
+                                            was_swing[i] = False
                                             continue
-                                        sl = slice(3 * i, 3 * i + 3)
-                                        p_d, v_d = swing_foot_body(
-                                            i, float(sph[i]), z_des,
-                                            foot_xy, args.swing_height)
-                                        tau_ff[sl] += swing_torque(
-                                            i, q[sl], qd[sl], p_d, v_d, dsdt)
-                                        q_ref[sl] = q[sl]
+                                        if args.raibert is not None \
+                                                and not was_swing[i]:
+                                            # LIFTOFF EDGE.  The step is
+                                            # LATCHED here, not recomputed
+                                            # every block: a target chasing the
+                                            # low-passed odometry through the
+                                            # swing is a moving reference, and
+                                            # the impedance tracks it as a
+                                            # disturbance.  The edge is seen up
+                                            # to MODEL_EVERY sweeps (~12 ms of
+                                            # a ~120 ms swing) late, which
+                                            # costs nothing -- the horizontal
+                                            # ramp is a smoothstep and is still
+                                            # within 4% of zero there.
+                                            step_xy[i] = raibert_step_body(
+                                                i, est.v, state["C"],
+                                                gait.stance_duration,
+                                                args.raibert, z_des, foot_xy)
+                                        was_swing[i] = True
                         else:
                             # honest fallback: hold each leg up, command no
                             # body wrench.  A frozen wrench would keep pushing
                             # on a world model that has stopped updating.
-                            tau_ff = ft.leg_gravity_only(q) \
-                                if args.leg_gravity else np.zeros(N_JOINTS)
+                            # ZEROING THE FORCE IS THE WHOLE FALLBACK NOW: with
+                            # f_foot 0 and g_down None, leg_torque_block returns
+                            # exactly force_totorque.leg_gravity_only(q), and
+                            # the self-test pins it to that.
+                            f_foot[:] = 0.0
+                            g_down = None
+                            model_live = False
                             if torque_stage and not limp:
                                 limp = True
                                 print(f"[stand] LIMP: estimator refused ({why})")
 
-                    # ---- the 250 Hz floor + safety -----------------------
+                    # ---- the 250 Hz law + floor + safety -----------------
+                    # THE FEEDFORWARD IS BUILT HERE NOW, not held from the
+                    # model block: -J(q)^T f and the swing impedance both see
+                    # THIS sweep's q and qd.  The self-test TIMES this block
+                    # rather than quoting it -- 0.85 ms for four legs on the
+                    # Pi it was written on, which puts the worst sweep (model
+                    # block + this) at 2.23 of the 4 ms.
                     if torque_stage and not limp:
+                        p_des = v_des = None
+                        dsdt = 0.0
+                        if (model_live and stage == "TROT"
+                                and z_des is not None):
+                            # The arc is re-evaluated every sweep, so the
+                            # reference the impedance chases advances smoothly
+                            # instead of in 12 ms steps -- a 40 mm apex over a
+                            # 120 ms swing moves 2.6 mm in one model block, and
+                            # a 200 N/m stiffness reads that as half a newton
+                            # of staircase.
+                            sph = gait.swing_phase(now)
+                            dsdt = 1.0 / gait.swing_duration
+                            p_des = np.zeros((4, 3))
+                            v_des = np.zeros((4, 3))
+                            for i in range(4):
+                                if planted[i]:
+                                    continue
+                                sl = slice(3 * i, 3 * i + 3)
+                                p_des[i], v_des[i] = swing_foot_body(
+                                    i, float(sph[i]), z_des, foot_xy,
+                                    args.swing_height, step_xy[i])
+                                # q_ref FOLLOWS THE LEG, every sweep.  Left at
+                                # the stance pose the joint floor fights the
+                                # swing; left at the 83 Hz value it fights it
+                                # 12 ms late, which is worse than either.
+                                q_ref[sl] = q[sl]
+                        tau_ff = leg_torque_block(
+                            q, qd, f_foot, planted, g_down,
+                            p_des, v_des, dsdt,
+                            leg_gravity=args.leg_gravity,
+                            kd_joint=gains.kd_joint)
                         tau_cmd = gate.apply(tau_ff + imp.tau(q, qd, q_ref),
                                              q, now)
                     else:
@@ -872,7 +1180,7 @@ def run(args):
                     # that leg collapses while the others keep pushing, which
                     # is an active tip-over, not a stall
                     latched = [m for m, e in mb.errors().items() if e & 0x80]
-                    if latched and torque_stage and P.LATCH_LIMPS_ROBOT \
+                    if latched and torque_stage and cfg.LATCH_LIMPS_ROBOT \
                             and not limp:
                         limp = True
                         print(f"[stand] LIMP: input-lost latch on {latched}")
@@ -890,19 +1198,19 @@ def run(args):
                     # STAGGERED against the model block so the two never land
                     # in the same sweep (see params.LOAD_OFFSET).  At 21 Hz it
                     # still catches a collapsing leg within 48 ms.
-                    if sweep % P.LOAD_EVERY == P.LOAD_OFFSET:
+                    if sweep % cfg.LOAD_EVERY == cfg.LOAD_OFFSET:
                         support, ok = ft.foot_load_from_torque(
                             q, tau_meas, None if state is None else state["C"])
                         load_sum = float(np.nansum(support)) if ok.any() \
                             else float("nan")
                         if stage == "HOLD" and not limp \
                                 and np.isfinite(load_sum) \
-                                and abs(load_sum - args.mass * P.GRAVITY) \
-                                / (args.mass * P.GRAVITY) > P.LOAD_SUM_TOL_FRAC:
+                                and abs(load_sum - args.mass * cfg.GRAVITY) \
+                                / (args.mass * cfg.GRAVITY) > cfg.LOAD_SUM_TOL_FRAC:
                             limp = True
                             print(f"[stand] LIMP: measured foot load "
                                   f"{load_sum:.1f} N against "
-                                  f"{args.mass*P.GRAVITY:.1f} N expected -- the "
+                                  f"{args.mass*cfg.GRAVITY:.1f} N expected -- the "
                                   f"force loop is not doing what it says")
 
                     if args.log:
@@ -911,8 +1219,9 @@ def run(args):
                         # them a log of an outer-loop shake shows the result
                         # and neither the cause nor the command -- roll is an
                         # ANGLE, and kd_att acts on the RATE, which nothing
-                        # else in this file records.  Held between model
-                        # steps, like tau_ff.
+                        # else in this file records.  W and est.* are held
+                        # between model steps; tau_cmd is not, and neither is
+                        # the feedforward inside it any more.
                         log.append((now, q.copy(), qd.copy(), qd_drv.copy(),
                                     tau_cmd.copy(), tau_meas.copy(),
                                     np.array(diag["fz"]),
@@ -923,7 +1232,8 @@ def run(args):
                                     np.zeros(3) if state is None
                                     else np.asarray(state["w"]).copy(),
                                     est.v.copy(), W.copy(),
-                                    np.asarray(planted, float).copy()))
+                                    np.asarray(planted, float).copy(),
+                                    step_xy.copy(), f_foot.copy()))
 
                     if now - last_print >= 1.0 / base.STATUS_HZ:
                         last_print = now
@@ -977,7 +1287,7 @@ def run(args):
         if a.size:
             print(f"  foot load sum: mean {a.mean():.1f} N, min {a.min():.1f}, "
                   f"max {a.max():.1f}, against "
-                  f"{args.mass*P.GRAVITY:.1f} N")
+                  f"{args.mass*cfg.GRAVITY:.1f} N")
             print("  ^ THE number: this is measured current, not a command.")
 
         # The control loop runs on the encoder now, so this block answers a
@@ -995,7 +1305,7 @@ def run(args):
                   f"worst {base.JOINT_LABELS[worst]} ({int(glitches[worst])}) "
                   f"-- these no longer reach the force law")
             print(f"  ^ through the OLD path each would have injected up to "
-                  f"{P.KD_Z * drv[i] * 0.0425:.0f} N of phantom force")
+                  f"{cfg.KD_POS[2] * drv[i] * 0.0425:.0f} N of phantom force")
         else:
             print("  driver and encoder agreed throughout -- no glitching this "
                   "run, so the shake had another cause")
@@ -1034,6 +1344,24 @@ def run(args):
                 # "the QP gave it none", and every per-foot number below is
                 # ambiguous.
                 planted=np.array([r[21] for r in log]),
+                # THE STEP EACH SWING WAS PLANNED WITH (4,2), trunk frame,
+                # zero on a planted leg and zero everywhere with --raibert
+                # off.  This is the whole readout of the placement loop: with
+                # v beside it a log says whether the step tracked the drift,
+                # and whether the reach clamp was the thing limiting it.
+                # THE FORCE EACH FOOT WAS ACTUALLY GIVEN (n,4,3), BODY
+                # frame, force_frac already in it, zero on a swinging leg.
+                # W above is the wrench the PD law ASKED for; this is what
+                # survived distribute()'s min-norm solve, its unilateral and
+                # friction clamps and its saturation rescale.  With q and
+                # planted beside it the ACHIEVED wrench is G f -- which is the
+                # only way to see a residual Mz, since the yaw couple lives
+                # entirely in the tangential components and W[5] is identically
+                # zero while kd_yaw is.
+                f_foot=np.array([r[23] for r in log]),
+                step_xy=np.array([r[22] for r in log]),
+                raibert_kv=(float("nan") if args.raibert is None
+                            else float(args.raibert)),
                 period=args.period, duty=args.duty,
                 swing_height=args.swing_height,
                 glitches=glitches,
@@ -1046,10 +1374,16 @@ def run(args):
                 force_frac=args.force_frac, mass=args.mass,
                 setpoint_roll_deg=args.setpoint_roll,
                 setpoint_pitch_deg=args.setpoint_pitch,
-                imu_below_trunk_origin_m=P.IMU_BELOW_TRUNK_ORIGIN_M,
+                imu_below_trunk_origin_m=cfg.IMU_BELOW_TRUNK_ORIGIN_M,
                 kp_imp=args.kp, kd_imp=args.kd, tau_max=args.tau_max)
             print(f"  log -> {args.log} ({len(log)} sweeps)")
     return 0
+
+
+def fxy_st():
+    """The four crouch foot x/y, as the runner builds them.  Self-test only."""
+    return [st.leg_frames(LEGS[k], Q_CROUCH[3*k:3*k+3])[0][:2]
+            for k in range(4)]
 
 
 def self_test():
@@ -1058,58 +1392,58 @@ def self_test():
 
     # -- the impedance refuses gains past the measured envelope ------------
     check("impedance refuses kp past the stable envelope, before arming",
-          raises(lambda: JointImpedance(kp=P.KP_IMP_MAX + 1)))
+          raises(lambda: JointImpedance(kp=cfg.KP_IMP_MAX + 1)))
     check("...and kd past the sampled-damper bound",
-          raises(lambda: JointImpedance(kd=P.KD_IMP_MAX + 1)))
+          raises(lambda: JointImpedance(kd=cfg.KD_IMP_MAX + 1)))
     imp = JointImpedance()
     t = imp.tau(np.zeros(12), np.zeros(12), np.full(12, 0.1))
     check("impedance pulls TOWARDS q_ref", bool(np.all(t > 0))
-          and abs(t[0] - P.KP_IMP * 0.1) < 1e-12)
+          and abs(t[0] - cfg.KP_IMP * 0.1) < 1e-12)
     t = imp.tau(np.zeros(12), np.full(12, 1.0), np.zeros(12))
-    check("...and opposes velocity", abs(t[0] + P.KD_IMP) < 1e-12)
+    check("...and opposes velocity", abs(t[0] + cfg.KD_IMP) < 1e-12)
     # THE DAMPER IS CHECKED AT THE MEASURED DELAY, NOT THE COMMAND INTERVAL.
     # The old pair of checks used SWEEP_S and passed at kd=0.6, which is the
     # exact reason the offline gate was green while the robot shook: the
     # inequality had no delay term in it.  kd_joint is in the sum because it
     # damps the same joint through the same delay.
-    bound = 2 * P.J_MIN / P.LOOP_DELAY_S
+    bound = 2 * cfg.J_MIN / cfg.LOOP_DELAY_S
     check("the damper is inside the bound at the MEASURED loop delay",
-          P.KD_IMP + P.KD_JOINT < 0.5 * bound,
-          f"kd+kd_joint={P.KD_IMP+P.KD_JOINT:.2f} vs bound {bound:.2f} "
-          f"Nms/rad at {P.LOOP_DELAY_S*1e3:.0f} ms "
-          f"({100*(P.KD_IMP+P.KD_JOINT)/bound:.0f}%)")
+          cfg.KD_IMP + cfg.KD_JOINT_STANCE < 0.5 * bound,
+          f"kd+kd_joint={cfg.KD_IMP+cfg.KD_JOINT_STANCE:.2f} vs bound {bound:.2f} "
+          f"Nms/rad at {cfg.LOOP_DELAY_S*1e3:.0f} ms "
+          f"({100*(cfg.KD_IMP+cfg.KD_JOINT_STANCE)/bound:.0f}%)")
     # the whole reason this file can exist -- recompute, do not trust
     check("...and the OLD default would not have been (it shook, 9-12 Hz)",
-          P.KD_IMP_MAX + P.KD_JOINT > 0.5 * bound,
-          f"the old kd={P.KD_IMP_MAX}+{P.KD_JOINT} is "
-          f"{100*(P.KD_IMP_MAX+P.KD_JOINT)/bound:.0f}% of the same bound, and "
-          f"{100*(P.KD_IMP_MAX+P.KD_JOINT)/(2*P.J_MIN/P.SWEEP_S):.0f}% of the "
+          cfg.KD_IMP_MAX + cfg.KD_JOINT_STANCE > 0.5 * bound,
+          f"the old kd={cfg.KD_IMP_MAX}+{cfg.KD_JOINT_STANCE} is "
+          f"{100*(cfg.KD_IMP_MAX+cfg.KD_JOINT_STANCE)/bound:.0f}% of the same bound, and "
+          f"{100*(cfg.KD_IMP_MAX+cfg.KD_JOINT_STANCE)/(2*cfg.J_MIN/cfg.SWEEP_S):.0f}% of the "
           f"4 ms one this file used to check -- same gain, both answers")
     # the stiffness half: what a delay does is set by WHERE the loop crosses
-    f_c = math.sqrt(P.KP_IMP / P.J_MIN) / (2 * math.pi)
+    f_c = math.sqrt(cfg.KP_IMP / cfg.J_MIN) / (2 * math.pi)
     check("the stiffness puts the crossover where 16 ms is a small phase",
-          360.0 * f_c * P.LOOP_DELAY_S < 25.0,
-          f"kp={P.KP_IMP} -> {f_c:.1f} Hz -> "
-          f"{360*f_c*P.LOOP_DELAY_S:.0f} deg of delay phase; kp="
-          f"{P.KP_IMP_MAX} gives "
-          f"{360*math.sqrt(P.KP_IMP_MAX/P.J_MIN)/(2*math.pi)*P.LOOP_DELAY_S:.0f}"
+          360.0 * f_c * cfg.LOOP_DELAY_S < 25.0,
+          f"kp={cfg.KP_IMP} -> {f_c:.1f} Hz -> "
+          f"{360*f_c*cfg.LOOP_DELAY_S:.0f} deg of delay phase; kp="
+          f"{cfg.KP_IMP_MAX} gives "
+          f"{360*math.sqrt(cfg.KP_IMP_MAX/cfg.J_MIN)/(2*math.pi)*cfg.LOOP_DELAY_S:.0f}"
           f" deg, which is the shake")
 
     # -- the torque gate ---------------------------------------------------
     g = TorqueGate(tau_cap=1.0)
     g.start(0.0, np.zeros(12))
     check("the ramp opens over TORQUE_RAMP_S, not base's 1.0 s",
-          abs(g.cap_now(P.TORQUE_RAMP_S) - 1.0) < 1e-12
-          and g.cap_now(P.TORQUE_RAMP_S / 2) < 1.0)
+          abs(g.cap_now(cfg.TORQUE_RAMP_S) - 1.0) < 1e-12
+          and g.cap_now(cfg.TORQUE_RAMP_S / 2) < 1.0)
     # measure the SLEW, which means letting the ramp finish first -- otherwise
     # this reads the cap opening, not the rate limiter
     g.last_time = 10.0
-    out = g.apply(np.full(12, 5.0), np.zeros(12), 10.0 + P.SWEEP_S)
+    out = g.apply(np.full(12, 5.0), np.zeros(12), 10.0 + cfg.SWEEP_S)
     check("the slew is the torque-mode 60 Nm/s, not the position track's 5",
-          abs(float(out[0]) - P.TAU_SLEW_NM_S * P.SWEEP_S) < 1e-9,
+          abs(float(out[0]) - cfg.TAU_SLEW_NM_S * cfg.SWEEP_S) < 1e-9,
           f"{float(out[0])*1e3:.1f} mNm in one sweep; base's 5 Nm/s would give "
-          f"{base.TAU_SLEW_NM_S*P.SWEEP_S*1e3:.1f}")
-    dqd = P.TAU_SLEW_NM_S * P.SWEEP_S ** 2 / P.J_MIN
+          f"{base.TAU_SLEW_NM_S*cfg.SWEEP_S*1e3:.1f}")
+    dqd = cfg.TAU_SLEW_NM_S * cfg.SWEEP_S ** 2 / cfg.J_MIN
     check("...which is bounded: one sweep at the slew adds ~0.1 rad/s",
           dqd < 0.2, f"{dqd:.3f} rad/s per sweep vs the 7.0 e-stop")
     g2 = TorqueGate(tau_cap=1.0)
@@ -1168,20 +1502,20 @@ def self_test():
     # 38 mm off.  Nothing else in the stack can see that.  So: ask for a
     # height, and demand the pose that comes back MEASURES that height.
     worst_frame = 0.0
-    for z_ask in (0.05, 0.09, 0.12, P.STAND_HEIGHT):
+    for z_ask in (0.05, 0.09, 0.12, cfg.STAND_TRUNK_BOTTOM_M):
         q_at = q_ref_for_height(Q_CROUCH.copy(), z_ask, foot_xy)
         worst_frame = max(worst_frame, abs(height_of(q_at) - z_ask))
     check("ask for a height and the pose MEASURES that height -- the IK and "
           "the estimator agree on which point it is",
           worst_frame < 1e-9,
           f"worst {worst_frame*1e6:.3f} um over 4 heights; a frame mismatch "
-          f"here is a silent {P.IMU_BELOW_TRUNK_ORIGIN_M*1e3:.0f} mm and the "
+          f"here is a silent {cfg.IMU_BELOW_TRUNK_ORIGIN_M*1e3:.0f} mm and the "
           f"log cannot show it")
-    q_st_f = q_ref_for_height(Q_CROUCH.copy(), P.STAND_HEIGHT, foot_xy)
+    q_st_f = q_ref_for_height(Q_CROUCH.copy(), cfg.STAND_TRUNK_BOTTOM_M, foot_xy)
     check("...and it is the TRUNK BOTTOM, not the hip axis (the 38 mm)",
           abs(fe.fk_trunk_height(q_st_f, np.eye(3), ALL4, ref="hip")
-              - P.STAND_HEIGHT - P.IMU_BELOW_TRUNK_ORIGIN_M) < 1e-9,
-          f"stand pose measures {P.STAND_HEIGHT*1e3:.0f} mm at the trunk "
+              - cfg.STAND_TRUNK_BOTTOM_M - cfg.IMU_BELOW_TRUNK_ORIGIN_M) < 1e-9,
+          f"stand pose measures {cfg.STAND_TRUNK_BOTTOM_M*1e3:.0f} mm at the trunk "
           f"bottom, "
           f"{fe.fk_trunk_height(q_st_f, np.eye(3), ALL4, ref='hip')*1e3:.0f} "
           f"mm at the hip axis")
@@ -1214,18 +1548,18 @@ def self_test():
     # A single jump from crouch to stand is not how this is ever called, and
     # with a plain Newton step it diverges by 330 mm -- the damped step and the
     # warm start are both load-bearing.
-    n = int(P.T_RISE * P.CONTROL_HZ / P.MODEL_EVERY)
+    n = int(cfg.T_RISE * cfg.CONTROL_HZ / cfg.MODEL_EVERY)
     q_ref = Q_CROUCH.copy()
     worst_lag = 0.0
     for k in range(n + 1):
-        z_des = dm.height_ramp(z0, P.STAND_HEIGHT, k / n)
+        z_des = dm.height_ramp(z0, cfg.STAND_TRUNK_BOTTOM_M, k / n)
         q_ref = q_ref_for_height(q_ref, z_des, foot_xy)
         worst_lag = max(worst_lag, abs(height_of(q_ref) - z_des))
     check("q_ref tracks the whole 8 s rise, never lagging the reference",
           worst_lag < 1e-6, f"worst lag over {n} steps: {worst_lag*1e6:.3f} um")
     check("...and lands exactly on the stand height",
-          abs(height_of(q_ref) - P.STAND_HEIGHT) < 1e-6,
-          f"{height_of(q_ref)*1e3:.4f} mm vs {P.STAND_HEIGHT*1e3:.1f}")
+          abs(height_of(q_ref) - cfg.STAND_TRUNK_BOTTOM_M) < 1e-6,
+          f"{height_of(q_ref)*1e3:.4f} mm vs {cfg.STAND_TRUNK_BOTTOM_M*1e3:.1f}")
     xy_err = max(float(np.max(np.abs(
         st.leg_frames(LEGS[i], q_ref[3*i:3*i+3])[0][:2] - foot_xy[i])))
         for i in range(4))
@@ -1240,12 +1574,12 @@ def self_test():
           f"max joint travel {np.rad2deg(np.max(np.abs(q_ref-Q_CROUCH))):.1f} "
           f"deg -- last week's runner froze q_ref here, so the impedance "
           f"fought the rise all the way up")
-    step = (P.STAND_HEIGHT - z0) / n
+    step = (cfg.STAND_TRUNK_BOTTOM_M - z0) / n
     check("one 83 Hz step of the rise is a fraction of a mm",
           step < 5e-4, f"{step*1e3:.3f} mm per model update")
 
     # -- open loop really is open: no state error can reach the wrench ------
-    g0 = dm.default_gains()
+    g0 = cfg.gains()
     g0.kp_z = g0.kd_z = g0.kp_roll = g0.kd_roll = 0.0
     g0.kp_pitch = g0.kd_pitch = g0.kd_x = g0.kd_y = g0.kd_yaw = 0.0
     rng_states = [
@@ -1255,18 +1589,18 @@ def self_test():
                             (0.30, (-.5, 0.4, -0.2), (-0.1, 0.3), (-2, 1, 3)))]
     check("--open-loop wrench is [0,0,mg,0,0,0] whatever the state does",
           all(np.allclose(dm.body_wrench(s, 0.19, gains=g0),
-                          [0, 0, P.WEIGHT_N, 0, 0, 0]) for s in rng_states),
+                          [0, 0, cfg.WEIGHT, 0, 0, 0]) for s in rng_states),
           "the diagnostic baseline cannot be perturbed by any estimate")
 
     # -- the velocity path that caused the 2026-08-17 shake -----------------
     # Replay the measured glitch through both paths and demand the fix holds.
-    q_st = q_ref_for_height(Q_CROUCH.copy(), P.STAND_HEIGHT, foot_xy)
+    q_st = q_ref_for_height(Q_CROUCH.copy(), cfg.STAND_TRUNK_BOTTOM_M, foot_xy)
     spike = np.zeros(12)
     spike[0] = 8.1                      # what the driver field reported
     v_bad, _ = fe.leg_odometry_velocity(q_st, spike, np.eye(3), np.zeros(3),
                                         ALL4)
-    F_bad = abs(P.KD_Z * v_bad[2]) + abs(P.KD_X * v_bad[0]) \
-        + abs(P.KD_Y * v_bad[1])
+    F_bad = abs(cfg.KD_POS[2] * v_bad[2]) + abs(cfg.KD_POS[0] * v_bad[0]) \
+        + abs(cfg.KD_POS[1] * v_bad[1])
     # THE THRESHOLD IS THE GAIN'S, NOT A FIXED FRACTION OF THE WEIGHT.  This
     # asserted F_bad > 20% of the weight, which was written when kd_z was 120
     # and the glitch was worth 33 N.  At the verified kd_z = 40 the same
@@ -1275,64 +1609,272 @@ def self_test():
     # that has since moved.  What matters is that ONE bad reading is worth
     # more than the height loop's own resolution, so compare it to what a
     # millimetre of real height error commands.
-    F_mm = P.KP_Z * 0.001
+    F_mm = cfg.KP_POS[2] * 0.001
     check("the measured 8.1 rad/s glitch is worth more than a mm of real error",
           F_bad > 3.0 * F_mm,
           f"{F_bad:.1f} N from one bad reading, against {F_mm:.2f} N for a "
           f"whole millimetre of height -- {F_bad/F_mm:.0f} mm of phantom "
-          f"height, on a {P.WEIGHT_N:.0f} N robot")
+          f"height, on a {cfg.WEIGHT:.0f} N robot")
 
     # the encoder path, driven by a joint that is NOT moving
     qd_enc = np.zeros(12)
     for _ in range(200):                # a stationary joint, quantised encoder
-        qd_enc += P.QD_ALPHA * (0.0 - qd_enc)
+        qd_enc += cfg.QD_ALPHA * (0.0 - qd_enc)
     check("a stationary joint differences to zero -- an encoder cannot glitch",
           float(np.max(np.abs(qd_enc))) < 1e-9)
     # worst case: one encoder LSB of jitter every sweep
     lsb = np.deg2rad(0.01)
     qd_j = 0.0
     for k in range(400):
-        qd_j += P.QD_ALPHA * ((lsb if k % 2 else -lsb) / P.SWEEP_S - qd_j)
+        qd_j += cfg.QD_ALPHA * ((lsb if k % 2 else -lsb) / cfg.SWEEP_S - qd_j)
     spike_j = np.zeros(12)
     spike_j[0] = abs(qd_j)
     v_j, _ = fe.leg_odometry_velocity(q_st, spike_j, np.eye(3), np.zeros(3),
                                       ALL4)
-    F_j = abs(P.KD_Z * v_j[2]) + abs(P.KD_X * v_j[0]) + abs(P.KD_Y * v_j[1])
+    F_j = abs(cfg.KD_POS[2] * v_j[2]) + abs(cfg.KD_POS[0] * v_j[0]) + abs(cfg.KD_POS[1] * v_j[1])
     check("encoder quantisation dither is a NEGLIGIBLE force by comparison",
-          F_j < 0.01 * P.WEIGHT_N and F_j < F_bad / 50,
+          F_j < 0.01 * cfg.WEIGHT and F_j < F_bad / 50,
           f"{F_j:.2f} N vs {F_bad:.1f} N -- {F_bad/max(F_j,1e-9):.0f}x better")
     check("...and negligible through the impedance damper too",
-          P.KD_IMP * abs(qd_j) < 0.05 * P.TAU_START_MAX,
-          f"{P.KD_IMP*abs(qd_j):.4f} Nm vs {P.KD_IMP*8.1:.2f} Nm from the glitch")
+          cfg.KD_IMP * abs(qd_j) < 0.05 * cfg.TAU_START_MAX,
+          f"{cfg.KD_IMP*abs(qd_j):.4f} Nm vs {cfg.KD_IMP*8.1:.2f} Nm from the glitch")
 
     # the low pass that was not one
-    dt_outer = P.MODEL_EVERY / P.CONTROL_HZ
-    alpha = 1.0 - np.exp(-2 * np.pi * P.ODOM_LPF_FC_HZ * dt_outer)
+    dt_outer = cfg.MODEL_EVERY / cfg.CONTROL_HZ
+    alpha = 1.0 - np.exp(-2 * np.pi * cfg.ODOM_LPF_FC_HZ * dt_outer)
     check("the odometry low pass is actually a low pass at the OUTER rate",
           alpha < 0.5,
           f"alpha={alpha:.2f} at {1/dt_outer:.0f} Hz; the old 20 Hz corner "
           f"gave {1-np.exp(-2*np.pi*20*dt_outer):.2f}, i.e. no filtering")
     check("...while still far above the height loop it feeds",
-          P.ODOM_LPF_FC_HZ > 2.0 * np.sqrt(P.KP_Z / P.MASS_KG) / (2 * np.pi),
-          f"{P.ODOM_LPF_FC_HZ:.0f} Hz filter vs "
-          f"{np.sqrt(P.KP_Z/P.MASS_KG)/2/np.pi:.2f} Hz height loop")
+          cfg.ODOM_LPF_FC_HZ > 2.0 * np.sqrt(cfg.KP_POS[2] / cfg.MASS) / (2 * np.pi),
+          f"{cfg.ODOM_LPF_FC_HZ:.0f} Hz filter vs "
+          f"{np.sqrt(cfg.KP_POS[2]/cfg.MASS)/2/np.pi:.2f} Hz height loop")
+
+    # -- the 250 Hz law is the SAME law, just evaluated later ---------------
+    # THIS IS A REFACTOR AND MUST PROVE IT.  The 83 Hz code that shipped t1..t8
+    # built tau from f inside ft.stance_torque and added swing_torque on top;
+    # leg_torque_block does both from a q that is one sweep old instead of
+    # three.  If the two disagree at the SAME q, the move changed the law and
+    # not just when it is evaluated -- so they are held to machine precision.
+    g_st = cfg.gains()
+    st_state = {"r": np.array([0.0, 0.0, cfg.STAND_TRUNK_BOTTOM_M]),
+                "v": np.zeros(3), "C": np.eye(3), "w": np.zeros(3),
+                "z_hip": 0.0}
+    q_s = q_ref_for_height(Q_CROUCH.copy(), cfg.STAND_TRUNK_BOTTOM_M, fxy_st())
+    qd_s = np.full(N_JOINTS, 0.3)          # NOT zero: the kd_joint term must
+    W_s = dm.body_wrench(st_state, cfg.STAND_TRUNK_BOTTOM_M, cfg.MASS, gains=g_st)
+    for frac in (1.0, 0.6):
+        tau_old, dg = ft.stance_torque(q_s, qd_s, st_state, W_s, ALL4, g_st,
+                                       force_frac=frac, leg_gravity=True)
+        ff = np.array([frac * dg["forces"][l] for l in LEGS])
+        tau_new = leg_torque_block(q_s, qd_s, ff, ALL4,
+                                   st.gravity_down_body(st_state["C"]),
+                                   kd_joint=g_st.kd_joint)
+        check(f"the sweep-rate stance law IS force_totorque's, force_frac={frac}",
+              float(np.max(np.abs(tau_new - tau_old))) < 1e-12,
+              f"worst joint differs by {np.max(np.abs(tau_new-tau_old)):.2e} Nm "
+              f"over 12 joints")
+
+    # A SWINGING LEG: leg gravity from stance_torque PLUS swing_torque was the
+    # old sum, and swing_torque is kept in the file precisely to be this half.
+    planted_t = np.array([True, False, False, True])
+    tau_old, dg = ft.stance_torque(q_s, qd_s, st_state, W_s, planted_t, g_st,
+                                   force_frac=1.0, leg_gravity=True)
+    p_d = np.zeros((4, 3))
+    v_d = np.zeros((4, 3))
+    for i in (1, 2):
+        p_d[i], v_d[i] = swing_foot_body(i, 0.37, cfg.STAND_TRUNK_BOTTOM_M, fxy_st(),
+                                         0.02, (0.003, -0.002))
+        sl = slice(3 * i, 3 * i + 3)
+        tau_old[sl] += swing_torque(i, q_s[sl], qd_s[sl], p_d[i], v_d[i], 8.3)
+    ff = np.zeros((4, 3))
+    for k, leg in enumerate(LEGS):
+        if planted_t[k] and leg in dg["forces"]:
+            ff[k] = dg["forces"][leg]
+    tau_new = leg_torque_block(q_s, qd_s, ff, planted_t,
+                               st.gravity_down_body(st_state["C"]),
+                               p_d, v_d, 8.3, kd_joint=g_st.kd_joint)
+    check("...and the sweep-rate SWING law is swing_torque + leg gravity",
+          float(np.max(np.abs(tau_new - tau_old))) < 1e-12,
+          f"worst {np.max(np.abs(tau_new-tau_old)):.2e} Nm across a diagonal "
+          f"stance with two legs in the air")
+
+    # The estimator-refused fallback must not have become something else.
+    check("zero force and no tilt IS force_totorque.leg_gravity_only",
+          float(np.max(np.abs(
+              leg_torque_block(q_s, qd_s, np.zeros((4, 3)),
+                               np.zeros(4, dtype=bool), None)
+              - ft.leg_gravity_only(q_s)))) < 1e-12,
+          "the LIMP branch is the same three torques it always was")
+
+    # THE POINT OF THE MOVE: J must not be frozen.  Perturb q by one model
+    # block's worth of swing travel and the torque has to move with it.
+    q_late = q_s.copy()
+    q_late[3:6] += 0.02                      # ~1 deg on a leg, 12 ms of swing
+    d = np.max(np.abs(leg_torque_block(q_late, qd_s, ff, planted_t, None,
+                                       p_d, v_d, 8.3)
+                      - leg_torque_block(q_s, qd_s, ff, planted_t, None,
+                                         p_d, v_d, 8.3)))
+    check("a stale q would have been worth real torque, so J is not frozen",
+          d > 0.01,
+          f"{d:.3f} Nm between a fresh q and one 12 ms old -- what the 83 Hz "
+          f"map was silently commanding")
+
+    # -- the logged force must reconstruct the ACHIEVED wrench --------------
+    # W in the npz is what the PD law ASKED for.  The whole reason f_foot is
+    # logged is that the answer after the clamps is a different wrench, and
+    # the yaw half of it cannot be seen any other way.
+    tau_old, dg = ft.stance_torque(q_s, qd_s, st_state, W_s, ALL4, g_st)
+    feet = [st.leg_frames(l, q_s[3*k:3*k+3])[0] for k, l in enumerate(LEGS)]
+    G = ft.grasp_map(feet, list(LEGS), st_state["C"], dg["com_body"])
+    f_w = np.concatenate([st_state["C"].T @ dg["forces"][l] for l in LEGS])
+    W_ach = G @ f_w
+    check("f_foot + q + planted reconstruct the wrench the feet PRODUCED",
+          float(np.max(np.abs(W_ach - W_s))) < 0.05,
+          f"|G f - W| = {np.max(np.abs(W_ach - W_s)):.4f} N/Nm on an "
+          f"unclamped four-foot stand (GRASP_LAMBDA leaves the residual)")
+    check("...and that reconstruction is what carries Mz, which W cannot",
+          abs(W_s[5]) < 1e-12,
+          f"commanded Mz is identically {W_s[5]:.1e} at kd_yaw="
+          f"{g_st.kd_yaw:.0f}; the achieved Mz is {W_ach[5]:+.4f} Nm and only "
+          f"the tangential forces know it")
+
+    # -- foot placement: the horizontal loop, and the arc it rides on ------
+    fxy = [st.leg_frames(LEGS[k], Q_CROUCH[3*k:3*k+3])[0][:2] for k in range(4)]
+    zh = cfg.STAND_TRUNK_BOTTOM_M
+
+    # THE REGRESSION GUARD FIRST.  Every t*.npz was flown with the vertical
+    # arc, and they stay comparable to the next run only if the default
+    # argument reproduces that arc EXACTLY -- not to a tolerance.
+    same = all(
+        np.array_equal(swing_foot_body(i, s, zh, fxy)[0][:2],
+                       np.array([fxy[i][0], fxy[i][1]]))
+        and swing_foot_body(i, s, zh, fxy)[1][0] == 0.0
+        and swing_foot_body(i, s, zh, fxy)[1][1] == 0.0
+        for i in range(4) for s in np.linspace(0, 1, 41))
+    check("the default step reproduces the t1..t8 vertical arc exactly", same,
+          "x/y bit-identical to foot_xy and horizontal v exactly 0")
+
+    # v_des has to BE dp_des/ds or the impedance damps against a lie -- the
+    # same check swing.py makes of its own reference, made here because this
+    # is a DIFFERENT reference and inherits none of that proof.
+    step = np.array([0.004, -0.003])
+    ss = np.linspace(0.001, 0.999, 401)
+    P_ = np.array([swing_foot_body(0, s, zh, fxy, 0.02, step)[0] for s in ss])
+    V_ = np.array([swing_foot_body(0, s, zh, fxy, 0.02, step)[1] for s in ss])
+    # INTERIOR ONLY: np.gradient is second-order in the middle and FIRST
+    # order at the two ends, so the edge samples measure the stencil rather
+    # than the arc -- they read 0.59 mm/phase on a reference that is exact.
+    num = np.gradient(P_, ss, axis=0)[1:-1]
+    err = float(np.max(np.abs(num - V_[1:-1])))
+    check("v_des is the true d(p_des)/ds, horizontal included", err < 1e-4,
+          f"worst |v_num - v_des| = {err*1e3:.4f} mm/phase over 399 interior "
+          f"samples")
+
+    # A step that arrives with horizontal speed scuffs; one that STARTS with
+    # horizontal speed is a p_des discontinuity into a 200 N/m impedance.
+    v0 = swing_foot_body(0, 0.0, zh, fxy, 0.02, step)[1]
+    v1 = swing_foot_body(0, 1.0, zh, fxy, 0.02, step)[1]
+    check("the horizontal starts and ends at zero speed",
+          abs(v0[0]) + abs(v0[1]) + abs(v1[0]) + abs(v1[1]) < 1e-12)
+    p0 = swing_foot_body(0, 0.0, zh, fxy, 0.02, step)[0]
+    p1 = swing_foot_body(0, 1.0, zh, fxy, 0.02, step)[0]
+    check("...and it travels exactly the planned step, lift to land",
+          np.allclose(p1[:2] - p0[:2], step, atol=1e-12),
+          f"{(p1[:2]-p0[:2])*1e3} mm vs {step*1e3} mm asked")
+
+    # TROTTING IN PLACE MUST BE UNAFFECTED, or the flag is not an A/B: at zero
+    # drift and zero command the step is zero and the arc is the old one.
+    T_st = cfg.DUTY * cfg.GAIT_PERIOD
+    z = raibert_step_body(0, np.zeros(3), np.eye(3), T_st, cfg.RAIBERT_KV,
+                          zh, fxy)
+    check("a robot with no drift plans no step at all",
+          float(np.max(np.abs(z))) == 0.0, f"{z*1e3} mm")
+
+    # The sign is the whole mechanism: drifting +x, the foot goes +x, AHEAD of
+    # the body, and the stance that follows pushes it back.  A sign slip here
+    # is a positive feedback that empties the workspace in two cycles, and it
+    # would look exactly like the drift it was meant to fix.
+    s_fwd = raibert_step_body(0, np.array([0.02, 0.0, 0.0]), np.eye(3), T_st,
+                              cfg.RAIBERT_KV, zh, fxy)
+    check("the foot is placed DOWNSTREAM of the drift, not against it",
+          s_fwd[0] > 0.0 and abs(s_fwd[1]) < 1e-12,
+          f"+20 mm/s of x drift -> {s_fwd[0]*1e3:+.1f} mm step")
+    check("...and the symmetry term alone is v*t_stance/2, to the mm",
+          abs(raibert_step_body(0, np.array([0.02, 0.0, 0.0]), np.eye(3),
+                                T_st, 0.0, zh, fxy)[0]
+              - 0.02 * 0.5 * T_st) < 1e-9,
+          f"{0.02*0.5*T_st*1e3:.2f} mm at t_stance = {T_st*1e3:.0f} ms")
+
+    # The clamp, at the height it actually bites: a 1 m/s step is absurd and
+    # is exactly what a single bad odometry sample looks like.
+    big = raibert_step_body(0, np.array([1.0, 0.0, 0.0]), np.eye(3), T_st,
+                            cfg.RAIBERT_KV, zh, fxy)
+    hip0 = np.asarray(cfg.HIP_OFFSET[0], dtype=float)
+    z_site = -(fe.hip_from_imu(zh) - cfg.FOOT_RADIUS_M)
+    land = np.array([fxy[0][0] + big[0], fxy[0][1] + big[1], z_site])
+    check("a wild velocity is clamped inside 95% of the leg's reach",
+          float(np.linalg.norm(land - hip0)) <= 0.95 * cfg.LEG_REACH + 1e-9,
+          f"1 m/s asks {1.0*0.5*T_st*1e3:.0f} mm, clamp gives "
+          f"{big[0]*1e3:.1f} mm")
+    check("...and the clamp holds the LANDING HEIGHT, not just the length",
+          abs(land[2] - z_site) < 1e-15,
+          "a foot pulled in must still arrive at the floor")
+
+    # THE ROOM MUST BE POSITIVE AT THE HEIGHT ACTUALLY FLOWN, or the flag is
+    # a no-op that still prints a banner: every step would clamp to zero and
+    # the run would look like placement was on and did nothing.
+    check("there IS step room at the stand height this runner flies",
+          _step_room(zh) > 0.005,
+          f"{_step_room(zh)*1e3:.1f} mm at {zh*1e3:.0f} mm trunk-bottom "
+          f"({fe.hip_from_imu(zh)*1e3:.0f} mm at the hip axis)")
+    # config.py's table is in the OLD HIP-AXIS FRAME and z_des here is the
+    # TRUNK BOTTOM -- the same 38 mm that made STAND_HEIGHT 0.152, and the
+    # reason 0.190 is quoted nowhere in this block.  Compare heights this
+    # runner can actually be given.
+    check("crouching buys step room, which is the only way to buy it",
+          _step_room(zh - 0.012) > 2.0 * _step_room(zh),
+          f"{_step_room(zh)*1e3:.1f} mm at {zh*1e3:.0f}, "
+          f"{_step_room(zh-0.012)*1e3:.1f} mm 12 mm lower")
+
+    # The banner quotes a drift speed the loop can still correct; it has to be
+    # the speed at which the clamp starts truncating, not a nearby number.
+    kv = cfg.RAIBERT_KV
+    v_edge = _step_room(zh) / (0.5 * T_st + kv)
+    s_edge = raibert_step_body(0, np.array([v_edge * 0.98, 0.0, 0.0]),
+                               np.eye(3), T_st, kv, zh, fxy)
+    check("the banner's max correctable drift is where the clamp starts",
+          abs(s_edge[0] - v_edge * 0.98 * (0.5 * T_st + kv)) < 1e-6,
+          f"{v_edge:.3f} m/s at {zh*1e3:.0f} mm -- unclamped just below it")
 
     # -- the loop's own timing budget --------------------------------------
     check("the sub-sampled model still updates faster than the body moves",
-          P.CONTROL_HZ / P.MODEL_EVERY > 50.0,
-          f"{P.CONTROL_HZ/P.MODEL_EVERY:.0f} Hz model, "
-          f"{P.CONTROL_HZ/P.LOAD_EVERY:.0f} Hz load check")
+          cfg.CONTROL_HZ / cfg.MODEL_EVERY > 50.0,
+          f"{cfg.CONTROL_HZ/cfg.MODEL_EVERY:.0f} Hz model, "
+          f"{cfg.CONTROL_HZ/cfg.LOAD_EVERY:.0f} Hz load check")
     # The staggering is the whole reason a single thread is safe here: without
     # it the two heavy blocks coincide and one sweep is 2.41 ms late instead
     # of 1.38.  Prove they cannot collide, do not assert it in a comment.
-    collide = [s for s in range(P.MODEL_EVERY * P.LOAD_EVERY)
-               if s % P.MODEL_EVERY == 0 and s % P.LOAD_EVERY == P.LOAD_OFFSET]
+    collide = [s for s in range(cfg.MODEL_EVERY * cfg.LOAD_EVERY)
+               if s % cfg.MODEL_EVERY == 0 and s % cfg.LOAD_EVERY == cfg.LOAD_OFFSET]
     check("the model and load blocks can NEVER land in the same sweep",
-          not collide, f"checked all {P.MODEL_EVERY*P.LOAD_EVERY} phases")
-    check("the worst single-sweep delay is inside half the driver watchdog",
-          0.00138 < P.WATCHDOG_S / 2,
-          f"measured 1.38 ms model block vs {P.WATCHDOG_S*1e3:.0f} ms watchdog "
-          f"(2.41 ms if they were not staggered)")
+          not collide, f"checked all {cfg.MODEL_EVERY*cfg.LOAD_EVERY} phases")
+    # THE WORST SWEEP GREW when the map moved to the sweep rate, and this
+    # check has to grow with it or it is measuring last week's loop.  Time the
+    # block rather than quote a number: a slower Pi, or a fifth leg, moves it.
+    _t0 = time.perf_counter()
+    for _ in range(50):
+        leg_torque_block(q_s, qd_s, ff, planted_t, None, p_d, v_d, 8.3)
+    _blk = (time.perf_counter() - _t0) / 50
+    check("the sweep-rate map fits in a sweep, beside the model block",
+          0.00138 + _blk < cfg.SWEEP_S,
+          f"1.38 ms model + {_blk*1e3:.2f} ms map = {(0.00138+_blk)*1e3:.2f} ms "
+          f"of the {cfg.SWEEP_S*1e3:.0f} ms sweep; SLOT_S is {cfg.SLOT_S*1e6:.0f} us "
+          f"and mb.pace borrows across slots, which is what makes this legal")
+    check("...and the worst sweep is still inside half the driver watchdog",
+          0.00138 + _blk < cfg.WATCHDOG_S / 2,
+          f"{(0.00138+_blk)*1e3:.2f} ms vs {cfg.WATCHDOG_S*1e3:.0f} ms watchdog")
 
     # -- the stage machine's one irreversible rule -------------------------
     # z_crouch is MEASURED, so recompute it here rather than carrying the
@@ -1340,15 +1882,15 @@ def self_test():
     # crouch and the frame change made it silently wrong by 38 mm.
     z_cr = height_of(Q_CROUCH)
     check("RISE starts at the MEASURED crouch height, never at the target",
-          dm.height_ramp(z_cr, P.STAND_HEIGHT, 0.0) == z_cr,
-          f"a {P.STAND_HEIGHT:.3f} setpoint at the {z_cr:.3f} crouch would ask "
-          f"{P.KP_Z*(P.STAND_HEIGHT-z_cr) + P.WEIGHT_N:.0f} N on sweep 1, "
-          f"{(P.KP_Z*(P.STAND_HEIGHT-z_cr)+P.WEIGHT_N)/P.WEIGHT_N:.1f}x weight")
+          dm.height_ramp(z_cr, cfg.STAND_TRUNK_BOTTOM_M, 0.0) == z_cr,
+          f"a {cfg.STAND_TRUNK_BOTTOM_M:.3f} setpoint at the {z_cr:.3f} crouch would ask "
+          f"{cfg.KP_POS[2]*(cfg.STAND_TRUNK_BOTTOM_M-z_cr) + cfg.WEIGHT:.0f} N on sweep 1, "
+          f"{(cfg.KP_POS[2]*(cfg.STAND_TRUNK_BOTTOM_M-z_cr)+cfg.WEIGHT)/cfg.WEIGHT:.1f}x weight")
     check("...and the rise TRAVEL is unchanged by the frame change",
-          abs((P.STAND_HEIGHT - z_cr)
+          abs((cfg.STAND_TRUNK_BOTTOM_M - z_cr)
               - (0.190 - fe.fk_trunk_height(Q_CROUCH, np.eye(3), ALL4,
                                             ref="hip"))) < 1e-9,
-          f"{(P.STAND_HEIGHT - z_cr)*1e3:.1f} mm of travel either way -- a "
+          f"{(cfg.STAND_TRUNK_BOTTOM_M - z_cr)*1e3:.1f} mm of travel either way -- a "
           f"constant offset cancels in a difference, which is why the shake "
           f"work was unaffected by the frame being wrong")
 
@@ -1358,12 +1900,12 @@ def self_test():
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--port", default=None)
-    ap.add_argument("--height", type=float, default=P.STAND_HEIGHT)
-    ap.add_argument("--mass", type=float, default=P.MASS_KG)
-    ap.add_argument("--tau-max", type=float, default=P.TAU_START_MAX)
-    ap.add_argument("--kp", type=float, default=P.KP_IMP)
-    ap.add_argument("--kd", type=float, default=P.KD_IMP)
-    ap.add_argument("--force-frac", type=float, default=P.FORCE_FRAC_DEFAULT)
+    ap.add_argument("--height", type=float, default=cfg.STAND_TRUNK_BOTTOM_M)
+    ap.add_argument("--mass", type=float, default=cfg.MASS)
+    ap.add_argument("--tau-max", type=float, default=cfg.TAU_START_MAX)
+    ap.add_argument("--kp", type=float, default=cfg.KP_IMP)
+    ap.add_argument("--kd", type=float, default=cfg.KD_IMP)
+    ap.add_argument("--force-frac", type=float, default=cfg.FORCE_FRAC_DEFAULT)
     ap.add_argument("--no-leg-gravity", dest="leg_gravity",
                     action="store_false",
                     help="reproduce the 2026-07-30 stance law (A/B only)")
@@ -1389,21 +1931,35 @@ def main():
                          "gain --open-loop zeroes that no other flag could: "
                          "zeroing kp-z/kd-z/kd-xy/kp-att/kd-att left it live "
                          "at 4.0 and the banner did not show it")
-    ap.add_argument("--setpoint-roll", type=float, default=P.SETPOINT_ROLL_DEG,
+    ap.add_argument("--setpoint-roll", type=float, default=cfg.SETPOINT_ROLL_DEG,
                     help="resting attitude of THIS rig in deg, subtracted from "
                          "every AHRS reading.  Read the pair the WAIT stage "
                          "prints; 0 means the IMU mount's own tilt is fed to "
                          "the wrench as a real one")
     ap.add_argument("--setpoint-pitch", type=float,
-                    default=P.SETPOINT_PITCH_DEG)
-    ap.add_argument("--period", type=float, default=tcfg.GAIT_PERIOD,
+                    default=cfg.SETPOINT_PITCH_DEG)
+    ap.add_argument("--period", type=float, default=cfg.GAIT_PERIOD,
                     help="trot cycle (s)")
-    ap.add_argument("--duty", type=float, default=tcfg.DUTY,
+    ap.add_argument("--duty", type=float, default=cfg.DUTY,
                     help="stance fraction.  0.5 is the textbook trot and has "
                          "ZERO double support; the contact ramp then has "
                          "nowhere to hand the load over")
-    ap.add_argument("--swing-height", type=float, default=tcfg.SWING_HEIGHT,
+    ap.add_argument("--swing-height", type=float, default=cfg.SWING_HEIGHT,
                     help="swing apex above the resting foot site (m)")
+    ap.add_argument("--raibert", type=float, default=None, metavar="KV",
+                    help="TURN FOOT PLACEMENT ON, with this kv (s).  OMITTED "
+                         "IS OFF, and off is the default because no hardware "
+                         "log stands behind any value yet -- t1..t8 were all "
+                         "flown with a purely vertical swing.  Passing the "
+                         "flag enables BOTH terms of "
+                         "step = v*(t_stance/2) + kv*(v - v_cmd); kv is the "
+                         "only tunable half, so --raibert 0 (symmetry term "
+                         "alone) is the A/B against no flag at all.  This is "
+                         "the ONLY horizontal feedback the runner has: the "
+                         "wrench has no kp on x/y and cannot get one without "
+                         "an EKF, so with the flag off x, y and yaw are open "
+                         "loop and drift integrates unopposed.  Start at "
+                         f"{cfg.RAIBERT_KV} and read step_xy in the log.")
     ap.add_argument("--lead-diagonal", choices=("fr-rl", "fl-rr"),
                     default="fr-rl",
                     help="which diagonal leaves the ground FIRST after T.  "
@@ -1415,7 +1971,7 @@ def main():
                          "(-6 -> -12 deg), so if the sign follows the lead "
                          "diagonal the roll is the handover, and if it does "
                          "not it is a fixed bias -- CoM, mount or leg zeros.")
-    ap.add_argument("--tilt-stop", type=float, default=P.TILT_STOP_DEG,
+    ap.add_argument("--tilt-stop", type=float, default=cfg.TILT_STOP_DEG,
                     help="attitude that stops the run (deg).  0 DISABLES IT.  "
                          "The default is params.TILT_STOP_DEG and belongs "
                          "there; this flag is for a diagnostic run only.  "
@@ -1436,8 +1992,14 @@ def main():
 
     if args.self_test:
         return self_test()
-    if not 0.0 < args.tau_max <= P.TAU_STAGED_MAX:
-        ap.error(f"--tau-max must be in (0, {P.TAU_STAGED_MAX}]")
+
+    # BEFORE ANYTHING ARMS.  config.py owns this runner's table, but three
+    # week-2 modules read a handful of constants out of params.py that no
+    # argument can override.  A divergence there is a wrong number inside a
+    # live force loop, so it is a refusal to start instead.
+    cfg.assert_shared(_week2_params)
+    if not 0.0 < args.tau_max <= cfg.TAU_STAGED_MAX:
+        ap.error(f"--tau-max must be in (0, {cfg.TAU_STAGED_MAX}]")
     if not 0.0 <= args.force_frac <= 1.0:
         ap.error("--force-frac must be in [0, 1]")
     return run(args)

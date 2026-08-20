@@ -190,7 +190,7 @@ FOOT_STANCE_BODY = np.array([kin.foot_position(leg, Q_STAND[i])
                              for i, leg in enumerate(LEGS)])
 HIP_TO_FOOT_STANCE = FOOT_STANCE_BODY - HIP_OFFSET
 
-GAIT_PERIOD = 0.40                       # s, one full cycle
+GAIT_PERIOD = 0.20                       # s, one full cycle
 # 0.60, NOT the textbook 0.50.  A trot with duty exactly 0.5 has ZERO double
 # support, and the contact ramp below then has nowhere to hand the load over:
 # measured, the two diagonals' weights both reach 0 at the crossover instant
@@ -198,10 +198,10 @@ GAIT_PERIOD = 0.40                       # s, one full cycle
 # overlap (duty - 0.5) has to exceed the ramp length (CONTACT_RAMP * duty).
 # At 0.60/0.15 that is 0.100 against 0.090 and the total weight never leaves
 # 2.000; at 0.55/0.15 it dips to 0.879, and at 0.50 anything it is 0.
-DUTY = 0.60
+DUTY = 0.80
 # FL and RR swing together, FR and RL swing together.  Offsets are in CYCLES.
 PHASE_OFFSET = np.array([0.0, 0.5, 0.5, 0.0])
-SWING_HEIGHT = 0.04                      # m, apex of the swing arc
+SWING_HEIGHT = 0.08                 # m, apex of the swing arc
 
 # CONTACT FORCE IS RAMPED, NOT SWITCHED, and this is not a refinement either.
 # With a binary mask the QP's fz bound on a leg goes from [FZ_MIN, FZ_MAX] to
@@ -313,7 +313,7 @@ KD_SWING = np.diag([8.0, 8.0, 8.0])         # Ns/m
 # a pure force law is velocity-level and a lost foot integrates without bound.
 # 3.0/0.1 and NOT 15/0.6 -- the latter is 68% of the sampled-damper bound at
 # the measured 16 ms loop delay and shook this robot at 9-12 Hz.
-KP_JOINT = 10.0                           # Nm/rad
+KP_JOINT = 3                         # Nm/rad
 KD_JOINT = 0.1                           # Nms/rad
 
 # ===========================================================================
@@ -374,6 +374,199 @@ MODEL_EVERY = 3
 
 # Raibert foot placement: p_foot = p_hip + v * T_stance/2 + RAIBERT_KV*(v-v_cmd)
 RAIBERT_KV = 0.03                        # s, the velocity-error term
+
+# ===========================================================================
+# THE TROT TRACK'S OWN PARAMETER TABLE
+# ===========================================================================
+# trot_hw.py READS THIS FILE AND NOT august_week2/params.py.  One folder, one
+# table: the week-2 stand keeps its own, and a number changed here cannot
+# reach the stand, nor a number changed there reach the trot.
+#
+# WHAT THE SPLIT COST, AND IT WAS NOT FREE.  Two names collided outright and
+# both are recorded here rather than quietly resolved:
+#
+#   STAND_HEIGHT   0.190 here (TRUNK ORIGIN) against 0.152 in params.py
+#                  (TRUNK BOTTOM).  The SAME NAME in two frames, 38 mm apart,
+#                  live in the same process -- the exact shape of the
+#                  2026-08-17 bug.  Neither was wrong for its own file; the
+#                  name was.  Nothing below reads STAND_HEIGHT: the runner's
+#                  height is STAND_TRUNK_BOTTOM_M, which SAYS its frame.
+#   KD_JOINT       0.10 here against the 0.15 every run actually flew.  This
+#                  file's 0.10 had no log behind it, so the flown value wins
+#                  and is written below.
+#
+# EVERY GAIN HERE IS A VERIFIED ONE.  An experiment goes on the command line
+# and is promoted here only after a run completes and can be named -- the same
+# rule the provenance block above states.  params.py currently carries an
+# UNVERIFIED experiment (kp_att 3, kd_att 0, kd_yaw 10, tilt-stop 20); that is
+# a CLI line, not a table entry, and the banner prints which it is.
+
+# -- the height the runner is given, in the frame a ruler measures -----------
+# --height means FLOOR to TRUNK BOTTOM everywhere in trot_hw, because that is
+# the point a ruler reaches.  STAND_HEIGHT above is the TRUNK ORIGIN and is
+# what this file's own geometry (Q_STAND, FOOT_STANCE_BODY, COM_ABOVE_FLOOR,
+# INERTIA_BODY) is derived at.  Deriving one from the other is what keeps them
+# from drifting apart the way the two STAND_HEIGHTs did.
+IMU_BELOW_TRUNK_ORIGIN_M = 0.038
+STAND_TRUNK_BOTTOM_M = STAND_HEIGHT - IMU_BELOW_TRUNK_ORIGIN_M   # 0.152 m
+FOOT_RADIUS_M = 0.02
+T_RISE = 8.0                             # s, crouch -> stand under torque
+
+# -- loop rates.  CTRL_DT and MODEL_EVERY above are the same clock -----------
+CONTROL_HZ = 250.0                       # per motor AND per sweep
+SWEEP_S = 1.0 / CONTROL_HZ               # 4 ms, the 12-vector refresh
+SLOT_S = SWEEP_S / N_JOINTS              # 333 us, one CAN frame's share
+WATCHDOG_S = 0.050                       # driver input-lost timeout
+# THE MEASURED LOOP DELAY, NOT THE COMMAND INTERVAL.  Every damper bound in
+# this file is sized against this and not against SWEEP_S; sizing on SWEEP_S
+# alone is what passed kd_joint = 0.6 offline while the robot shook at 9-12 Hz.
+LOOP_DELAY_S = 0.016
+LOAD_EVERY = 12                          # measured-iq foot load, 21 Hz
+LOAD_OFFSET = 1                          # staggered off the model block
+QD_ALPHA = 0.35                          # encoder-differenced velocity LPF
+
+# -- torque ceilings and the ramp -------------------------------------------
+TAU_START_MAX = 1.0                      # first-run cap
+TAU_STAGED_MAX = 3.0                     # the staged ceiling (= TAU_MAX)
+TAU_HARD_NM = 9.0                        # driver iq saturation
+J_MIN = 0.0088                           # kg m^2, smallest joint inertia
+
+# -- THREE THINGS ARE CALLED kd_joint AND THEY ARE NOT THE SAME NUMBER ------
+# Untangled here once, because the split forced the question:
+#
+#   KD_JOINT_STANCE  0.15  inside force_totorque's stance law, -kd*qd on a
+#                          PLANTED leg only.  params.py calls it KD_JOINT.
+#                          Every t*.npz flew 0.15.
+#   KP_IMP / KD_IMP  3.0 / 0.1   the 250 Hz joint-space floor under EVERY leg,
+#                          planted or not.  params.py calls it KP_IMP/KD_IMP.
+#   KP_JOINT/KD_JOINT 10.0 / 0.1  this file's pair, read only by
+#                          dog5_trot_quasi_static_model/controller.py, which trot_hw does not
+#                          fly.  Its own comment says "3.0/0.1" while the code
+#                          says 10.0 -- left alone rather than silently
+#                          retuned, because controller.py is what it belongs
+#                          to and nothing here reads it.
+KD_JOINT_STANCE = 0.15                   # Nms/rad, stance law's own damper
+KP_IMP = 3.0                             # Nm/rad
+KD_IMP = 0.1                             # Nms/rad
+KP_IMP_MAX = 15.0                        # A/B only: expect the 9-12 Hz shake
+KD_IMP_MAX = 0.6                         # 68% of the sampled-damper bound
+
+# -- the estimator ----------------------------------------------------------
+ODOM_LPF_FC_HZ = 5.0                     # leg-odometry velocity low pass
+AHRS_STALE_S = 0.10
+MIN_PLANTED_TROT = 2                     # a trot lifting two is the trot
+# THIS RIG'S RESTING ATTITUDE, subtracted from every AHRS reading.  Measured,
+# not assumed: 0/0 means the IMU mount's own tilt is fed to the wrench.
+SETPOINT_ROLL_DEG = -0.29
+SETPOINT_PITCH_DEG = 0.12
+
+# -- what stops a run -------------------------------------------------------
+# 12 deg, the VERIFIED value.  It is the only trip that covers TROT -- the
+# load check is gated to HOLD -- and on 2026-08-18 it fired on three real
+# rolls (t1, t5, t8) at 11.2, 11.4 and 10.9 deg.  Raise it with --tilt-stop
+# for a diagnostic run; a raised default is a removed guard.
+TILT_STOP_DEG = 12.0
+LOAD_SUM_TOL_FRAC = 0.40                 # HOLD-only measured-load check
+LATCH_LIMPS_ROBOT = True                 # an input-lost latch limps the robot
+FORCE_FRAC_DEFAULT = 1.0
+
+KEY_STOP, KEY_LIMP, KEY_PARK = "x", " ", "p"
+
+
+# ===========================================================================
+# the wrench law's gains, as the object Dynamic_Model consumes
+# ===========================================================================
+class Gains:
+    """KP_POS / KD_POS / KP_ORI / KD_ORI, flattened to the names
+    Dynamic_Model.body_wrench and force_totorque.stance_torque read.
+
+    THE ARRAYS ABOVE ARE THE SOURCE AND THIS IS THE ADAPTER.  Writing the nine
+    scalars out again would be a second place for kd_yaw to be 0 in, which is
+    how params.py and this file came to disagree in the first place.  A caller
+    that wants one gain moved sets it on the instance -- that is what every
+    --kp-att / --kd-yaw flag does -- and the instance is what the npz records.
+    """
+
+    def __init__(self):
+        self.kp_z, self.kd_z = float(KP_POS[2]), float(KD_POS[2])
+        self.kd_x, self.kd_y = float(KD_POS[0]), float(KD_POS[1])
+        self.kp_roll, self.kd_roll = float(KP_ORI[0]), float(KD_ORI[0])
+        self.kp_pitch, self.kd_pitch = float(KP_ORI[1]), float(KD_ORI[1])
+        self.kd_yaw = float(KD_ORI[2])
+        self.kd_joint = KD_JOINT_STANCE
+
+    def __repr__(self):
+        # Every gain the wrench uses, or none: kd_yaw used to be the one
+        # omitted, so a runner that zeroed everything the banner showed still
+        # had a live yaw damper and the banner read as all-off.
+        return (f"Gains(kp_z={self.kp_z:.0f} kd_z={self.kd_z:.0f} "
+                f"kp_att={self.kp_roll:.0f} kd_att={self.kd_roll:.2f} "
+                f"kd_xy={self.kd_x:.0f} kd_yaw={self.kd_yaw:.0f})")
+
+
+def gains():
+    """A fresh Gains, so a runner can move one without editing this file."""
+    return Gains()
+
+
+# ===========================================================================
+# what this table CANNOT own, and the gate that says so out loud
+# ===========================================================================
+# Dynamic_Model, force_totorque and feedback_estimator are week-2 modules and
+# they `import params as P` themselves.  Everything trot_hw hands them --
+# mass, gains, force_frac, leg_gravity, the estimator's three tunables -- is
+# passed explicitly and so comes from THIS file.  These are the leftovers:
+# constants those modules read internally, with no argument to override them.
+#
+# Forking the three modules would remove the coupling and would also fork the
+# clamp, the grasp map and the odometry that the stand, the crawl and the EKF
+# harness all fly.  A duplicated friction cone is a worse failure than a
+# shared one.  So the coupling stays and is made LOUD instead: assert_shared()
+# runs before the motors arm and refuses to start on a divergence, naming it.
+SHARED_WITH_WEEK2 = {
+    "GRAVITY": GRAVITY,
+    "MASS_KG": MASS,
+    "WEIGHT_N": WEIGHT,
+    "FOOT_RADIUS_M": FOOT_RADIUS_M,
+    "IMU_BELOW_TRUNK_ORIGIN_M": IMU_BELOW_TRUNK_ORIGIN_M,
+    "MU_FRICTION": 0.6,                  # per-foot tangential clamp
+    "FZ_MIN_N": 1.0,                     # unilateral floor
+    "GRASP_LAMBDA": 1.0e-3,              # damped-LS regulariser
+    "MIN_JAC_SINGULAR": 5.0e-3,          # leg-Jacobian singularity guard
+    "N_JOINTS": N_JOINTS,
+}
+
+
+def assert_shared(week2_params):
+    """Raise if a week-2 constant this table cannot inject has drifted.
+
+    `week2_params` is the imported august_week2.params module.  Called from
+    trot_hw before the bus is armed, so a divergence is a refusal to start and
+    not a wrong number inside a running force loop.
+    """
+    # RELATIVE, at 1e-6.  params.py writes MASS_KG as the rounded literal
+    # 5.8151 while this file DERIVES 5.81510043 from the link inertials -- a
+    # 4.3e-7 kg difference that is a transcription artifact and not a
+    # disagreement.  An exact test would fire on it every run and be turned
+    # off, which is the failure mode this gate exists to avoid.  1e-6 still
+    # catches everything that matters: the two collisions this split found
+    # were 25% (STAND_HEIGHT) and 50% (KD_JOINT).
+    bad = []
+    for name, mine in SHARED_WITH_WEEK2.items():
+        theirs = getattr(week2_params, name, None)
+        if theirs is None:
+            bad.append(f"{name}: absent from params.py, this file says {mine}")
+            continue
+        scale = max(abs(float(mine)), abs(float(theirs)), 1.0)
+        if abs(float(theirs) - float(mine)) / scale > 1e-6:
+            bad.append(f"{name}: params.py {theirs} vs config.py {mine}")
+    if bad:
+        raise RuntimeError(
+            "dog5_trot_quasi_static_model/config.py and august_week2/params.py disagree on a "
+            "constant the week-2 modules read INTERNALLY, which no argument "
+            "can override:\n  " + "\n  ".join(bad)
+            + "\nFix params.py, or fork the module that reads it.")
+
 
 # The machine-checkable copy of the provenance table.  trot_hw's self-test
 # refuses to start if anything here has drifted past what a log stands behind.

@@ -24,7 +24,7 @@ TWO FRAMES, AND THE ONLY DIFFERENCE IS A CONSTANT
 
 RUN
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
-    $V dog5_trot/leg_kin.py --self-test
+    $V dog5_trot_quasi_static_model/leg_kin.py --self-test
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ import numpy as np
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Sibling imports go through the PACKAGE when there is one.  Only a direct
-# `python dog5_trot/<this>.py --self-test` falls back to a path insert, and
+# `python dog5_trot_quasi_static_model/<this>.py --self-test` falls back to a path insert, and
 # that insert is what would shadow the repo's own top-level config.py -- see
 # the package docstring.  Keeping it off the library path is the point.
 if __package__:

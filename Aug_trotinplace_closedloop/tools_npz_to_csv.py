@@ -101,6 +101,24 @@ def columns(d):
         W = np.atleast_2d(d["W"])
         for i, lab in enumerate(WRENCH[:W.shape[1]]):
             put(f"W_{lab}", W[:, i])
+    if "f_foot" in d.files:
+        # (n, 4, 3) BODY-frame force per foot, post-clamp.  Twelve columns and
+        # worth every one: W_* above is what the PD law ASKED for, and these
+        # are what the feet were given after distribute()'s clamps.  G f is the
+        # achieved wrench, and its Mz is the only record of the yaw couple.
+        a = np.asarray(d["f_foot"], dtype=float).reshape(len(d["t"]), 4, 3)
+        for i, lab in enumerate(LEGS):
+            for k, ax in enumerate(XYZ):
+                put(f"f_{lab}_{ax}_N", a[:, i, k])
+    if "step_xy" in d.files:
+        # (n, 4, 2) and so too deep for VEC, which is a table of 2-D fields.
+        # EMITTED IN MILLIMETRES: the reach clamp at the stand height is about
+        # 10 mm, so every honest value in this column is single-digit, and a
+        # metres column reads as a screenful of zeros next to v in m/s.
+        s = np.asarray(d["step_xy"], dtype=float).reshape(len(d["t"]), -1)
+        for i, lab in enumerate(LEGS):
+            put(f"step_{lab}_x_mm", s[:, 2 * i] * 1e3)
+            put(f"step_{lab}_y_mm", s[:, 2 * i + 1] * 1e3)
     return head, cols
 
 

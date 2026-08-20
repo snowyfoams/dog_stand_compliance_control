@@ -38,7 +38,7 @@ THE JOINT-SPACE FLOOR IS NOT OPTIONAL
 
 RUN
     V=/home/robot01/Documents/can_motor_control/.venv/bin/python
-    $V dog5_trot/controller.py --self-test
+    $V dog5_trot_quasi_static_model/controller.py --self-test
 """
 from __future__ import annotations
 

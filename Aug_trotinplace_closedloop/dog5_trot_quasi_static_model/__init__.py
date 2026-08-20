@@ -1,4 +1,4 @@
-"""dog5_trot -- a trot controller for DOG5, split six ways.
+"""dog5_trot_quasi_static_model -- a trot controller for DOG5, split six ways.
 
     config      every constant, no logic
     leg_kin     single-leg FK / Jacobian / IK
