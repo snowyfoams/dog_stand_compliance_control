@@ -68,8 +68,15 @@ THE FOUR NUMBERS TO WATCH, AND WHERE THEY ARE
     the exit report  the foot-load sum (measured iq through J^-T, which must
                      come to ~57 N and is the only end-to-end proof the force
                      loop is real) and the SOLVE-TIME CENSUS.
-                     CONTROL_ROADMAP calls solve time this phase's main risk;
-                     it is measured here, not budgeted.
+                     CONTROL_ROADMAP calls solve time this phase's main risk,
+                     and NO NUMBER FOR IT IS QUOTED ANYWHERE IN THIS PACKAGE
+                     for the threaded case, because on a general-purpose box it
+                     does not reproduce -- the same solves came back 5.9 ms
+                     mean in one run and 20.5 ms with a 95 ms tail in the next.
+                     Read it off this report, on the Pi, with chrt.  If it
+                     shows solves over budget, the plan ages past
+                     MPC_STALE_S and the runner LIMPS; see mpc_worker for what
+                     to try, in order.
     the --log npz    every one of the above at the full 250 Hz, plus the plan
                      itself, the contact weights it was solved for, and which
                      feet the loop believed were down.

@@ -5,11 +5,24 @@ WHY IT IS A THREAD AND NOT PART OF THE SWEEP -- "cannot", not "should not"
     A CAN slot is 333 us, a sweep is 4 ms, and the driver's input-lost
     watchdog on CAN 1/7/8/9 fires at 10 ms.  The condensed QP is a 96-variable
     dense problem: one ~1 million multiply-add Hessian, one 96x96
-    factorisation and 60 ADMM iterations.  On the development box, driven from
-    this thread against a live model block, that is 3.1 ms mean and 6.8 ms
-    worst against a 25 ms budget; on the Pi it will be several times that, and
-    it is MEASURED IN THE RUN -- the census below, printed by the exit
-    report -- rather than guessed here.
+    factorisation and 60 ADMM iterations.  Measured on the development box,
+    solving alone with nothing else running:
+
+        1.14 / 2.90 / 5.85 ms (min/mean/max) over 400 trot solves
+
+    THAT IS THE ONLY SOLVE-TIME NUMBER IN THIS PACKAGE THAT REPRODUCES, and it
+    is deliberately the one that says least about the robot.  Driven from a
+    thread against a live model block on the same box, the same solves came
+    back at 5.9 ms mean in one run and 20.5 ms mean with a 95 ms worst case in
+    the next -- a 3x spread in the mean and 15x in the tail, with no code
+    change between them.  It is not the QP: it is a general-purpose OS
+    scheduling two Python threads that both want a core, one of which
+    busy-waits on a deadline while holding the GIL.
+
+    So no threaded number is quoted here.  What the split costs on THIS robot
+    is a property of a quiet 4-core Pi running the CAN loop at chrt -f 50, and
+    the only honest way to have it is to read it off the exit report's census
+    on the machine that matters.  That is what the census is for.
 
     Sub-sampling it into the sweep the way the stance law is sub-sampled does
     not help, because the cost lands in ONE sweep however rarely it runs, and
@@ -46,12 +59,25 @@ PUBLISHING DISCIPLINE
     from the sweep, and a worker walking that object mid-latch would plan
     against a contact set that never existed.
 
-THE GIL, STATED HONESTLY
-    numpy releases the GIL for the BLAS calls, which is where this thread's
-    time goes; the per-leg Python around them does not.  The runner sets
-    sys.setswitchinterval(0.0005) so a CAN slot never waits a full 5 ms switch
-    interval on it.  This is the same trade the 100 Hz stance worker already
-    makes, at a lower rate and with more of the time inside BLAS.
+THE GIL, AND THE ONE THING THAT MADE A MEASURABLE DIFFERENCE
+    numpy releases the GIL for the BLAS calls, which is where most of this
+    thread's time goes; the ADMM loop around them does not.  The runner sets
+    sys.setswitchinterval(0.0005), and that is not decoration -- with the
+    interpreter's 5 ms default, the same harness that produced the numbers
+    above instead produced 91 ms mean solves and a plan permanently past
+    MPC_STALE_S, because a Python-level busy-wait on the CAN side held the GIL
+    for a full switch interval at a time.  It is the same setting, for the same
+    reason, that stand_torque_Mode and trot_hw already open with.
+
+    WHAT TO TRY FIRST IF THE PI'S CENSUS IS BAD, in order:
+        --mpc-hz down.  A 20 Hz plan on a 2.5 Hz gait is still two solves per
+            knot at N = 8; nothing about the horizon changes.
+        pin the two.  On a 4-core Pi, `taskset -c 0 chrt -f 50 ...` leaves the
+            solver the other three.  UNTESTED here, and it is a shell change
+            rather than a code one, which is why it is a suggestion and not a
+            default.
+        --n-horizon down.  Last, because it is the only one of the three that
+            shortens what the plan can see.
 """
 from __future__ import annotations
 
