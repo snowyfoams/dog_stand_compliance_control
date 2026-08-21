@@ -73,7 +73,7 @@ if _AUG not in sys.path:
     sys.path.insert(0, _AUG)
 
 from . import mpc_config as C
-from dog5_trot import gait as gait_mod                     # noqa: E402
+from dog5_trot_quasi_static_model import gait as gait_mod  # noqa: E402
 
 TrotGait = gait_mod.TrotGait
 

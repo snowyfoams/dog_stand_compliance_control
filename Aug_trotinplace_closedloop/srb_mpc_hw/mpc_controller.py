@@ -177,7 +177,7 @@ from .srb_model import N_STATE
 import dog5_statics as st                                  # noqa: E402
 import feedback_estimator as fe                            # noqa: E402
 import Dynamic_Model as dm                                 # noqa: E402
-from dog5_trot import leg_kin                              # noqa: E402
+from dog5_trot_quasi_static_model import leg_kin  # noqa: E402
 
 LEGS = C.LEGS
 

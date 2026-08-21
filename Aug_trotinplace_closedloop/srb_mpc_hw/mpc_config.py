@@ -76,7 +76,7 @@ for _p in (_AUG, os.path.join(_AUG, "august_week2")):
 # THE TWO OWNERS OF EVERY NUMBER THIS FILE DOES NOT DECLARE.
 #   tcfg  geometry, mass, inertia, gait, swing, joint caps -- from dog5.xml
 #   P     bus timing, torque caps, friction, the estimator's constants
-from dog5_trot import config as tcfg                       # noqa: E402
+from dog5_trot_quasi_static_model import config as tcfg  # noqa: E402
 import params as P                                         # noqa: E402
 
 LEGS = tcfg.LEGS                     # ("FL", "FR", "RL", "RR") -- HARDWARE order

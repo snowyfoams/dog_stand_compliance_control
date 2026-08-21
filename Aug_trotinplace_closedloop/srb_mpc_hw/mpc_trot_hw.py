@@ -177,10 +177,10 @@ import force_totorque as ft                                # noqa: E402
 # for the joint-speed budget.  A second copy here would be a second thing to
 # keep in step with that argument, and dog5_trot/trot_hw.py is where they
 # already live.
-from dog5_trot.trot_hw import JointImpedance, TorqueGate    # noqa: E402
-from dog5_trot.trot_hw import q_ref_for_height              # noqa: E402
-from dog5_trot.trot_hw import _zero_rp_streamer             # noqa: E402
-from dog5_trot.trot_hw import _print_attitude_report        # noqa: E402
+from dog5_trot_quasi_static_model.trot_hw import JointImpedance, TorqueGate  # noqa: E402
+from dog5_trot_quasi_static_model.trot_hw import q_ref_for_height  # noqa: E402
+from dog5_trot_quasi_static_model.trot_hw import _zero_rp_streamer  # noqa: E402
+from dog5_trot_quasi_static_model.trot_hw import _print_attitude_report  # noqa: E402
 
 from srb_mpc_hw import mpc_config as C                      # noqa: E402
 from srb_mpc_hw import mpc_controller as ctl                # noqa: E402
