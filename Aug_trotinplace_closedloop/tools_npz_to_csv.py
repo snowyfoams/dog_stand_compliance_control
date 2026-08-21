@@ -55,6 +55,10 @@ VEC = {
     "q_ref":    ("q_ref",    "rad",   JOINTS),
     "qd":       ("qd",       "rad_s", JOINTS),
     "qd_drv":   ("qd_drv",   "rad_s", JOINTS),
+    # tau_des joined 2026-08-21: the PRE-GATE request the control law made,
+    # beside tau_cmd (post ramp/cap/slew) and tau_meas (driver iq).  Absent
+    # from every npz written before that date.
+    "tau_des":  ("tau_des",  "Nm",    JOINTS),
     "tau_cmd":  ("tau_cmd",  "Nm",    JOINTS),
     "tau_meas": ("tau_meas", "Nm",    JOINTS),
     "fz":       ("fz",       "N",     LEGS),
@@ -67,7 +71,11 @@ SCALAR = {
     "stage": "stage",
 }
 # logged in rad; every reading of them has been in deg, so emit both
-ANGLE = ("roll", "pitch", "roll_fk", "pitch_fk", "roll_raw", "pitch_raw")
+ANGLE = ("roll", "pitch", "roll_fk", "pitch_fk", "roll_raw", "pitch_raw",
+         # yaw joined on 2026-08-21 when it became a controlled axis.  It is
+         # NOT in the roll/pitch error loop below, because it is the one
+         # attitude channel whose error has to WRAP -- see wrap_pi_deg.
+         "yaw")
 
 
 def columns(d):
@@ -85,10 +93,40 @@ def columns(d):
     for k in ("z", "z_hip", "load"):
         if k in d.files:
             put(SCALAR[k], d[k])
+    # REFERENCE BESIDE MEASUREMENT, and the error already differenced.  The
+    # loop controls three things and every plot of it is a pair; making the
+    # reader subtract two columns is how a mount tilt gets subtracted twice.
+    if "z_des" in d.files:
+        put("z_des_m", d["z_des"])
+        if "z" in d.files:
+            put("z_err_mm", (d["z_des"] - d["z"]) * 1e3)
     for k in ANGLE:
         if k in d.files:
             put(f"{k}_rad", d[k])
             put(f"{k}_deg", np.degrees(d[k]))
+    for k in ("roll", "pitch"):
+        ref = f"{k}_ref"
+        if ref in d.files and k in d.files:
+            put(f"{ref}_deg", np.degrees(d[ref]))
+            # roll/pitch are ALREADY the setpoint-subtracted error, so this
+            # column is -roll.  Written out anyway: a reader who plots
+            # "*_err_deg" for all three gets the same sign convention on
+            # every one, instead of z from a difference and attitude from a
+            # sign flip they have to remember.
+            put(f"{k}_err_deg", np.degrees(d[ref] - d[k]))
+    # YAW'S ERROR IS THE ONE THAT MUST WRAP, and it gets its own block rather
+    # than a third entry in the loop above for exactly that reason.  A run
+    # that crosses the +/-180 deg seam would otherwise show a 360 deg spike in
+    # a column labelled "error" -- and the wrench never saw one, because
+    # Dynamic_Model.wrap_pi is what it actually acted on.  Reproduced here in
+    # degrees so the CSV column IS the quantity the spring was multiplying.
+    #
+    # yaw_ref is NaN on every sweep before the lock is latched and NaN
+    # propagates through, which is the honest answer: there was no error yet.
+    if "yaw_ref" in d.files and "yaw" in d.files:
+        put("yaw_ref_deg", np.degrees(d["yaw_ref"]))
+        err = np.degrees(d["yaw_ref"] - d["yaw"])
+        put("yaw_err_deg", np.mod(err + 180.0, 360.0) - 180.0)
     for k, (pre, unit, labels) in VEC.items():
         if k not in d.files:
             continue
@@ -127,7 +165,19 @@ def meta_rows(d, n):
     for k in d.files:
         a = d[k]
         if a.ndim == 0:
-            rows.append((k, "", float(a)))
+            if a.dtype.kind in "US":
+                # cfg_source is the whole config.py and gets its own file in
+                # convert(); any other string scalar goes in verbatim.
+                if k != "cfg_source":
+                    rows.append((k, "", str(a)))
+            else:
+                rows.append((k, "", float(a)))
+        elif k.startswith("cfg_") and a.dtype.kind in "fib" and a.size <= 64:
+            # the config.py snapshot's small arrays (gains, Q_STAND, the QP
+            # weights): one row per element, indexed, so two runs' meta CSVs
+            # diff line for line
+            for idx, v in np.ndenumerate(a):
+                rows.append((k, "_".join(str(j) for j in idx), float(v)))
         elif a.ndim == 1 and a.shape[0] == len(JOINTS) and a.shape[0] != n:
             for i, lab in enumerate(JOINTS):          # glitches
                 rows.append((k, lab, float(a[i])))
@@ -168,9 +218,19 @@ def convert(path, outdir):
         w = csv.writer(fh)
         w.writerow(["key", "label", "value"])
         for k, lab, v in meta_rows(d, n):
-            w.writerow([k, lab, f"{v:.6g}"])
+            w.writerow([k, lab, v if isinstance(v, str) else f"{v:.6g}"])
 
-    print(f"{path:22s} -> {out}  ({n} rows x {len(head)} cols)  + {os.path.basename(mout)}")
+    extra = ""
+    if "cfg_source" in d.files:
+        # the config.py the run flew, verbatim.  .txt and not .py so nothing
+        # ever imports a log's copy by accident.
+        cpath = os.path.join(outdir, stem + "_config.txt")
+        with open(cpath, "w") as fh:
+            fh.write(str(d["cfg_source"]))
+        extra = f" + {os.path.basename(cpath)}"
+
+    print(f"{path:22s} -> {out}  ({n} rows x {len(head)} cols)  "
+          f"+ {os.path.basename(mout)}{extra}")
 
 
 def main():
