@@ -187,6 +187,7 @@ from srb_mpc_hw import mpc_controller as ctl                # noqa: E402
 from srb_mpc_hw import mpc_gait                             # noqa: E402
 from srb_mpc_hw import mpc_worker                           # noqa: E402
 from srb_mpc_hw.convex_mpc import ConvexMPC                 # noqa: E402
+from srb_mpc_hw.ekf_feedback import EkfFeedback             # noqa: E402
 
 MOTOR_IDS = base.MOTOR_IDS
 N_JOINTS = P.N_JOINTS
@@ -307,6 +308,15 @@ def run(args):
         print(f"  WARNING: force_frac {args.force_frac} removes the term that "
               f"holds the TRUNK up.  Feet on the floor, the legs fold until "
               f"kp*dq carries {C.WEIGHT:.0f} N.")
+    if args.ekf != "off":
+        what = ("logged beside the leg odometry, NOT applied"
+                if args.ekf == "shadow" else
+                "fed to the MPC and the wrench while healthy and fresh; "
+                "leg odometry otherwise")
+        print(f"  EKF {args.ekf}: Bloesch filter on the raw IMU -- velocity "
+              f"{what}.")
+        print("  Attitude and height stay AHRS+FK in every mode.  Status "
+              "shows ekf=V/ok/--.")
     print("  Support the robot.  ENTER = rise, T = trot, SPACE = LIMP, "
           "P = park, X = stop")
     print("-" * 74)
@@ -317,16 +327,29 @@ def run(args):
     print("=" * 74)
 
     from imu_dog import ImuDog, DEFAULT_PORT                # noqa: PLC0415
-    imu = ImuDog(port=args.port or DEFAULT_PORT)
+    imu_feed = None
+    if args.ekf != "off":
+        # ONE ImuDog either way.  ImuEkfFeed wraps it and taps the raw 0x40
+        # stream for the filter; the AHRS keeps flowing to the estimator.
+        from imu_ekf_feed import ImuEkfFeed                 # noqa: PLC0415
+        imu_feed = ImuEkfFeed(args.port or DEFAULT_PORT)
+        imu = imu_feed.imu
+    else:
+        imu = ImuDog(port=args.port or DEFAULT_PORT)
     imp = JointImpedance(args.kp, args.kd)
     key = base.KeyPoller()
     log = []
     stop = None
     shared = None
     worker = None
+    ekf = None
 
     try:
         imu.start()
+        if imu_feed is not None and not imu_feed.wait_for_raw(timeout=3.0):
+            # same message as the stand runners: the AHRS alone is not enough
+            raise RuntimeError("no raw IMU (0x40) packets -- enable DETA10 "
+                               "raw mode, or run without --ekf")
         with motorbus.MotorBus(MOTOR_IDS, dirs=base.MOTOR_DIRECTIONS) as mb:
             if not mb.arm(rate_hz=P.CONTROL_HZ):
                 raise RuntimeError("arm failed (bus / power / terminators)")
@@ -338,6 +361,14 @@ def run(args):
 
             # ---- CROUCH: position mode, week-2 bookend -------------------
             q = cap.crouch(mb, unwrap, key, max_speed_dps=args.crouch_dps)
+
+            # The EKF worker starts HERE, after the crouch, so the first
+            # stage it ever sees is WAIT -- the one stage still enough to
+            # initialise in (ekf_feedback.EKF_QUIET_STAGES).
+            if args.ekf != "off":
+                ekf = EkfFeedback(imu_feed, q)
+                print(f"[mpc] EKF {args.ekf}: initialising during WAIT -- "
+                      f"hold still until it announces, then ENTER.")
 
             # min_planted = 2, AND THAT IS THE ONE ESTIMATOR CHANGE A TROT
             # NEEDS.  params.MIN_PLANTED = 3 is a STAND's alarm: a stand that
@@ -378,6 +409,11 @@ def run(args):
             w_now = np.ones(4)
             kine = None
             state, act, why = None, False, "starting"
+            ek = None
+            ekf_used = False
+            ekf_ok = 0.0
+            ekf_v_log = np.zeros(3)
+            ekf_rp_log = np.zeros(2)
             limp = False
             armed = False
             handed_over = False
@@ -509,9 +545,44 @@ def run(args):
                     planted = controller.gait.contact(now) if stage == "TROT" \
                         else ALL4
 
+                    # The filter gets the SAME contact set, on the same sweep.
+                    # In TROT that is the schedule with this loop's latched
+                    # touchdowns -- the stand runners' lesson (0438d43) was
+                    # that an EKF fed a stale schedule invents velocity at
+                    # every lift-off.
+                    if ekf is not None:
+                        ekf.publish(q, qd, stage, planted)
+
                     # ---- the sub-sampled model block -----------------------
                     if sweep % P.MODEL_EVERY == 0:
                         state, act, why = est.read(now, q, qd, planted)
+                        if ekf is not None:
+                            ek = ekf.sample()
+                            ekf_ok = float(ek is not None and ek["healthy"]
+                                           and ek["fresh"])
+                            if ek is not None and state is not None:
+                                ekf_v_log = EkfFeedback.v_loop(ek, state["C"])
+                                ekf_rp_log = np.array([ek["roll"],
+                                                       ek["pitch"]])
+                            use = bool(act and args.ekf == "active" and ekf_ok)
+                            if use:
+                                # VELOCITY ONLY -- attitude and height stay
+                                # AHRS+FK (ekf_feedback's header says why).
+                                # A FRESH dict: the worker and the wrench get
+                                # the override, est.v in the log stays the
+                                # leg odometry's, and the two never alias.
+                                state = dict(state)
+                                state["v"] = ekf_v_log.copy()
+                            if use != ekf_used:
+                                if use:
+                                    print("[mpc] EKF velocity engaged")
+                                elif args.ekf == "active" and act:
+                                    w = ("no output" if ek is None else
+                                         "stale" if not ek["fresh"] else
+                                         "unhealthy")
+                                    print(f"[mpc] EKF velocity fell back to "
+                                          f"leg odometry ({w})")
+                            ekf_used = use
                         if act:
                             if z_crouch is None:
                                 z_crouch = float(state["r"][2])
@@ -680,7 +751,9 @@ def run(args):
                                     f_now.copy(), w_now.copy(),
                                     np.asarray(shared.plan.f0).copy(),
                                     plan_age, controller.v_cmd.copy(),
-                                    controller.wz_cmd))
+                                    controller.wz_cmd,
+                                    ekf_v_log.copy(), ekf_rp_log.copy(),
+                                    ekf_ok, float(ekf_used)))
 
                     if now - last_print >= 1.0 / base.STATUS_HZ:
                         last_print = now
@@ -690,6 +763,11 @@ def run(args):
                                      f"{f_now[:, 2].sum():4.1f}N")
                         if stage == "TROT":
                             extra += f"  air={int(np.sum(w_now <= 0.0))}"
+                        if ekf is not None:
+                            # V = feeding the loop, ok = healthy but shadow
+                            # (or not engaged), -- = no usable output
+                            extra += ("  ekf=" + ("V" if ekf_used else
+                                      "ok" if ekf_ok else "--"))
                         print(f"[mpc] {'LIMP' if limp else stage:5s} "
                               f"{est.status() if state is not None else why}"
                               f"{extra}", flush=True)
@@ -728,6 +806,8 @@ def run(args):
             shared.run = False
             if worker is not None:
                 worker.join(timeout=1.0)
+        if ekf is not None:
+            ekf.stop()
         try:
             imu.stop()
         except Exception:                                   # noqa: BLE001
@@ -768,6 +848,26 @@ def run(args):
         else:
             print("  driver and encoder agreed throughout -- no glitching this "
                   "run")
+        if args.ekf != "off":
+            ok = np.array([r[29] for r in log], dtype=bool)
+            sel = ok & np.array([r[10] in ("HOLD", "TROT") for r in log])
+            n = int(sel.sum())
+            if n:
+                dv = (np.array([r[27] for r in log])[sel]
+                      - np.array([r[18] for r in log])[sel])
+                rms = float(np.sqrt(np.mean(np.sum(dv * dv, axis=1))))
+                used = float(np.mean([r[30] for r in log]))
+                print(f"  EKF ({args.ekf}): healthy on {100*ok.mean():.0f}% "
+                      f"of rows, fed the loop on {100*used:.0f}%; "
+                      f"|v_ekf - v_legs| RMS {rms*1e3:.0f} mm/s "
+                      f"over {n} HOLD/TROT rows")
+                print("  ^ the qualifying number.  If the two disagree on a "
+                      "stand, the filter has no")
+                print("    business under a trot; if they agree, shadow has "
+                      "earned active.")
+            else:
+                print(f"  EKF ({args.ekf}): never simultaneously healthy and "
+                      f"in HOLD/TROT -- nothing to compare")
         if args.log:
             np.savez_compressed(
                 args.log,
@@ -801,6 +901,16 @@ def run(args):
                 plan_age=np.array([r[24] for r in log]),
                 v_cmd=np.array([r[25] for r in log]),
                 wz_cmd=np.array([r[26] for r in log]),
+                # THE EKF BESIDE THE LEG ODOMETRY, whichever --ekf mode ran.
+                # v_ekf is in the loop's yaw-free world -- the same frame and
+                # the same ticks as `v`, so the qualifying A/B is one plot.
+                # Zeros before the filter initialised or with --ekf off;
+                # ekf_used says which rows actually fed the controller.
+                v_ekf=np.array([r[27] for r in log]),
+                rp_ekf=np.array([r[28] for r in log]),
+                ekf_ok=np.array([r[29] for r in log]),
+                ekf_used=np.array([r[30] for r in log]),
+                ekf_mode=args.ekf,
                 # the horizon and the cost, so a log is readable a month later
                 n_horizon=mpc.N, mpc_dt=mpc.dt, mpc_hz=args.mpc_hz,
                 w_att=mpc.q_state[0:3], w_pos=mpc.q_state[3:6],
@@ -873,6 +983,20 @@ def main():
                          "mpc_gait.ContactAwareGait names the one measurement "
                          "that earns this flag; the detector's fz is in the "
                          "--log npz either way")
+    ap.add_argument("--ekf", choices=("off", "shadow", "active"), default="off",
+                    help="run the Bloesch EKF (state_estimator) beside the "
+                         "loop.  'shadow' only logs its velocity next to the "
+                         "leg odometry's -- the A/B that qualifies it; "
+                         "'active' feeds it to the MPC and the wrench when "
+                         "the filter reports healthy and fresh, falling back "
+                         "to the leg odometry otherwise.  Attitude and height "
+                         "stay AHRS+FK in every mode -- see "
+                         "ekf_feedback's header for why velocity is the only "
+                         "signal with a case for replacement.  The filter "
+                         "initialises during WAIT: hold still until "
+                         "'[mpc] EKF initialised' prints, then ENTER.  "
+                         "OFF by default: no hardware log yet ties an "
+                         "EKF-fed MPC to a gain table")
     # -- the rig -------------------------------------------------------------
     ap.add_argument("--setpoint-roll", type=float, default=P.SETPOINT_ROLL_DEG,
                     help="resting attitude of THIS rig in deg, subtracted from "
