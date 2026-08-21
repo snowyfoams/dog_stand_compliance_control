@@ -104,9 +104,27 @@ def C_from_rp(roll, pitch):
     """I->B rotation whose (roll, pitch) is exactly the pair given.
 
     The exact inverse of Dynamic_Model.attitude_rp, so a state built here and
-    read back by the model round-trips.  Yaw is deliberately absent: the
-    AHRS's yaw is magnetometer-derived and untrusted next to twelve motors and
-    a steel frame, and the model only ever damps yaw RATE, from the gyro.
+    read back by the model round-trips.
+
+    YAW IS STILL ABSENT HERE, AND THAT IS NOT AN OVERSIGHT NOW THAT YAW IS
+    CONTROLLED (2026-08-21).  The frame this returns is the world rotated by
+    -yaw about the vertical, so its z axis IS true vertical -- a rotation
+    about z cannot tilt z.  Every consumer of C is therefore unaffected by
+    the heading:
+
+        leg odometry      returns v in a yaw-following frame.  x/y have no
+                          absolute reference anyway (kp is 0 on both), so a
+                          heading-locked v would buy nothing and would make
+                          the damper's axes rotate under it.
+        fk_trunk_height   a height, invariant to yaw outright.
+        the grasp map     moments come back about the SAME axes, so the Mz
+                          the wrench asks for is a moment about true
+                          vertical -- which is exactly what yaw control
+                          wants.
+
+    So the yaw ANGLE rides beside C in the state dict rather than inside it.
+    Putting it into C would rotate the odometry and the force split for no
+    gain, and would break the attitude_rp round-trip this module is pinned to.
     """
     g = np.array([-math.sin(pitch),
                   math.cos(pitch) * math.sin(roll),
@@ -286,6 +304,13 @@ class BodyState:
         self.n_planted = 0
         self.roll = self.pitch = 0.0            # AHRS, setpoint subtracted
         self.roll_raw = self.pitch_raw = 0.0    # AHRS as it arrived
+        # THE HEADING, AS IT ARRIVES.  No setpoint is subtracted and none can
+        # be: roll and pitch have a rest value this rig measurably sits at,
+        # but a heading has no such thing -- "level" is a fact about the
+        # floor, "north" is not a fact about the robot.  What makes a yaw
+        # error mean something is the LOCK the runner latches when torque
+        # arms, which lives there and not here.
+        self.yaw = 0.0
         self.roll_fk = self.pitch_fk = float("nan")   # from the feet, no IMU
         self.z = float("nan")             # floor -> TRUNK BOTTOM (controlled)
         self.z_hip = float("nan")         # floor -> hip axis (the IK's frame)
@@ -307,6 +332,7 @@ class BodyState:
         self.pitch_raw = math.radians(sample.pitch_deg)
         self.roll = self.roll_raw - self.sp_roll
         self.pitch = self.pitch_raw - self.sp_pitch
+        self.yaw = math.radians(sample.yaw_deg)
         C = C_from_rp(self.roll, self.pitch)
         omega = np.deg2rad([sample.roll_rate_dps,
                             sample.pitch_rate_dps,
@@ -344,6 +370,11 @@ class BodyState:
             "v": self.v.copy(),
             "C": C,
             "w": omega,
+            # THE HEADING RIDES BESIDE C, NOT INSIDE IT -- see C_from_rp.  It
+            # is an absolute angle in (-pi, pi], so anything differencing it
+            # must wrap; Dynamic_Model.body_wrench is the only thing that
+            # does, and it does.
+            "yaw": self.yaw,
             "z_fk": z,              # trunk bottom -- what r[2] is
             "z_hip": z_hip,         # hip axis -- what the leg IK wants
             "roll_fk": roll_fk,
@@ -528,6 +559,10 @@ if __name__ == "__main__":
         def __init__(self, r, p):
             self.roll_deg, self.pitch_deg = r, p
             self.roll_rate_dps = self.pitch_rate_dps = self.yaw_rate_dps = 0.0
+            # NOT OPTIONAL SINCE 2026-08-21: read() publishes the heading, so
+            # a stand-in for an AHRSData that omits it is no longer a valid
+            # sample at all -- it raises rather than quietly reading zero.
+            self.yaw_deg = 0.0
 
     class _FakeAhrs:
         def __init__(self, r, p):

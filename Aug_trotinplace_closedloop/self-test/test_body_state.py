@@ -55,9 +55,16 @@ class FakeImuDog:
     class _S:
         pass
 
-    def __init__(self, roll_deg=0.0, pitch_deg=0.0, rates_dps=(0.0, 0.0, 0.0)):
+    def __init__(self, roll_deg=0.0, pitch_deg=0.0, rates_dps=(0.0, 0.0, 0.0),
+                 yaw_deg=0.0):
         self.roll_deg = roll_deg
         self.pitch_deg = pitch_deg
+        # A stand-in for AHRSData carries every field the real one does, even
+        # the ones this module's consumer ignores.  body_state_ahrs does not
+        # read the heading, but feedback_estimator's Estimator has since
+        # 2026-08-21, and a fake that silently lacks a field is how a test
+        # keeps passing against an object the real code would raise on.
+        self.yaw_deg = yaw_deg
         self.rates_dps = tuple(rates_dps)
         self.stale = False
         self.none = False
@@ -68,6 +75,7 @@ class FakeImuDog:
         s = FakeImuDog._S()
         s.roll_deg = self.roll_deg
         s.pitch_deg = self.pitch_deg
+        s.yaw_deg = self.yaw_deg
         s.roll_rate_dps, s.pitch_rate_dps, s.yaw_rate_dps = self.rates_dps
         return s
 

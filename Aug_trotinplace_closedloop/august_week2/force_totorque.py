@@ -100,20 +100,37 @@ def grasp_map(foot_pos_body, stance, C, com_body):
 
 
 def distribute(W, foot_pos_body, stance, C, com_body=None,
-               mu=P.MU_FRICTION, fz_min=P.FZ_MIN_N, lam=P.GRASP_LAMBDA):
+               mu=P.MU_FRICTION, fz_min=P.FZ_MIN_N, lam=P.GRASP_LAMBDA,
+               weights=None):
     """Split the wrench across the stance feet.  Returns {leg: force in BODY}.
 
     Minimum-norm solve f = G^T (G G^T + lam I)^-1 W, then a per-foot
     unilateral + friction clamp: a foot can only PUSH (fz >= fz_min, never
     pull the robot down) and can only produce tangential force inside mu*fz
     (beyond that it would need grip the floor does not have).
+
+    `weights` (len(stance), in [0,1], optional) makes the split a WEIGHTED
+    minimum norm: min f^T diag(w)^-1 f s.t. G f = W, i.e. a foot with weight
+    0.1 volunteers a tenth of what a full foot does.  This is how a gait hands
+    the load over -- a foot entering stance ramps its share up instead of
+    taking half the robot in one model step, and a binary handover on THIS
+    stance is a roll impulse: a diagonal pair has no moment authority about
+    its own support line, so whatever the step imparts about that line is
+    unopposed until the next pair lands.  None (every stand) is exactly the
+    unweighted solve, bit for bit -- the self-test pins that.
     """
     if not stance:
         return {}
     com = np.zeros(3) if com_body is None else np.asarray(com_body, float)
     G = grasp_map(foot_pos_body, stance, C, com)
-    S = G @ G.T + lam * np.eye(6)
-    f_stack = G.T @ np.linalg.solve(S, W)
+    if weights is None:
+        S = G @ G.T + lam * np.eye(6)
+        f_stack = G.T @ np.linalg.solve(S, W)
+    else:
+        w = np.repeat(np.clip(np.asarray(weights, float), 1e-3, 1.0), 3)
+        GW = G * w                       # = G @ diag(w)
+        S = GW @ G.T + lam * np.eye(6)
+        f_stack = w * (G.T @ np.linalg.solve(S, W))
 
     clamped = []
     for j, leg in enumerate(stance):
@@ -171,7 +188,8 @@ def moment_capacity(foot_pos_body, stance, fz_total=P.WEIGHT_N):
 
 
 def stance_torque(q, qd, state, W, planted, gains, force_frac=P.FORCE_FRAC_DEFAULT,
-                  leg_gravity=P.STANCE_LEG_GRAVITY, com_body=None):
+                  leg_gravity=P.STANCE_LEG_GRAVITY, com_body=None,
+                  contact_weight=None):
     """The full feedforward: wrench in, 12 joint torques out.
 
     `force_frac` scales the DISTRIBUTED GRF -- the only term holding the TRUNK
@@ -198,7 +216,12 @@ def stance_torque(q, qd, state, W, planted, gains, force_frac=P.FORCE_FRAC_DEFAU
         com_body = (st.com_body(q.reshape(4, 3), frames_all=frames)
                     if P.CONFIG_DEPENDENT_COM else np.zeros(3))
 
-    forces = distribute(W, foot_pos_body, stance, state["C"], com_body)
+    # contact_weight is (4,) over ALL legs; distribute wants it per stance
+    # leg, in stance order.  None everywhere else keeps every stand unchanged.
+    wts = None if contact_weight is None else \
+        [float(contact_weight[i]) for i in range(N_LEGS) if planted[i]]
+    forces = distribute(W, foot_pos_body, stance, state["C"], com_body,
+                        weights=wts)
     g_down = st.gravity_down_body(state["C"])
 
     tau = np.zeros(N_JOINTS)
@@ -228,8 +251,14 @@ def stance_torque(q, qd, state, W, planted, gains, force_frac=P.FORCE_FRAC_DEFAU
     # be explicit about which is which.
     fz_world = [float((state["C"].T @ forces[l])[2]) if l in forces else 0.0
                 for l in LEGS]
+    # `feet` IS RETURNED SO A CALLER CAN REBUILD THE GRASP MAP.  Purely
+    # additive -- a new key cannot break a caller that does not read it -- and
+    # it is what turns `forces` from a number you have into a WRENCH you can
+    # compare against the one that was asked for.  Without it the achieved
+    # wrench costs four leg_frames the caller has already paid for once.
     return tau, {"forces": forces, "stance": stance, "singular": singular,
-                 "com_body": com_body, "fz": fz_world}
+                 "com_body": com_body, "fz": fz_world,
+                 "feet": foot_pos_body}
 
 
 def leg_gravity_only(q, C=None):

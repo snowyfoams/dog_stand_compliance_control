@@ -73,8 +73,16 @@ def attitude_rp(C):
     return roll, pitch
 
 
+def wrap_pi(a):
+    """Wrap an angle to (-pi, pi].  The only safe way to difference a heading."""
+    a = math.fmod(a + math.pi, 2.0 * math.pi)
+    if a <= 0.0:
+        a += 2.0 * math.pi
+    return a - math.pi
+
+
 def body_wrench(state, z_des, mass=P.MASS_KG, v_cmd=(0.0, 0.0, 0.0),
-                yawrate_cmd=0.0, gains=None):
+                yawrate_cmd=0.0, gains=None, yaw_ref=None):
     """The wrench the four feet must produce between them, in WORLD axes.
 
     `gains` is any object carrying the kp_*/kd_* attributes; None uses the
@@ -85,6 +93,29 @@ def body_wrench(state, z_des, mass=P.MASS_KG, v_cmd=(0.0, 0.0, 0.0),
     ERROR -- a robot sitting exactly at its target height would be told to
     push with zero force and would fall.  The springs trim; gravity is what
     holds it up.
+
+    YAW GAINED A STIFFNESS ON 2026-08-21, AND IT IS OPT-IN THREE TIMES OVER.
+    The heading was damping-only for as long as imu_dog.py called the DETA10's
+    magnetometer yaw untrusted next to twelve motors and a steel frame.  It
+    was then watched under power through att_web and found to hold, so the
+    ANGLE is now available -- but every existing caller must be unaffected,
+    so the term needs all three of `yaw_ref` passed, `state["yaw"]` present
+    and a non-zero `kp_yaw` on the gains object before it contributes
+    anything.  The stand passes none of them and its wrench is unchanged bit
+    for bit; the self-test pins that.
+
+    `yaw_ref` IS A LOCK THE CALLER LATCHES, not a constant like the level
+    reference roll and pitch use.  There is no absolute heading a robot ought
+    to have, so the reference is "wherever you were pointing when the torque
+    armed" and the runner owns it.
+
+    THE ERROR IS WRAPPED AND THEN CLAMPED, and both matter.  Wrapped, because
+    a robot at +179 deg against a -179 deg lock has a 2 deg error and not a
+    358 deg one.  Clamped, because yaw authority is 100% friction -- a
+    diagonal pair makes a yaw couple entirely out of tangential force -- so an
+    unbounded error would ask for a moment the cone cannot deliver and the
+    distributor would answer by slewing every foot's tangential force at once.
+    The clamp is `gains.yaw_err_max` when the gains object carries one.
     """
     g = _Gains() if gains is None else gains
     z = float(np.asarray(state["r"])[2])
@@ -99,6 +130,15 @@ def body_wrench(state, z_des, mass=P.MASS_KG, v_cmd=(0.0, 0.0, 0.0),
     Mx = g.kp_roll * (0.0 - roll) + g.kd_roll * (0.0 - w[0])
     My = g.kp_pitch * (0.0 - pitch) + g.kd_pitch * (0.0 - w[1])
     Mz = g.kd_yaw * (yawrate_cmd - w[2])
+    # The stiffness half, absent unless the caller opted in on all three
+    # counts.  `state` is a plain dict everywhere, so .get is the test for
+    # "this estimator publishes a heading at all".
+    kp_yaw = float(getattr(g, "kp_yaw", 0.0))
+    yaw = state.get("yaw") if hasattr(state, "get") else None
+    if kp_yaw and yaw is not None and yaw_ref is not None:
+        e_yaw = wrap_pi(float(yaw_ref) - float(yaw))
+        e_max = float(getattr(g, "yaw_err_max", P.YAW_ERR_MAX_RAD))
+        Mz += kp_yaw * max(-e_max, min(e_max, e_yaw))
     return np.array([Fx, Fy, Fz, Mx, My, Mz])
 
 
@@ -112,6 +152,8 @@ class _Gains:
         self.kp_roll, self.kd_roll = P.KP_ROLL, P.KD_ROLL
         self.kp_pitch, self.kd_pitch = P.KP_PITCH, P.KD_PITCH
         self.kd_x, self.kd_y, self.kd_yaw = P.KD_X, P.KD_Y, P.KD_YAW
+        self.kp_yaw = P.KP_YAW
+        self.yaw_err_max = P.YAW_ERR_MAX_RAD
         self.kd_joint = P.KD_JOINT
 
     def __repr__(self):
@@ -119,9 +161,13 @@ class _Gains:
         # used to be the one omitted, so a runner that zeroed everything the
         # banner showed still had 4.0 Nms/rad live on the yaw axis and the
         # banner read as all-off.  Every gain the wrench uses, or none.
+        # Two decimals on anything that can sensibly be a fraction: at :.0f a
+        # live 0.5 damper prints as "0" and the banner reads as all-off, which
+        # is the exact failure the paragraph above records.
         return (f"Gains(kp_z={self.kp_z:.0f} kd_z={self.kd_z:.0f} "
-                f"kp_att={self.kp_roll:.0f} kd_att={self.kd_roll:.0f} "
-                f"kd_xy={self.kd_x:.0f} kd_yaw={self.kd_yaw:.0f})")
+                f"kp_att={self.kp_roll:.0f} kd_att={self.kd_roll:.2f} "
+                f"kd_xy={self.kd_x:.2f} kd_yaw={self.kd_yaw:.2f} "
+                f"kp_yaw={self.kp_yaw:.2f})")
 
 
 def default_gains():
@@ -200,8 +246,64 @@ if __name__ == "__main__":
           np.allclose(body_wrench(state(), 0.19),
                       body_wrench(state(), 0.19)))
     W_yaw = body_wrench(state(w=(0, 0, 0.4)), 0.19)
-    check("yaw is rate-damped only (its angle is never read)",
+    check("yaw is rate-damped whenever no lock is latched",
           abs(W_yaw[5] + P.KD_YAW * 0.4) < 1e-9)
+
+    # -- the yaw stiffness, and above all that it stays OFF by default -----
+    # The stand shares this function, so the first three checks are the
+    # backward-compatibility contract: nothing changes until a caller opts in.
+    g_yaw = default_gains()
+    g_yaw.kp_yaw, g_yaw.kd_yaw = 20.0, 0.0
+    s_yaw = state()
+    s_yaw["yaw"] = 0.10
+    check("a heading in the state alone does NOT create a moment "
+          "(no lock, no term)",
+          abs(body_wrench(s_yaw, 0.19, gains=g_yaw)[5]) < 1e-12)
+    check("a lock alone does NOT create a moment (no heading published)",
+          abs(body_wrench(state(), 0.19, gains=g_yaw, yaw_ref=0.0)[5]) < 1e-12)
+    g_off = default_gains()
+    g_off.kd_yaw = 0.0
+    check("kp_yaw = 0 is inert even with heading AND lock -- the stand's case",
+          abs(body_wrench(s_yaw, 0.19, gains=g_off, yaw_ref=0.0)[5]) < 1e-12)
+    check("with all three, Mz = kp_yaw * (ref - yaw)",
+          abs(body_wrench(s_yaw, 0.19, gains=g_yaw, yaw_ref=0.0)[5]
+              + 20.0 * 0.10) < 1e-9)
+    # THE WRAP IS THE BUG THIS EXISTS TO CATCH.  179 deg held against a
+    # -179 deg lock is 2 deg of error the short way round; unwrapped it is
+    # 358 deg, and the sign is backwards as well as the size.
+    s_wrap = state()
+    s_wrap["yaw"] = math.radians(179.0)
+    Mz_wrap = body_wrench(s_wrap, 0.19, gains=g_yaw,
+                          yaw_ref=math.radians(-179.0))[5]
+    check("the yaw error wraps: 179 deg against -179 deg is 2 deg, not 358",
+          abs(Mz_wrap - 20.0 * math.radians(2.0)) < 1e-6,
+          f"Mz {Mz_wrap:+.4f} vs {20.0*math.radians(2.0):+.4f} Nm")
+    # And the clamp, which is what keeps a big excursion from asking the
+    # friction cone for a moment it has no way to produce.
+    s_big = state()
+    s_big["yaw"] = -1.5                      # 86 deg away from the lock
+    check("a huge yaw error is clamped to yaw_err_max, not multiplied whole",
+          abs(body_wrench(s_big, 0.19, gains=g_yaw, yaw_ref=0.0)[5]
+              - 20.0 * P.YAW_ERR_MAX_RAD) < 1e-9)
+    s_big_neg = state()
+    s_big_neg["yaw"] = +1.5
+    check("the clamp is symmetric: the same excursion the other way is -that",
+          abs(body_wrench(s_big_neg, 0.19, gains=g_yaw, yaw_ref=0.0)[5]
+              + 20.0 * P.YAW_ERR_MAX_RAD) < 1e-9)
+    # Damping and stiffness ADD rather than replace: a robot twisted off the
+    # lock AND rotating gets both terms.
+    g_both = default_gains()
+    g_both.kp_yaw, g_both.kd_yaw = 20.0, 4.0
+    s_both = state(w=(0, 0, 0.4))
+    s_both["yaw"] = 0.10
+    # BOTH TERMS COME OUT NEGATIVE HERE AND THAT IS THE RESTORING SIGN.
+    # imu_dog's frame has yaw > 0 = nose LEFT, so a robot sitting 0.10 rad
+    # left of its lock and still turning left needs a CLOCKWISE (negative)
+    # moment on both counts.  Writing the expected value as a sum of two
+    # signed terms rather than a number is what makes that checkable.
+    check("stiffness and damping add on the yaw axis, both restoring",
+          abs(body_wrench(s_both, 0.19, gains=g_both, yaw_ref=0.0)[5]
+              - (-20.0 * 0.10 - 4.0 * 0.4)) < 1e-9)
 
     # -- attitude convention round-trip -----------------------------------
     for rp in ((0.0, 0.0), (0.12, 0.0), (0.0, -0.09), (0.2, 0.15)):

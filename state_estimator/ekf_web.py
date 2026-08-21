@@ -117,7 +117,9 @@ def sampler_loop(shared, tel, stop_evt, hz=DEFAULT_SAMPLE_HZ):
             stop_evt.wait(rem)
 
 
-def _make_handler(tel):
+def _make_handler(tel, page=None):
+    page_html = PAGE if page is None else page
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -151,7 +153,7 @@ def _make_handler(tel):
                                    "status": status}).encode()
                 self._send(body, "application/json")
             elif self.path in ("/", "/index.html"):
-                self._send(PAGE.encode(), "text/html; charset=utf-8")
+                self._send(page_html.encode(), "text/html; charset=utf-8")
             else:
                 self.send_response(404)
                 self.send_header("Content-Length", "0")

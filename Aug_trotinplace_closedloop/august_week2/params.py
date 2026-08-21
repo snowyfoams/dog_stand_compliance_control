@@ -218,13 +218,26 @@ IMP_DQ_NOTICE_RAD = 0.1      # |q_ref - q| above this means the impedance is
 # a run completes at the higher value and this table can name it.
 KP_Z = 300.0                 # N/m
 KD_Z = 40.0                  # Ns/m
-KP_ROLL = 10.0               # Nm/rad
-KD_ROLL = 0.5                # Nms/rad
-KP_PITCH = 10.0
-KD_PITCH = 0.5
+KP_ROLL = 3.0               # Nm/rad
+KD_ROLL = 0            # Nms/rad
+KP_PITCH = 3.0
+KD_PITCH = 0
 KD_X = 0.0                   # Ns/m   damping-only axes, and never yet damped
 KD_Y = 0.0
-KD_YAW = 0.0                 # Nms/rad
+KD_YAW = 10.0                 # Nms/rad
+# YAW STIFFNESS IS ZERO *HERE*, WHICH IS NOT THE SAME AS "CANNOT EXIST".
+# body_wrench grew a kp_yaw term on 2026-08-21, once the DETA10's heading had
+# been watched under power and found to hold.  The STAND does not use it: it
+# never latches a yaw lock, so the term is inert no matter what this says, and
+# 0.0 keeps that true even if someone later passes one in.  The trot's value
+# lives in dog5_trot_quasi_static_model/config.py (KP_ORI[2]) -- that is the
+# table the trot flies, and this one is the stand's.
+KP_YAW = 0.0                 # Nm/rad
+# The yaw error is clamped before it is multiplied.  15 deg, chosen against
+# the authority rather than the angle: a diagonal pair produces yaw entirely
+# out of tangential force, so a bigger error cannot buy a bigger moment -- it
+# only asks the distributor for one the friction cone will refuse.
+YAW_ERR_MAX_RAD = 0.262      # rad = 15 deg
 KD_JOINT = 0.15              # Nms/rad, stance joint damping inside the law
 
 # ===========================================================================
@@ -394,7 +407,7 @@ STAND_HEIGHT = 0.152
 # ===========================================================================
 # safety
 # ===========================================================================
-TILT_STOP_DEG = 12.0         # absolute attitude that limps the run
+TILT_STOP_DEG = 20.0         # absolute attitude that limps the run
 # |sum of measured foot load - WEIGHT_N| beyond this -> limp.  WITH TORQUE
 # CALIBRATION DROPPED THIS IS THE ONLY END-TO-END PROOF THE FORCE LOOP IS
 # REAL: it is measured iq, inverted through J^-T, and it must add up to the

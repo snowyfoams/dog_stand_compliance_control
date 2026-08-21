@@ -103,7 +103,8 @@ THE TWO NUMBERS THAT WERE DEAD RECKONING UNTIL 2026-08-17
     hip-axis plane -- a plane nothing physical sits on -- so the runner printed
     191 mm where a ruler read ~160.  38 mm of that was the frame.  zI is the
     point the ruler reaches; the (H...) beside it is the hip axis, which is
-    where the leg tables and the IK work.  --height means zI now, and
+    where the leg tables and the IK work.  The height knob (config.py's
+    STAND_TRUNK_BOTTOM_M) means zI now, and
     STAND_HEIGHT moved 0.190 -> 0.152 so the POSE is unchanged.
 
     rp:d IS THE ONLY INDEPENDENT CHECK ON THE AHRS.  rp:fk is a least-squares
@@ -115,7 +116,7 @@ THE TWO NUMBERS THAT WERE DEAD RECKONING UNTIL 2026-08-17
 
     THE SETPOINT PROCEDURE, because rp:d is three constants added together:
         1. crouch and read the rp: block the WAIT stage prints
-        2. re-run with --setpoint-roll/--setpoint-pitch set to rp:d
+        2. set SETPOINT_ROLL_DEG / SETPOINT_PITCH_DEG to rp:d and re-run
         3. to split mount from floor: rotate the robot 180 deg on the SAME
            spot and read again.  The floor's share flips sign, the mount's
            does not, so half the sum is the mount and half the difference is
@@ -137,53 +138,85 @@ RUN -- supported robot, hand on SPACE
     half, and the Raibert step that plans it.  The gait clock and the
     world-frame swing are still tested a module at a time, by the two above.
 
+    PARAMETERS ARE EDITS, NOT FLAGS (workflow changed 2026-08-21).  Open
+    dog5_trot_quasi_static_model/config.py, change the constant, save, and every hardware run
+    is the SAME one line:
+
+    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py
+
+    Every run logs itself: with no --log it writes run_<date>_<time>.npz to
+    the cwd, and the npz embeds cfg.snapshot() -- every constant as imported
+    plus config.py's own source text -- so the log says what flew without
+    anyone writing it down.  `mv` a run worth keeping to a real name
+    afterwards, and promote its values into config.py's provenance tables.
+    --no-log is for torque-free bench fiddling and nothing else.
+
+    --tau-max IS THE ONE TUNING FLAG LEFT: the staged cap, raised between
+    otherwise-identical runs (and the one number worth lowering from the
+    terminal in a hurry).  Every other parameter flag is GONE -- a flag that
+    shadows config.py is a value the npz's cfg_* snapshot lies about.  What
+    remains besides it is plumbing: --port, --log/--no-log, --park-on-stop,
+    --self-test.
+
     THE STAND COMES FIRST, and its procedure is week 2's because the code is:
-    do these on THIS runner, not on stand_torque_Mode.py, so that what you
-    tuned is what then trots.  Do not press T until HOLD is quiet.
+    tune on THIS runner, not on stand_torque_Mode.py, so that what you tuned
+    is what then trots.  Do not press T until HOLD is quiet.  Each step below
+    is an edit to config.py followed by the one line above:
 
-    # first run: low cap, full force.  Do NOT start at --force-frac 0 with the
-    # feet on the floor -- that removes the only term holding the trunk up.
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py --tau-max 1.0
+    1. first run after any edit: leave TAU_START_MAX at 1.0, the low cap, and
+       raise it toward TAU_STAGED_MAX (3.0) only after a quiet HOLD.  Do NOT
+       zero FORCE_FRAC_DEFAULT with the feet on the floor -- that removes the
+       only term holding the trunk up.
+    2. the rig's resting attitude: run, read the rp: block the crouch prints,
+       X out, and write rp:d into SETPOINT_ROLL_DEG / SETPOINT_PITCH_DEG.
+       Do this BEFORE any run with attitude gains live.  (Done 2026-08-20:
+       -0.29 / 0.12 is this rig; a different floor moves it.)
+    3. the A/B that makes the STAND a measurement rather than a demo: one run
+       as-is, then zero the roll/pitch entries of KP_ORI and KD_ORI and run
+       again, pushing the trunk the SAME way in both.  Keep the setpoints
+       identical across the pair or the ablation is confounded.  Two npz,
+       each carrying its own config -- their cfg_* diff IS the record.
+    4. only then the trot: ENTER, wait for HOLD, T.  The gait knobs are
+       GAIT_PERIOD / DUTY / SWING_HEIGHT; move ONE per run, and duty 0.5
+       removes the double support the contact ramp hands the load over in.
 
-    # measure the rig's resting attitude: crouch, read the rp: block, X out.
-    # Then feed it back.  Do this BEFORE any run with attitude gains live.
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py --open-loop
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
-        --setpoint-roll -0.50 --setpoint-pitch 0.45 --log hold.npz
+    THE YAW SPRING (new 2026-08-21) is KP_ORI[2], and it is the newest and
+    least-tested loop in this file -- treat it the way the 2026-08-18 ladder
+    treated the attitude pair.  Its reference is a LOCK, latched from the
+    DETA10 heading the first sweep torque is live and retaken on every
+    re-engage, so the error is zero at arming by construction and there is no
+    step to ramp through.  Two things to know before turning it up:
 
-    # the A/B that makes the STAND a measurement rather than a demo.  Push the
-    # trunk the SAME way in each; the difference between the logs is the loop.
-    # Pass the SAME setpoint to both halves or the ablation is confounded.
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py --log live.npz
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
-        --kp-att 0 --kd-att 0 --log ablate.npz
+      * yaw authority is 100% FRICTION.  A trot's stance is a diagonal pair
+        and a pair makes a moment about the vertical only out of tangential
+        force, so asking for more yaw moment spends the same cone budget the
+        roll and pitch corrections are drawing on.  This is the coupling to
+        watch: a yaw demand that the distributor has to clip shows up as
+        every foot's tangential force moving at once.
+      * the banner prints the ceiling (kp_yaw * YAW_ERR_MAX_RAD) because the
+        error is clamped BEFORE it is multiplied.  Past the clamp a bigger
+        heading error buys nothing at all.
 
-    # only then the trot: ENTER, wait for HOLD, T.  The three gait numbers
-    # default to dog5_trot_quasi_static_model/config.py (0.40 s, 0.60 duty, 40 mm apex); the
-    # flags exist to move ONE of them at a time, and duty 0.5 removes the
-    # double support the contact ramp hands the load over in.
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
-        --setpoint-roll -0.50 --setpoint-pitch 0.45 --log trot.npz
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
-        --period 0.50 --swing-height 0.02 --log trot_slow.npz
+    The A/B is KP_ORI[2] = 0 against the value under test, same floor, same
+    session; the npz carries yaw, yaw_ref and kp_yaw, and tools_npz_to_csv
+    emits yaw_err_deg already wrapped, so the two logs are directly
+    comparable.  Note that yaw_err_deg is NOT readable in any npz written
+    before 2026-08-21: those runs have no yaw arrays at all, and their
+    cfg_KP_ORI[2] records a number that reached no multiply.
 
-    # FOOT PLACEMENT: the only horizontal feedback this runner has, and it is
-    # OFF unless --raibert is passed.  t1..t8 all drifted because nothing was
-    # acting on x/y at all -- the wrench has no kp there (no EKF, so no origin
-    # for a spring), and every one of them logged kd_xy = 0, i.e. W[0], W[1]
-    # and W[5] identically zero.  Three runs, same floor, same session, or the
-    # comparison is between two carpets:
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py --log p_off.npz
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
-        --raibert 0 --log p_sym.npz          # symmetry term only, kv = 0
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
-        --raibert 0.03 --log p_kv03.npz
-    # then read step_xy against v in the CSV.  IF step_xy SITS ON THE CLAMP
-    # the banner prints, the height is the limit and not the gain: at the
-    # default 152 mm there are 10.2 mm of reach room, which corrects 0.068 m/s
-    # of drift and no more.  --height 0.140 buys 23.6 mm and 0.157 m/s.
-    sudo HOME=$HOME chrt -f 50 $V dog5_trot_quasi_static_model/trot_hw.py \
-        --raibert 0.03 --height 0.140 --log p_low.npz
+    FOOT PLACEMENT -- the only horizontal feedback this runner has -- is
+    RAIBERT_ON / RAIBERT_KV in config.py, and OFF is the verified state.
+    Off, the swing is purely vertical and nothing acts on x/y at all: the
+    wrench has no kp there (no EKF, so no origin for a spring), so drift
+    integrates unopposed -- t1..t8 all did.  The three-way A/B is off, on
+    with RAIBERT_KV = 0 (symmetry term alone), and on with 0.03 -- three
+    runs, same floor, same session, or the comparison is between two carpets.
+    Then read step_xy against v in the CSV.  IF step_xy SITS ON THE CLAMP
+    the banner prints, the height is the limit and not the gain: at the
+    default 152 mm there are 10.2 mm of reach room, which corrects 0.068 m/s
+    of drift and no more.  The height is ONE number: STAND_TRUNK_BOTTOM_M in
+    config.py, floor to trunk bottom, what a ruler reads (0.140 buys 23.6 mm
+    and 0.157 m/s).  STAND_HEIGHT is the geometry anchor, not the run height.
 
 Keys: ENTER = rise / re-engage from limp, T = trot (FROM HOLD ONLY),
       SPACE = LIMP, P = park (FROM HOLD ONLY), X = stop.
@@ -396,8 +429,11 @@ def raibert_step_body(i, v_world, C, t_stance, kv, z_des, foot_xy,
     until it existed nothing did.  The wrench cannot: Dynamic_Model.body_wrench
     has no kp on x or y -- leg odometry measures VELOCITY and has no origin, so
     there is no position for a spring to pull against -- and every t*.npz was
-    logged with kd_xy = 0, which makes W[0], W[1] and W[5] identically zero in
-    all of them.  A foot placed DOWNSTREAM of the drift is the standard answer
+    logged with kd_xy = 0, which makes W[0] and W[1] identically zero in all of
+    them.  (W[5] was zero in the t*.npz too, but is NOT any more: yaw got a
+    spring on 2026-08-21 and x/y did not, because a heading is measured and an
+    x/y position still is not.)  A foot placed DOWNSTREAM of the drift is the
+    standard answer
     and needs no absolute position: it needs the velocity, which IS measured.
 
         step = v * (t_stance / 2)  +  kv * (v - v_cmd)
@@ -407,21 +443,22 @@ def raibert_step_body(i, v_world, C, t_stance, kv, z_des, foot_xy,
     body decelerates over the second half by as much as it accelerated over the
     first.  It follows from t_stance, which is DUTY * period and already known.
     kv is the only tunable number here, and `kv = 0` -- symmetry term alone --
-    is therefore the honest A/B against `--raibert` left off entirely.
+    is therefore the honest A/B against RAIBERT_ON = False entirely.
 
     v IS ROTATED INTO THE TRUNK FRAME because the arc and `foot_xy` live there.
-    C is the estimator's roll/pitch-only rotation (I->B): the AHRS yaw is
-    magnetometer-derived next to twelve motors and C_from_rp discards it, so
-    this rotation carries NO YAW.  That is correct rather than a shortcut --
-    with no yaw measurement there is no yaw to rotate by -- and it is also the
-    reason this term cannot correct a yaw drift, only an x/y one.
+    C is the estimator's roll/pitch-only rotation (I->B), so this rotation
+    carries NO YAW.  That stayed true when the heading became a controlled
+    axis on 2026-08-21: the wrench reads the yaw ANGLE beside C, never inside
+    it, precisely so that this frame -- and the leg odometry that shares it --
+    does not start rotating with the heading.  Placement still cannot correct
+    a yaw drift, only an x/y one; the yaw spring is what answers that now.
 
     THE CLAMP HOLDS z AND SHORTENS THE STEP, which swing.py's does not: that
     one scales the whole hip-to-foot vector, and so lifts the landing point off
     the floor by the same fraction it pulls it in.  On a flat floor the height
     is not negotiable and the length is, so the reachable set is intersected at
     the LANDING PLANE -- a horizontal disc of radius sqrt((0.95 R)^2 - dz^2)
-    about the hip.  At --height 0.190 that disc leaves ~6 mm
+    about the hip.  At the nominal stand height that disc leaves ~6 mm
     (config.MAX_FORWARD_V_AT_STAND_HEIGHT), which is why the honest way to buy
     a longer step is to crouch and not to raise the clamp.
     """
@@ -436,10 +473,17 @@ def raibert_step_body(i, v_world, C, t_stance, kv, z_des, foot_xy,
     r_max_sq = (0.95 * cfg.LEG_REACH) ** 2 - dz * dz
     if r_max_sq <= 0.0:
         # The leg is already at full stretch straight down; there is no
-        # horizontal room at all.  Not reachable at any sane --height, but a
+        # horizontal room at all.  Not reachable at any sane height, but a
         # negative sqrt here would be a NaN target fed to a torque.
         return np.zeros(2)
 
+    # INWARD BEFORE REACH: a leg's reachable disc extends far PAST the
+    # midline, so the reach clamp alone admits a stance-narrowing step five
+    # times the outward room.  The inward cap is a stability bound, not a
+    # workspace one, and it binds first.
+    inward = -float(cfg.SIDE_SIGN[i]) * step[1]
+    if inward > cfg.STEP_INWARD_MAX_M:
+        step[1] = -float(cfg.SIDE_SIGN[i]) * cfg.STEP_INWARD_MAX_M
     land = np.asarray(foot_xy[i], dtype=float) + step
     d = land - hip[:2]
     r = float(np.linalg.norm(d))
@@ -455,7 +499,7 @@ def _step_room(z_des, i=0, foot_xy=None):
 
     DERIVED FROM THE HEIGHT ACTUALLY BEING FLOWN, not read from
     config.MAX_FORWARD_V_AT_STAND_HEIGHT: that constant is computed once at the
-    nominal stand pose and --height is a flag, and the number more than doubles
+    nominal stand pose and the height is a knob, and the number more than doubles
     over 12 mm of crouch.  A banner quoting the nominal figure during a lower
     run would be worse than quoting nothing.
 
@@ -666,7 +710,7 @@ def _zero_rp_streamer(imu, args, window_s=5.0):
     no torque anywhere and the trunk wherever the operator puts it.
 
     So this prints raw roll/pitch, a mean over the last `window_s`, and the
-    --setpoint-* line that cancels the mean.  The SPREAD is printed with it
+    SETPOINT_* pair that cancels the mean.  The SPREAD is printed with it
     because it is the part that says whether the mean is trustworthy: held by
     hand it runs a degree or more, and a mean that moves by a degree is not a
     mount tilt.
@@ -688,12 +732,12 @@ def _zero_rp_streamer(imu, args, window_s=5.0):
         ps = [h[1] for h in hist]
         rm, pm = sum(rs) / len(rs), sum(ps) / len(ps)
         spread = max(max(rs) - min(rs), max(ps) - min(ps))
-        # The flags already include whatever setpoint THIS run subtracts, so
-        # the printed pair is absolute: paste it, do not add it to the old one.
+        # The printed pair is ABSOLUTE (raw AHRS, no setpoint in it): paste it
+        # into config.py as written, do not add it to the old values.
         return (f"[zero] rp {r:+6.2f} / {p_:+6.2f} deg   "
                 f"mean({len(hist)/2:.1f}s) {rm:+6.2f} / {pm:+6.2f} "
-                f"+/-{spread:.2f}   "
-                f"--setpoint-roll {rm:.2f} --setpoint-pitch {pm:.2f}")
+                f"+/-{spread:.2f}   config.py: SETPOINT_ROLL_DEG = {rm:.2f}  "
+                f"SETPOINT_PITCH_DEG = {pm:.2f}")
 
     return line
 
@@ -705,7 +749,7 @@ def _print_attitude_report(est, args):
     anywhere -- the only moment in the run when "the trunk is not tilted" is
     something we can assume rather than something the loop is enforcing.
 
-        rp:ahrs   the DETA10, with --setpoint-* already subtracted
+        rp:ahrs   the DETA10, with the SETPOINT_* pair already subtracted
         rp:fk     a least-squares plane through the four measured feet.  No
                   IMU in it at all, so it is the independent number.
         rp:d      ahrs - fk = floor slope + IMU mount tilt + encoder zeros
@@ -730,9 +774,12 @@ def _print_attitude_report(est, args):
     print(f"[stand] rp:d    {np.degrees(dr):+6.2f} / {np.degrees(dp):+6.2f} "
           f"deg   = floor slope + mount tilt + encoder zeros")
     if max(abs(np.degrees(dr)), abs(np.degrees(dp))) > 0.2:
-        print(f"[stand] ^ to make the wrench see THIS as level, re-run with")
-        print(f"[stand]     --setpoint-roll {args.setpoint_roll + np.degrees(dr):.2f} "
-              f"--setpoint-pitch {args.setpoint_pitch + np.degrees(dp):.2f}")
+        print(f"[stand] ^ to make the wrench see THIS as level, set in "
+              f"config.py and re-run:")
+        print(f"[stand]     SETPOINT_ROLL_DEG = "
+              f"{args.setpoint_roll + np.degrees(dr):.2f}   "
+              f"SETPOINT_PITCH_DEG = "
+              f"{args.setpoint_pitch + np.degrees(dp):.2f}")
         print(f"[stand]   but that folds the FLOOR in too.  Rotate the robot "
               f"180 deg on the same")
         print(f"[stand]   spot and read again to split them: half the sum is "
@@ -763,11 +810,16 @@ def run(args):
         # for the 2026-08-17 shake: if THIS shakes, the fault is below the
         # model (torque gain, current loop, impedance, CAN timing) and no
         # controller swap can fix it; if it is smooth, add loops back one at
-        # a time (--kp-z first, attitude last) to find the one that chatters.
+        # a time (kp_z first, attitude last) to find the one that chatters.
         gains.kp_z = gains.kd_z = 0.0
         gains.kp_roll = gains.kd_roll = 0.0
         gains.kp_pitch = gains.kd_pitch = 0.0
         gains.kd_x = gains.kd_y = gains.kd_yaw = 0.0
+        # kp_yaw with the rest of them.  OPEN_LOOP's whole claim is
+        # W = [0, 0, m*g, 0, 0, 0], and a live yaw spring would leave W[5]
+        # non-zero while the banner said every loop was off -- the exact
+        # failure kd_yaw's own comment in Dynamic_Model records.
+        gains.kp_yaw = 0.0
     ablated = gains.kp_roll == 0.0 and gains.kd_roll == 0.0
 
     print("=" * 74)
@@ -787,8 +839,8 @@ def run(args):
     else:
         print(f"  AHRS setpoint 0.00 / 0.00 -- the IMU MOUNT'S OWN TILT is "
               f"being read as a real")
-        print(f"  attitude.  The crouch prints rp:d; pass it back as "
-              f"--setpoint-roll/--setpoint-pitch.")
+        print(f"  attitude.  The crouch prints rp:d; write it into config.py "
+              f"as SETPOINT_ROLL_DEG / SETPOINT_PITCH_DEG.")
     print(f"  {gains}, impedance kp={args.kp} kd={args.kd}, "
           f"tau cap {args.tau_max} Nm, force_frac {args.force_frac}")
     print(f"  model at {cfg.CONTROL_HZ/cfg.MODEL_EVERY:.0f} Hz "
@@ -801,8 +853,8 @@ def run(args):
     if args.raibert is None:
         print(f"  FOOT PLACEMENT OFF: the swing is purely vertical, so with "
               f"kd_xy = {gains.kd_x:.0f} there is")
-        print(f"  NOTHING acting on x, y or yaw -- drift integrates. "
-              f"--raibert {cfg.RAIBERT_KV} turns it on.")
+        print(f"  NOTHING acting on x or y -- that drift integrates. "
+              f"RAIBERT_ON = True in config.py turns it on.")
     else:
         _vmax = _room / (0.5 * args.duty * args.period + args.raibert)
         print(f"  foot placement ON: kv={args.raibert} s, "
@@ -817,6 +869,20 @@ def run(args):
     print(f"  stance moment capacity: roll {Mx_max:.1f} Nm "
           f"(kp_roll saturates at {np.rad2deg(Mx_max/max(gains.kp_roll,1e-9)):.1f} deg), "
           f"pitch {My_max:.1f} Nm")
+    # THE YAW AXIS SAYS OUT LOUD WHICH OF ITS TWO STATES IT IS IN.  It was
+    # damping-only for every run before 2026-08-21, and a log from either era
+    # looks the same from the outside, so the banner names the era.
+    if gains.kp_yaw:
+        print(f"  yaw: SPRING LIVE, kp_yaw {gains.kp_yaw:.0f} Nm/rad on the "
+              f"DETA10 heading, error clamped")
+        print(f"  at {np.degrees(gains.yaw_err_max):.0f} deg -> at most "
+              f"{gains.kp_yaw*gains.yaw_err_max:.2f} Nm, made entirely of "
+              f"tangential force.")
+        print(f"  The lock is latched when torque arms, NOT at ENTER, and is "
+              f"retaken on every re-engage.")
+    else:
+        print(f"  yaw: damping only (kd_yaw {gains.kd_yaw:.1f}), heading not "
+              f"held -- KP_ORI[2] turns the spring on.")
     if args.open_loop:
         print("  OPEN LOOP: W = [0, 0, m*g, 0, 0, 0] always -- even split + "
               "leg gravity + impedance.")
@@ -851,9 +917,24 @@ def run(args):
     key = base.KeyPoller()
     log = []
     stop = None
+    web, web_stop = None, None
 
     try:
         imu.start()
+        if args.web:
+            # Display only: daemon threads that READ the AHRS and a status
+            # dict this loop rebinds.  A dead port must not cost a run.
+            from dog5_trot_quasi_static_model import att_web  # noqa: PLC0415
+            web = att_web.AttShared(imu)
+            try:
+                web_stop, _web_urls = att_web.start(web)
+            except OSError as exc:
+                print(f"[web] page disabled ({exc}); the run continues")
+                web = None
+            else:
+                web.status = {"stage": "PREFLIGHT"}
+                for _u in _web_urls:
+                    print(f"[web] attitude stream at {_u}")
         with motorbus.MotorBus(MOTOR_IDS, dirs=base.MOTOR_DIRECTIONS) as mb:
             if not mb.arm(rate_hz=cfg.CONTROL_HZ):
                 raise RuntimeError("arm failed (bus / power / terminators)")
@@ -903,6 +984,7 @@ def run(args):
             tau_ff = np.zeros(N_JOINTS)
             W = np.zeros(6)
             tau_cmd = np.zeros(N_JOINTS)
+            tau_des = np.zeros(N_JOINTS)
             # The foot-placement latch.  step_xy is the trunk-frame offset
             # THIS swing was planned with, held for the whole swing; was_swing
             # is what turns a swinging leg into a liftoff EDGE.  Both are also
@@ -910,6 +992,9 @@ def run(args):
             # was asked for is only readable as "it drifted less, somehow".
             step_xy = np.zeros((4, 2))
             was_swing = np.zeros(4, dtype=bool)
+            # the placement's own slow velocity -- see RAIBERT_V_TAU_S
+            v_place = np.zeros(3)
+            t_place = None
             # WHAT THE MODEL BLOCK HANDS THE SWEEP.  f_foot is the per-foot
             # BODY-frame force the distributor produced, already scaled by
             # force_frac; g_down is the tilt leg gravity is taken against;
@@ -924,6 +1009,12 @@ def run(args):
             limp = False
             armed = False
             load_sum = float("nan")
+            # THE HEADING THE YAW SPRING PULLS TOWARDS.  None means "not
+            # latched yet"; the model block takes it the first sweep torque is
+            # live, and LIMP puts it back to None so a re-engage locks onto
+            # wherever the robot ended up rather than fighting back to a
+            # heading it was carried away from.
+            yaw_ref = None
 
             slot = mb.slot(cfg.CONTROL_HZ)
             deadline = time.perf_counter() + slot
@@ -976,6 +1067,13 @@ def run(args):
                             limp = False
                             gate.start(now, q)
                             q_ref = q.copy()
+                            # RE-LATCH THE HEADING, for the same reason q_ref
+                            # is retaken: a limp is where the robot gets moved.
+                            # Holding the old lock would ask the first torqued
+                            # sweep for the whole accumulated yaw error at
+                            # once, which is precisely the step the ramp and
+                            # the slew limit exist to prevent elsewhere.
+                            yaw_ref = None
                             print("[stand] re-engaged")
                         elif stage == "WAIT" and z_crouch is not None:
                             stage, t0, armed = "RISE", now, True
@@ -1043,8 +1141,31 @@ def run(args):
                                      else z_crouch)
                             if torque_stage:
                                 q_ref = q_ref_for_height(q_ref, z_des, foot_xy)
+                                # THE YAW LOCK, LATCHED THE FIRST TIME TORQUE
+                                # IS LIVE AND CLEARED ON EVERY LIMP.  Roll and
+                                # pitch have a reference that is a fact about
+                                # the world -- level -- and yaw does not, so
+                                # the reference is "wherever the robot was
+                                # pointing when it started pushing".  Latching
+                                # it HERE rather than at the ENTER that begins
+                                # RISE matters: the estimator may not have
+                                # answered yet at ENTER, and a lock taken from
+                                # a stale heading would be a constant offset
+                                # the spring then fights for the whole run.
+                                # By construction the error is exactly zero on
+                                # the sweep it is taken, so arming can never
+                                # step the wrench.
+                                if yaw_ref is None:
+                                    yaw_ref = float(est.yaw)
+                                    print(f"[stand] yaw lock "
+                                          f"{np.degrees(yaw_ref):+.1f} deg "
+                                          f"(kp_yaw {gains.kp_yaw:.0f} "
+                                          f"Nm/rad, error clamped at "
+                                          f"{np.degrees(gains.yaw_err_max):.0f}"
+                                          f" deg)")
                                 W = dm.body_wrench(state, z_des, args.mass,
-                                                   gains=gains)
+                                                   gains=gains,
+                                                   yaw_ref=yaw_ref)
                                 # stance_torque IS STILL CALLED, and its
                                 # torque IS thrown away.  What is wanted is
                                 # diag: the clamped per-foot force, the
@@ -1055,10 +1176,22 @@ def run(args):
                                 # The 1 ms is affordable (measured 1066 us per
                                 # sweep total, 27% of the 4 ms budget); a
                                 # second copy of the clamp is not.
+                                # THE HANDOVER IS A RAMP NOW, NOT A STEP.
+                                # contact_weight smoothsteps each foot's share
+                                # over the first and last 15% of its stance;
+                                # binary planted took half the robot in one
+                                # model step, and on a diagonal pair that step
+                                # is an unopposed roll impulse -- the roll's
+                                # sign FOLLOWED the lead diagonal in the
+                                # t1/t5-vs-t8 A/B, which is this mechanism's
+                                # fingerprint.
+                                cw = (gait.contact_weight(now)
+                                      if stage == "TROT" else None)
                                 _, diag = ft.stance_torque(
                                     q, qd, state, W, planted, gains,
                                     force_frac=args.force_frac,
-                                    leg_gravity=args.leg_gravity)
+                                    leg_gravity=args.leg_gravity,
+                                    contact_weight=cw)
                                 f_foot[:] = 0.0
                                 for _k, _leg in enumerate(LEGS):
                                     if planted[_k] and _leg in diag["forces"]:
@@ -1066,6 +1199,12 @@ def run(args):
                                                       * diag["forces"][_leg])
                                 g_down = st.gravity_down_body(state["C"])
                                 model_live = True
+                                dt_p = (0.0 if t_place is None
+                                        else now - t_place)
+                                t_place = now
+                                a_p = 1.0 - math.exp(
+                                    -dt_p / cfg.RAIBERT_V_TAU_S)
+                                v_place += a_p * (est.v - v_place)
                                 if stage == "TROT":
                                     # ONLY THE LATCH IS LEFT HERE.  The arc and
                                     # the impedance moved to the sweep, where
@@ -1097,7 +1236,7 @@ def run(args):
                                             # ramp is a smoothstep and is still
                                             # within 4% of zero there.
                                             step_xy[i] = raibert_step_body(
-                                                i, est.v, state["C"],
+                                                i, v_place, state["C"],
                                                 gait.stance_duration,
                                                 args.raibert, z_des, foot_xy)
                                         was_swing[i] = True
@@ -1123,7 +1262,8 @@ def run(args):
                     # rather than quoting it -- 0.85 ms for four legs on the
                     # Pi it was written on, which puts the worst sweep (model
                     # block + this) at 2.23 of the 4 ms.
-                    if torque_stage and not limp:
+                    if torque_stage and not limp \
+                            and sweep % args.map_every == 0:
                         p_des = v_des = None
                         dsdt = 0.0
                         if (model_live and stage == "TROT"
@@ -1155,9 +1295,22 @@ def run(args):
                             p_des, v_des, dsdt,
                             leg_gravity=args.leg_gravity,
                             kd_joint=gains.kd_joint)
-                        tau_cmd = gate.apply(tau_ff + imp.tau(q, qd, q_ref),
-                                             q, now)
+                        # tau_des IS THE CONTROLLER'S ANSWER, tau_cmd is what
+                        # the gate let through (ramp, cap, slew).  Both are
+                        # logged: their difference is the only record of how
+                        # much of the control law the hardware actually ran,
+                        # and a law that is right but 60% clipped looks
+                        # exactly like a law that is wrong.
+                        tau_des = tau_ff + imp.tau(q, qd, q_ref)
+                        tau_cmd = gate.apply(tau_des, q, now)
+                    elif torque_stage and not limp:
+                        # a held map: tau_ff is stale by < map_every sweeps,
+                        # exactly the pre-refactor behaviour; the impedance
+                        # floor still sees this sweep's q and qd.
+                        tau_des = tau_ff + imp.tau(q, qd, q_ref)
+                        tau_cmd = gate.apply(tau_des, q, now)
                     else:
+                        tau_des = np.zeros(N_JOINTS)
                         tau_cmd = np.zeros(N_JOINTS)
                         if not torque_stage:
                             q_ref = q.copy()     # never step on re-engage
@@ -1233,7 +1386,25 @@ def run(args):
                                     else np.asarray(state["w"]).copy(),
                                     est.v.copy(), W.copy(),
                                     np.asarray(planted, float).copy(),
-                                    step_xy.copy(), f_foot.copy()))
+                                    step_xy.copy(), f_foot.copy(),
+                                    float("nan") if z_des is None else z_des,
+                                    # THE HEADING AND THE LOCK IT IS PULLED
+                                    # TOWARDS.  Both, because neither is
+                                    # readable alone: yaw is absolute and
+                                    # wraps, the lock is whatever the run
+                                    # happened to arm at, and the ERROR --
+                                    # the only quantity the wrench acts on --
+                                    # is the wrapped difference.  Logging the
+                                    # error instead would hide a lock that
+                                    # was latched off a stale sample.
+                                    est.yaw,
+                                    float("nan") if yaw_ref is None
+                                    else yaw_ref,
+                                    # the pre-gate request, beside tau_cmd
+                                    # (r[4], the post-gate command) and
+                                    # tau_meas (r[5], the measured iq): the
+                                    # three stations of one torque.
+                                    tau_des.copy()))
 
                     if now - last_print >= 1.0 / base.STATUS_HZ:
                         last_print = now
@@ -1242,6 +1413,52 @@ def run(args):
                         print(f"[stand] {'LIMP' if limp else stage:5s} "
                               f"{est.status() if state is not None else why}"
                               f"{nsw}", flush=True)
+
+                    if web is not None:
+                        # One whole-dict REBIND per sweep, never an in-place
+                        # mutation -- att_web's sampler reads this without a
+                        # lock and must never see a half-write.
+                        web.status = {
+                            "stage": "LIMP" if limp else stage,
+                            "swing": (4 - int(np.sum(planted))
+                                      if stage == "TROT" else 0),
+                            "planted": [bool(b) for b in planted],
+                            "est_roll": (round(float(np.degrees(est.roll)), 3)
+                                         if state is not None else None),
+                            "est_pitch": (round(float(np.degrees(est.pitch)), 3)
+                                          if state is not None else None),
+                            # THE LOCK AND THE ERROR, not just the heading.
+                            # att_web already streams raw yaw off its own
+                            # sampler; what it cannot know is where the spring
+                            # is pulling, and the error is the only number
+                            # that says whether the loop is winning.  None
+                            # before the lock is latched, which the page shows
+                            # as "--" rather than as a zero error.
+                            "yaw_lock": (round(float(np.degrees(yaw_ref)), 2)
+                                         if yaw_ref is not None else None),
+                            "yaw_err": (round(float(np.degrees(
+                                dm.wrap_pi(yaw_ref - est.yaw))), 2)
+                                if yaw_ref is not None and state is not None
+                                else None),
+                            # THE THREE STATIONS OF EVERY JOINT'S TORQUE,
+                            # per joint and NOT reduced: a worst-joint scalar
+                            # was tried first and told the operator neither
+                            # WHICH joint nor how the other eleven were
+                            # doing.  The page renders these as a 12-row
+                            # table -- des (the law's request), cmd (what the
+                            # gate let through), meas (what the driver
+                            # reports) -- and derives the clip marks itself.
+                            "tau_des": np.round(tau_des, 3).tolist(),
+                            "tau_cmd": np.round(tau_cmd, 3).tolist(),
+                            "tau_meas": np.round(tau_meas, 3).tolist(),
+                            # None until torque arms: cap_now needs
+                            # gate.started_at, which WAIT has not set yet --
+                            # and the page's "--" is honest there, where a
+                            # 0.00 would read as a zeroed cap.
+                            "tau_cap": (round(float(gate.cap_now(now)), 3)
+                                        if gate.started_at is not None
+                                        else None),
+                        }
 
                 mid = MOTOR_IDS[j]
                 if stage == "WAIT":
@@ -1273,6 +1490,8 @@ def run(args):
     except RuntimeError as exc:
         print(f"\n[stand] fault: {exc}")
     finally:
+        if web_stop is not None:
+            web_stop()
         try:
             imu.stop()
         except Exception:                                   # noqa: BLE001
@@ -1317,6 +1536,13 @@ def run(args):
                 qd_drv=np.array([r[3] for r in log]),    # driver field, unused
                 tau_cmd=np.array([r[4] for r in log]),
                 tau_meas=np.array([r[5] for r in log]),
+                # THE PRE-GATE REQUEST.  tau_des is what the control law asked
+                # for THIS sweep; tau_cmd is what survived the gate's ramp,
+                # cap and slew; tau_meas is what the drivers report doing.
+                # des-vs-cmd is the gate's bite (how much law was clipped),
+                # cmd-vs-meas is the drivers' tracking -- two different
+                # failures, separable only if all three are here.
+                tau_des=np.array([r[27] for r in log]),
                 fz=np.array([r[6] for r in log]),
                 roll=np.array([r[7] for r in log]),      # AHRS, setpoint out
                 pitch=np.array([r[8] for r in log]),
@@ -1345,7 +1571,7 @@ def run(args):
                 # ambiguous.
                 planted=np.array([r[21] for r in log]),
                 # THE STEP EACH SWING WAS PLANNED WITH (4,2), trunk frame,
-                # zero on a planted leg and zero everywhere with --raibert
+                # zero on a planted leg and zero everywhere with placement
                 # off.  This is the whole readout of the placement loop: with
                 # v beside it a log says whether the step tracked the drift,
                 # and whether the reach clamp was the thing limiting it.
@@ -1359,14 +1585,43 @@ def run(args):
                 # entirely in the tangential components and W[5] is identically
                 # zero while kd_yaw is.
                 f_foot=np.array([r[23] for r in log]),
+                # THE HEIGHT REFERENCE, beside the measured z two lines up.
+                # The only setpoint in this loop that MOVES: over RISE it is
+                # dm.height_ramp(z_crouch -> the height knob) and z_crouch is
+                # MEASURED, so a log without it cannot be replotted as
+                # reference-vs-actual -- the ramp would have to be rebuilt
+                # from t0 and a crouch height that was never written down.
+                # NaN before the estimator's first answer, which is honest:
+                # there was no reference yet.
+                z_des=np.array([r[24] for r in log]),
+                # THE ATTITUDE REFERENCE IS IDENTICALLY ZERO and is written
+                # out so a plot can say so.  Dynamic_Model.body_wrench is
+                # Mx = kp_roll*(0 - roll): the target is level, always.  What
+                # makes that mean level on THIS rig is setpoint_roll_deg,
+                # already subtracted from `roll` below -- so `roll` IS the
+                # error the law acts on, and roll_raw - setpoint reproduces
+                # it.  Three arrays, no arithmetic, no chance of subtracting
+                # the mount tilt twice.
+                roll_ref=np.zeros(len(log)),
+                pitch_ref=np.zeros(len(log)),
+                # YAW IS THE ONE ATTITUDE REFERENCE THAT IS NOT ZERO and not
+                # even constant across runs -- it is latched per run, and NaN
+                # on every sweep before torque armed.  Kept in radians like
+                # roll/pitch; the error the spring acted on is
+                # wrap_pi(yaw_ref - yaw), which Dynamic_Model.wrap_pi will
+                # reproduce exactly.
+                yaw=np.array([r[25] for r in log]),
+                yaw_ref=np.array([r[26] for r in log]),
+                kp_yaw=gains.kp_yaw,
+                yaw_err_max=gains.yaw_err_max,
                 step_xy=np.array([r[22] for r in log]),
                 raibert_kv=(float("nan") if args.raibert is None
                             else float(args.raibert)),
                 period=args.period, duty=args.duty,
                 swing_height=args.swing_height,
                 glitches=glitches,
-                # every OUTER gain, not just the attitude pair: a --kd-z or
-                # --kd-xy A/B is unreadable afterwards if the npz cannot say
+                # every OUTER gain, not just the attitude pair: a kd_z or
+                # kd_xy A/B is unreadable afterwards if the npz cannot say
                 # which half of it this file is.
                 kp_att=gains.kp_roll, kd_att=gains.kd_roll,
                 kp_z=gains.kp_z, kd_z=gains.kd_z,
@@ -1375,8 +1630,17 @@ def run(args):
                 setpoint_roll_deg=args.setpoint_roll,
                 setpoint_pitch_deg=args.setpoint_pitch,
                 imu_below_trunk_origin_m=cfg.IMU_BELOW_TRUNK_ORIGIN_M,
-                kp_imp=args.kp, kd_imp=args.kd, tau_max=args.tau_max)
-            print(f"  log -> {args.log} ({len(log)} sweeps)")
+                kp_imp=args.kp, kd_imp=args.kd, tau_max=args.tau_max,
+                map_every=args.map_every,
+                # THE WHOLE PARAMETER TABLE, EVERY RUN.  The workflow is
+                # edit-config.py-and-run, so the log must carry the table it
+                # flew: cfg_* is every constant as imported, cfg_source is the
+                # file's own text for diffing two runs.  The unprefixed keys
+                # above stay authoritative for anything a CLI flag can still
+                # move, since a flag wins over the file.
+                **cfg.snapshot())
+            print(f"  log -> {args.log} ({len(log)} sweeps, full config.py "
+                  f"snapshot inside)")
     return 0
 
 
@@ -1511,17 +1775,22 @@ def self_test():
           f"worst {worst_frame*1e6:.3f} um over 4 heights; a frame mismatch "
           f"here is a silent {cfg.IMU_BELOW_TRUNK_ORIGIN_M*1e3:.0f} mm and the "
           f"log cannot show it")
-    q_st_f = q_ref_for_height(Q_CROUCH.copy(), cfg.STAND_TRUNK_BOTTOM_M, foot_xy)
+    # PINNED TO THE NOMINAL, NOT THE KNOB.  These two checks verify the
+    # 2026-08-17 frame relabelling (0.152 bottom == 0.190 hip, same pose), so
+    # they must solve at the nominal derived from STAND_HEIGHT -- config's
+    # STAND_TRUNK_BOTTOM_M is the user's height KNOB now and may be anything.
+    z_nom = cfg.STAND_HEIGHT - cfg.IMU_BELOW_TRUNK_ORIGIN_M
+    q_st_f = q_ref_for_height(Q_CROUCH.copy(), z_nom, foot_xy)
     check("...and it is the TRUNK BOTTOM, not the hip axis (the 38 mm)",
           abs(fe.fk_trunk_height(q_st_f, np.eye(3), ALL4, ref="hip")
-              - cfg.STAND_TRUNK_BOTTOM_M - cfg.IMU_BELOW_TRUNK_ORIGIN_M) < 1e-9,
-          f"stand pose measures {cfg.STAND_TRUNK_BOTTOM_M*1e3:.0f} mm at the trunk "
+              - z_nom - cfg.IMU_BELOW_TRUNK_ORIGIN_M) < 1e-9,
+          f"stand pose measures {z_nom*1e3:.0f} mm at the trunk "
           f"bottom, "
           f"{fe.fk_trunk_height(q_st_f, np.eye(3), ALL4, ref='hip')*1e3:.0f} "
           f"mm at the hip axis")
     check("the STAND_HEIGHT number moved with the frame and the POSE did not",
           abs(fe.fk_trunk_height(q_st_f, np.eye(3), ALL4, ref="hip")
-              - 0.190) < 1e-9,
+              - cfg.STAND_HEIGHT) < 1e-9,
           "0.152 at the trunk bottom is the same joint angles 0.190 at the "
           "hip axis used to command -- the change is a relabelling, not a "
           "different stand")
@@ -1582,15 +1851,51 @@ def self_test():
     g0 = cfg.gains()
     g0.kp_z = g0.kd_z = g0.kp_roll = g0.kd_roll = 0.0
     g0.kp_pitch = g0.kd_pitch = g0.kd_x = g0.kd_y = g0.kd_yaw = 0.0
+    g0.kp_yaw = 0.0
+    # THE STATES CARRY A HEADING AND THE CALL PASSES A LOCK, so this is a real
+    # test of the yaw spring's OPEN_LOOP zeroing and not an accident of the
+    # key being absent.  Written the hard way on purpose: the version of this
+    # test that omitted "yaw" passed before kp_yaw existed and would have gone
+    # on passing after, which is the shape of a test that checks nothing.
     rng_states = [
         {"r": np.array([0., 0., z]), "v": np.array(v, dtype=float),
-         "C": fe.C_from_rp(*rp), "w": np.array(w, dtype=float)}
-        for z, v, rp, w in ((0.10, (0.2, -0.1, 0.3), (0.2, -0.15), (1, 2, -1)),
-                            (0.30, (-.5, 0.4, -0.2), (-0.1, 0.3), (-2, 1, 3)))]
-    check("--open-loop wrench is [0,0,mg,0,0,0] whatever the state does",
-          all(np.allclose(dm.body_wrench(s, 0.19, gains=g0),
+         "C": fe.C_from_rp(*rp), "w": np.array(w, dtype=float), "yaw": yw}
+        for z, v, rp, w, yw in (
+            (0.10, (0.2, -0.1, 0.3), (0.2, -0.15), (1, 2, -1), 0.35),
+            (0.30, (-.5, 0.4, -0.2), (-0.1, 0.3), (-2, 1, 3), -2.90))]
+    check("the OPEN_LOOP wrench is [0,0,mg,0,0,0] whatever the state does",
+          all(np.allclose(dm.body_wrench(s, 0.19, gains=g0, yaw_ref=0.0),
                           [0, 0, cfg.WEIGHT, 0, 0, 0]) for s in rng_states),
           "the diagnostic baseline cannot be perturbed by any estimate")
+
+    # -- the yaw spring, end to end through the runner's own gains ----------
+    gy = cfg.gains()
+    s_yaw = {"r": np.array([0., 0., 0.19]), "v": np.zeros(3),
+             "C": fe.C_from_rp(0.0, 0.0), "w": np.zeros(3), "yaw": 0.05}
+    check("no lock latched (yaw_ref None) means no yaw moment at all",
+          abs(dm.body_wrench(s_yaw, 0.19, gains=gy)[5]) < 1e-12,
+          "every sweep before torque arms must be spring-free")
+    check("the lock is zero-error on the sweep it is taken, so arming cannot "
+          "step the wrench",
+          abs(dm.body_wrench(s_yaw, 0.19, gains=gy,
+                             yaw_ref=s_yaw["yaw"])[5]) < 1e-12)
+    if gy.kp_yaw:
+        # A heading error must produce a RESTORING moment: imu_dog's frame has
+        # yaw > 0 = nose left, so drifting left must be answered clockwise.
+        check("a nose-left drift is answered with a clockwise moment",
+              dm.body_wrench(s_yaw, 0.19, gains=gy, yaw_ref=0.0)[5] < 0.0)
+        s_big = dict(s_yaw, yaw=-2.0)        # 115 deg off, past the clamp
+        check("the yaw moment is bounded by kp_yaw * yaw_err_max",
+              abs(dm.body_wrench(s_big, 0.19, gains=gy, yaw_ref=0.0)[5])
+              <= gy.kp_yaw * gy.yaw_err_max + 1e-9,
+              f"ceiling {gy.kp_yaw*gy.yaw_err_max:.3f} Nm")
+        # The bound has to be worth something against the axis it acts on.
+        # Yaw comes entirely out of friction, so the honest comparison is the
+        # tangential budget mu*W, not the roll/pitch capacity above.
+        check("...and that ceiling is a small fraction of the friction budget",
+              gy.kp_yaw * gy.yaw_err_max < 0.5 * cfg.MU * cfg.WEIGHT * 0.2,
+              f"{gy.kp_yaw*gy.yaw_err_max:.2f} Nm against a "
+              f"{cfg.MU*cfg.WEIGHT*0.2:.2f} Nm scale")
 
     # -- the velocity path that caused the 2026-08-17 shake -----------------
     # Replay the measured glitch through both paths and demand the fix holds.
@@ -1650,6 +1955,24 @@ def self_test():
           cfg.ODOM_LPF_FC_HZ > 2.0 * np.sqrt(cfg.KP_POS[2] / cfg.MASS) / (2 * np.pi),
           f"{cfg.ODOM_LPF_FC_HZ:.0f} Hz filter vs "
           f"{np.sqrt(cfg.KP_POS[2]/cfg.MASS)/2/np.pi:.2f} Hz height loop")
+
+    # -- the weighted handover ---------------------------------------------
+    # None must be the EXACT old solve -- every stand flies through this code.
+    fx = [st.leg_frames(l, Q_CROUCH[3*k:3*k+3])[0] for k, l in enumerate(LEGS)]
+    Wt = np.array([0.0, 0.0, 57.05, 0.0, 0.0, 0.0])
+    f_none = ft.distribute(Wt, fx, list(LEGS), np.eye(3))
+    f_ones = ft.distribute(Wt, fx, list(LEGS), np.eye(3),
+                           weights=[1.0, 1.0, 1.0, 1.0])
+    check("weights of 1.0 ARE the unweighted solve, bit for bit",
+          all(np.array_equal(f_none[l], f_ones[l]) for l in LEGS))
+    f_ramp = ft.distribute(Wt, fx, list(LEGS), np.eye(3),
+                           weights=[0.1, 1.0, 1.0, 0.1])
+    check("a foot at 10% weight volunteers a small share, not half the robot",
+          f_ramp["FL"][2] < 0.35 * f_ramp["FR"][2],
+          f"FL {f_ramp['FL'][2]:.1f} N vs FR {f_ramp['FR'][2]:.1f} N")
+    check("...and the ramped split still adds up to the commanded weight",
+          abs(sum(f_ramp[l][2] for l in LEGS) - 57.05) < 0.1,
+          f"{sum(f_ramp[l][2] for l in LEGS):.2f} N of 57.05")
 
     # -- the 250 Hz law is the SAME law, just evaluated later ---------------
     # THIS IS A REFACTOR AND MUST PROVE IT.  The 83 Hz code that shipped t1..t8
@@ -1734,11 +2057,18 @@ def self_test():
           float(np.max(np.abs(W_ach - W_s))) < 0.05,
           f"|G f - W| = {np.max(np.abs(W_ach - W_s)):.4f} N/Nm on an "
           f"unclamped four-foot stand (GRASP_LAMBDA leaves the residual)")
+    # THIS STATE IS AT REST WITH NO YAW LOCK LATCHED, so the commanded Mz is
+    # zero for both of the reasons it can be -- no rate for the damper and no
+    # reference for the spring.  It is NOT zero because the axis is
+    # uncommandable: since 2026-08-21 a latched lock makes W[5] non-zero, and
+    # this check would then be reading the spring rather than the point it
+    # exists to make.  The point is that the ACHIEVED Mz is non-zero even when
+    # the commanded one is not, which is why f_foot has to be logged.
     check("...and that reconstruction is what carries Mz, which W cannot",
           abs(W_s[5]) < 1e-12,
-          f"commanded Mz is identically {W_s[5]:.1e} at kd_yaw="
-          f"{g_st.kd_yaw:.0f}; the achieved Mz is {W_ach[5]:+.4f} Nm and only "
-          f"the tangential forces know it")
+          f"commanded Mz is identically {W_s[5]:.1e} at rest with no lock "
+          f"(kd_yaw={g_st.kd_yaw:.1f}, kp_yaw={g_st.kp_yaw:.1f}); the achieved "
+          f"Mz is {W_ach[5]:+.4f} Nm and only the tangential forces know it")
 
     # -- foot placement: the horizontal loop, and the arc it rides on ------
     fxy = [st.leg_frames(LEGS[k], Q_CROUCH[3*k:3*k+3])[0][:2] for k in range(4)]
@@ -1807,6 +2137,24 @@ def self_test():
               - 0.02 * 0.5 * T_st) < 1e-9,
           f"{0.02*0.5*T_st*1e3:.2f} mm at t_stance = {T_st*1e3:.0f} ms")
 
+    # THE INWARD CAP, on the exact failure f_ramp_raibert.npz recorded: the
+    # trunk rolls left, v_y says left, and the LEFT foot must not answer by
+    # stepping under the body.  Outward from the same velocity stays free.
+    v_left = np.array([0.0, -0.30, 0.0])           # 300 mm/s leftward slosh
+    s_fl = raibert_step_body(0, v_left, np.eye(3), T_st, cfg.RAIBERT_KV, zh, fxy)
+    s_fr = raibert_step_body(1, v_left, np.eye(3), T_st, cfg.RAIBERT_KV, zh, fxy)
+    check("a left foot answering a leftward fall cannot cross the midline",
+          -cfg.SIDE_SIGN[0] * s_fl[1] <= cfg.STEP_INWARD_MAX_M + 1e-12,
+          f"FL inward {-cfg.SIDE_SIGN[0]*s_fl[1]*1e3:.1f} mm, cap "
+          f"{cfg.STEP_INWARD_MAX_M*1e3:.0f}; the log showed -57 mm")
+    # "in full" up to the REACH clamp, which for a pure-y step bites near
+    # 28 mm: the rest pose is 92% of reach almost entirely in x-z, so lateral
+    # motion adds in quadrature and gets ~3x the radial room.
+    check("...while the right foot, stepping OUTWARD, is capped by reach only",
+          -cfg.SIDE_SIGN[1] * s_fr[1] < 0
+          and abs(s_fr[1]) > 2 * cfg.STEP_INWARD_MAX_M,
+          f"FR steps {s_fr[1]*1e3:+.1f} mm outward vs the 10 mm inward cap")
+
     # The clamp, at the height it actually bites: a 1 m/s step is absurd and
     # is exactly what a single bad odometry sample looks like.
     big = raibert_step_body(0, np.array([1.0, 0.0, 0.0]), np.eye(3), T_st,
@@ -1833,10 +2181,15 @@ def self_test():
     # TRUNK BOTTOM -- the same 38 mm that made STAND_HEIGHT 0.152, and the
     # reason 0.190 is quoted nowhere in this block.  Compare heights this
     # runner can actually be given.
+    # AT THE NOMINAL, NOT THE KNOB: the doubling is a property of how cramped
+    # the 0.152 stance is.  A user who has already dialled the knob lower is
+    # standing where the room is no longer scarce, and the ratio there is
+    # honestly smaller -- that is the knob working, not this claim failing.
+    z_nom_room = cfg.STAND_HEIGHT - cfg.IMU_BELOW_TRUNK_ORIGIN_M
     check("crouching buys step room, which is the only way to buy it",
-          _step_room(zh - 0.012) > 2.0 * _step_room(zh),
-          f"{_step_room(zh)*1e3:.1f} mm at {zh*1e3:.0f}, "
-          f"{_step_room(zh-0.012)*1e3:.1f} mm 12 mm lower")
+          _step_room(z_nom_room - 0.012) > 2.0 * _step_room(z_nom_room),
+          f"{_step_room(z_nom_room)*1e3:.1f} mm at {z_nom_room*1e3:.0f}, "
+          f"{_step_room(z_nom_room-0.012)*1e3:.1f} mm 12 mm lower")
 
     # The banner quotes a drift speed the loop can still correct; it has to be
     # the speed at which the clamp starts truncating, not a nearby number.
@@ -1886,11 +2239,14 @@ def self_test():
           f"a {cfg.STAND_TRUNK_BOTTOM_M:.3f} setpoint at the {z_cr:.3f} crouch would ask "
           f"{cfg.KP_POS[2]*(cfg.STAND_TRUNK_BOTTOM_M-z_cr) + cfg.WEIGHT:.0f} N on sweep 1, "
           f"{(cfg.KP_POS[2]*(cfg.STAND_TRUNK_BOTTOM_M-z_cr)+cfg.WEIGHT)/cfg.WEIGHT:.1f}x weight")
+    # The NOMINAL again, not the knob: the claim is about the frame
+    # relabelling, and it must hold whatever height the user has dialled in.
+    z_nom2 = cfg.STAND_HEIGHT - cfg.IMU_BELOW_TRUNK_ORIGIN_M
     check("...and the rise TRAVEL is unchanged by the frame change",
-          abs((cfg.STAND_TRUNK_BOTTOM_M - z_cr)
-              - (0.190 - fe.fk_trunk_height(Q_CROUCH, np.eye(3), ALL4,
-                                            ref="hip"))) < 1e-9,
-          f"{(cfg.STAND_TRUNK_BOTTOM_M - z_cr)*1e3:.1f} mm of travel either way -- a "
+          abs((z_nom2 - z_cr)
+              - (cfg.STAND_HEIGHT - fe.fk_trunk_height(Q_CROUCH, np.eye(3),
+                                                       ALL4, ref="hip"))) < 1e-9,
+          f"{(z_nom2 - z_cr)*1e3:.1f} mm of travel either way -- a "
           f"constant offset cancels in a difference, which is why the shake "
           f"work was unaffected by the frame being wrong")
 
@@ -1899,99 +2255,72 @@ def self_test():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--port", default=None)
-    ap.add_argument("--height", type=float, default=cfg.STAND_TRUNK_BOTTOM_M)
-    ap.add_argument("--mass", type=float, default=cfg.MASS)
-    ap.add_argument("--tau-max", type=float, default=cfg.TAU_START_MAX)
-    ap.add_argument("--kp", type=float, default=cfg.KP_IMP)
-    ap.add_argument("--kd", type=float, default=cfg.KD_IMP)
-    ap.add_argument("--force-frac", type=float, default=cfg.FORCE_FRAC_DEFAULT)
-    ap.add_argument("--no-leg-gravity", dest="leg_gravity",
-                    action="store_false",
-                    help="reproduce the 2026-07-30 stance law (A/B only)")
-    ap.add_argument("--open-loop", action="store_true",
-                    help="ALL outer gains 0: W=[0,0,mg,0,0,0], even split + "
-                         "leg gravity + impedance.  The known-good baseline; "
-                         "run this FIRST when diagnosing a shake")
-    ap.add_argument("--kp-att", type=float, default=None,
-                    help="0 with --kd-att 0 is the ablation half of the A/B")
-    ap.add_argument("--kd-att", type=float, default=None)
-    ap.add_argument("--kp-z", type=float, default=None)
-    ap.add_argument("--kd-z", type=float, default=None,
-                    help="the height loop's DAMPING half, separately from "
-                         "--kp-z.  kd_z acts on leg-odometry velocity, which "
-                         "is the one outer signal carrying the whole lag "
-                         "budget (5 Hz LPF + 12 ms hold), so a shake that "
-                         "--kp-z alone cannot clear usually lives here")
-    ap.add_argument("--kd-xy", type=float, default=None,
-                    help="kd_x = kd_y together: the damping-only translation "
-                         "axes, on the same lagged odometry velocity as kd_z")
-    ap.add_argument("--kd-yaw", type=float, default=None,
-                    help="the yaw damper.  Its own flag because it is the "
-                         "gain --open-loop zeroes that no other flag could: "
-                         "zeroing kp-z/kd-z/kd-xy/kp-att/kd-att left it live "
-                         "at 4.0 and the banner did not show it")
-    ap.add_argument("--setpoint-roll", type=float, default=cfg.SETPOINT_ROLL_DEG,
-                    help="resting attitude of THIS rig in deg, subtracted from "
-                         "every AHRS reading.  Read the pair the WAIT stage "
-                         "prints; 0 means the IMU mount's own tilt is fed to "
-                         "the wrench as a real one")
-    ap.add_argument("--setpoint-pitch", type=float,
-                    default=cfg.SETPOINT_PITCH_DEG)
-    ap.add_argument("--period", type=float, default=cfg.GAIT_PERIOD,
-                    help="trot cycle (s)")
-    ap.add_argument("--duty", type=float, default=cfg.DUTY,
-                    help="stance fraction.  0.5 is the textbook trot and has "
-                         "ZERO double support; the contact ramp then has "
-                         "nowhere to hand the load over")
-    ap.add_argument("--swing-height", type=float, default=cfg.SWING_HEIGHT,
-                    help="swing apex above the resting foot site (m)")
-    ap.add_argument("--raibert", type=float, default=None, metavar="KV",
-                    help="TURN FOOT PLACEMENT ON, with this kv (s).  OMITTED "
-                         "IS OFF, and off is the default because no hardware "
-                         "log stands behind any value yet -- t1..t8 were all "
-                         "flown with a purely vertical swing.  Passing the "
-                         "flag enables BOTH terms of "
-                         "step = v*(t_stance/2) + kv*(v - v_cmd); kv is the "
-                         "only tunable half, so --raibert 0 (symmetry term "
-                         "alone) is the A/B against no flag at all.  This is "
-                         "the ONLY horizontal feedback the runner has: the "
-                         "wrench has no kp on x/y and cannot get one without "
-                         "an EKF, so with the flag off x, y and yaw are open "
-                         "loop and drift integrates unopposed.  Start at "
-                         f"{cfg.RAIBERT_KV} and read step_xy in the log.")
-    ap.add_argument("--lead-diagonal", choices=("fr-rl", "fl-rr"),
-                    default="fr-rl",
-                    help="which diagonal leaves the ground FIRST after T.  "
-                         "fr-rl is config.PHASE_OFFSET as written and is what "
-                         "every t*.npz was logged with; fl-rr adds half a "
-                         "cycle to every offset, which swaps the pair without "
-                         "touching period, duty or the ramp.  THIS IS THE A/B "
-                         "FOR THE ROLL: t1/t2/t5 all rolled the SAME way "
-                         "(-6 -> -12 deg), so if the sign follows the lead "
-                         "diagonal the roll is the handover, and if it does "
-                         "not it is a fixed bias -- CoM, mount or leg zeros.")
-    ap.add_argument("--tilt-stop", type=float, default=cfg.TILT_STOP_DEG,
-                    help="attitude that stops the run (deg).  0 DISABLES IT.  "
-                         "The default is params.TILT_STOP_DEG and belongs "
-                         "there; this flag is for a diagnostic run only.  "
-                         "MEASURED 2026-08-18 (t1/t3/t5.npz): every trip was "
-                         "a real roll -- 2.2-2.9 rad/s on the gyro, growing "
-                         "over two gait cycles -- not an unfiltered spike.  "
-                         "t2.npz is the run where it did NOT fire: the trunk "
-                         "went 149 -> -23 mm and lay on the floor at 2x "
-                         "weight for 7 s, because a robot on its belly reads "
-                         "level.  DISABLING THIS REMOVES THE ONLY TRIP THAT "
-                         "COVERS TROT -- the load check is gated to HOLD.")
-    ap.add_argument("--crouch-dps", type=float, default=cap.MAX_DPS)
+    # --tau-max IS THE ONE TUNING FLAG LEFT.  Every other parameter flag was
+    # deleted 2026-08-21: the workflow is edit-config.py-and-run, and a flag
+    # that shadows the file is a value the cfg_* snapshot in the npz lies
+    # about.  The cap is different in kind -- the staged-verification
+    # procedure raises it between otherwise-IDENTICAL runs, and it is the one
+    # number worth being able to lower from the terminal in a hurry.
+    ap.add_argument("--tau-max", type=float, default=cfg.TAU_START_MAX,
+                    help=f"per-joint torque cap (Nm), the staged-verification "
+                         f"knob: {cfg.TAU_START_MAX} first, toward "
+                         f"{cfg.TAU_STAGED_MAX} only after a quiet HOLD.  "
+                         f"The ONLY parameter flag; everything else is an "
+                         f"edit to dog5_trot_quasi_static_model/config.py.")
+    # The rest is run plumbing, not parameters.
+    ap.add_argument("--port", default=None, help="AHRS serial port override")
+    ap.add_argument("--web", action="store_true",
+                    help="serve a live roll/pitch/yaw page on :8080 (att_web; "
+                         "AHRS + the loop's setpoint-subtracted view, mag yaw "
+                         "display-only).  Run plumbing, not a parameter.")
     ap.add_argument("--park-on-stop", action="store_true",
                     help="park in position mode after ANY stop, not just P")
-    ap.add_argument("--log", default=None)
+    ap.add_argument("--log", default=None,
+                    help="npz path.  EVERY hardware run logs: left unset, a "
+                         "run_<date>_<time>.npz is written to the cwd.  "
+                         "--no-log is the only way to not leave a record.")
+    ap.add_argument("--no-log", action="store_true",
+                    help="run without writing an npz (bench fiddling only)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
     if args.self_test:
         return self_test()
+
+    # THE TABLE FILLS THE NAMESPACE, in one place.  run() still reads args.*
+    # so the loop is untouched; every parameter lands here from config.py and
+    # nowhere else, so there is exactly one way a number reaches the loop --
+    # and the npz's cfg_* snapshot is that number, always.
+    args.height = cfg.STAND_TRUNK_BOTTOM_M
+    args.mass = cfg.MASS
+    args.kp, args.kd = cfg.KP_IMP, cfg.KD_IMP
+    args.force_frac = cfg.FORCE_FRAC_DEFAULT
+    args.leg_gravity = cfg.LEG_GRAVITY_ON
+    args.open_loop = cfg.OPEN_LOOP
+    # The per-gain overrides are gone WITH their flags: run() treats None as
+    # "config.py as written", i.e. KP_ORI/KD_ORI/KP_POS/KD_POS.
+    args.kp_att = args.kd_att = None
+    args.kp_z = args.kd_z = args.kd_xy = args.kd_yaw = None
+    args.setpoint_roll = cfg.SETPOINT_ROLL_DEG
+    args.setpoint_pitch = cfg.SETPOINT_PITCH_DEG
+    args.period, args.duty = cfg.GAIT_PERIOD, cfg.DUTY
+    args.swing_height = cfg.SWING_HEIGHT
+    args.map_every = cfg.MAP_EVERY
+    args.raibert = cfg.RAIBERT_KV if cfg.RAIBERT_ON else None
+    args.lead_diagonal = cfg.LEAD_DIAGONAL
+    args.tilt_stop = cfg.TILT_STOP_DEG
+    args.crouch_dps = cap.MAX_DPS
+
+    # EVERY RUN LEAVES AN NPZ unless --no-log says otherwise.  The parameter
+    # workflow is edit-config.py-and-run, and an edit whose run wrote no log
+    # is a change with no record -- the exact hole the snapshot exists to
+    # close.  Auto-named by wall clock so back-to-back runs cannot clobber
+    # each other; name it yourself the moment a run is worth keeping.
+    if args.no_log:
+        args.log = None
+    elif args.log is None:
+        args.log = time.strftime("run_%Y%m%d_%H%M%S.npz")
+        print(f"[log] no --log given: this run -> {args.log}")
 
     # BEFORE ANYTHING ARMS.  config.py owns this runner's table, but three
     # week-2 modules read a handful of constants out of params.py that no
@@ -2001,7 +2330,8 @@ def main():
     if not 0.0 < args.tau_max <= cfg.TAU_STAGED_MAX:
         ap.error(f"--tau-max must be in (0, {cfg.TAU_STAGED_MAX}]")
     if not 0.0 <= args.force_frac <= 1.0:
-        ap.error("--force-frac must be in [0, 1]")
+        raise SystemExit(f"config.py FORCE_FRAC_DEFAULT = {args.force_frac} "
+                         f"must be in [0, 1]")
     return run(args)
 
 
